@@ -73,7 +73,7 @@ ANALYSIS_JSON_SHAPE = {
             "imbalance": "0-100",
             "fairtalk": [{"speaker": "string", "p_intent": "0-1"}],
         },
-        "dps": {"score": "0-100", "why": "string"},
+        "dps": {"score": "0-1", "why": "string"},
     },
     "evidence_gate": {
         "status": "VERIFIED|MIXED|UNVERIFIED",

@@ -102,7 +102,7 @@ def build_mock_analysis(
         stagnation_score = 63
         stagnation_why = "반복 표현이 늘어 정체 루프 위험이 있습니다."
 
-    dps_score = min(88, 20 + utterance_count * 7)
+    dps_score = min(0.88, (20 + utterance_count * 7) / 100.0)
     dps_why = "옵션과 실행 항목이 구체화되며 진행도가 상승했습니다."
 
     imbalance = 25
@@ -125,7 +125,7 @@ def build_mock_analysis(
             "의사결정 책임자와 다음 단계 확정",
         ]
 
-    decision_lock_triggered = dps_score >= 70 and drift_band != "RED"
+    decision_lock_triggered = dps_score >= 0.70 and drift_band != "RED"
     intervention_level = "L0"
     banner_text = ""
     if drift_band == "RED":

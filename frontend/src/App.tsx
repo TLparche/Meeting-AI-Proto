@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createArtifact, getState, resetState, saveConfig, tickAnalysis, transcribeChunk } from "./api";
-import type { AgendaStatus, ArtifactKind, MeetingState, SttDebug } from "./types";
+import { addUtterance, createArtifact, getState, resetState, saveConfig, tickAnalysis, transcribeChunk } from "./api";
+import type { ArtifactKind, MeetingState, SttDebug } from "./types";
 
 const EMPTY_STATE: MeetingState = {
   meeting_goal: "",
@@ -8,11 +8,20 @@ const EMPTY_STATE: MeetingState = {
   window_size: 12,
   transcript: [],
   agenda_stack: [],
+  agenda_candidates: [],
+  agenda_vectors: {},
+  agenda_state_map: {},
+  active_agenda_id: "",
+  agenda_events: [],
+  evidence_status: "UNVERIFIED",
+  evidence_snippet: "",
+  evidence_log: [],
+  fairtalk_glow: [],
+  fairtalk_debug: { active_speakers: 0, soft_count: 0, strong_count: 0, rule: "intent_only" },
   analysis: null,
   artifacts: {},
 };
 
-const STATUS_ORDER: AgendaStatus[] = ["PROPOSED", "ACTIVE", "CLOSING", "CLOSED"];
 const CLIENT_STEPS = [
   "IDLE",
   "REQUEST_PERMISSION",
@@ -53,6 +62,7 @@ function App() {
   const [sttLogs, setSttLogs] = useState<string[]>([]);
   const [lastDebug, setLastDebug] = useState<SttDebug | null>(null);
   const [debugHistory, setDebugHistory] = useState<SttDebug[]>([]);
+  const [liveBanner, setLiveBanner] = useState<{ text: string; kind: "info" | "lock" | "warn" } | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -63,6 +73,12 @@ function App() {
   const sttSessionRef = useRef(0);
   const pendingChunksRef = useRef(0);
   const stopReasonRef = useRef("사용자가 STT를 중지했습니다.");
+  const bannerTimerRef = useRef<number | null>(null);
+  const bannerInitializedRef = useRef(false);
+  const prevActiveAgendaIdRef = useRef("");
+  const prevDecisionLockRef = useRef(false);
+  const prevL2Ref = useRef(false);
+  const prevDriftStateRef = useRef("Normal");
 
   const appendSttLog = useCallback((message: string) => {
     const ts = new Date().toLocaleTimeString();
@@ -90,16 +106,153 @@ function App() {
     return () => window.clearInterval(id);
   }, [loadState]);
 
-  const groupedAgenda = useMemo(() => {
-    const map = new Map<AgendaStatus, string[]>();
-    STATUS_ORDER.forEach((k) => map.set(k, []));
+  const showLiveBanner = useCallback((text: string, kind: "info" | "lock" | "warn" = "info") => {
+    if (bannerTimerRef.current !== null) {
+      window.clearTimeout(bannerTimerRef.current);
+      bannerTimerRef.current = null;
+    }
+    setLiveBanner({ text, kind });
+    bannerTimerRef.current = window.setTimeout(() => {
+      setLiveBanner(null);
+      bannerTimerRef.current = null;
+    }, 3000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (bannerTimerRef.current !== null) {
+        window.clearTimeout(bannerTimerRef.current);
+      }
+    };
+  }, []);
+
+  const agendaBuckets = useMemo(() => {
+    const active: Array<{ title: string; status: string }> = [];
+    const proposed: Array<{ title: string; status: string }> = [];
+    const closed: Array<{ title: string; status: string }> = [];
     state.agenda_stack.forEach((item) => {
-      const existing = map.get(item.status) ?? [];
-      existing.push(item.title);
-      map.set(item.status, existing);
+      if (item.status === "ACTIVE" || item.status === "CLOSING") {
+        active.push({ title: item.title, status: item.status });
+        return;
+      }
+      if (item.status === "CLOSED") {
+        closed.push({ title: item.title, status: item.status });
+        return;
+      }
+      proposed.push({ title: item.title, status: item.status });
     });
-    return map;
+    return { active, proposed, closed };
   }, [state.agenda_stack]);
+
+  const currentAgendaText = useMemo(() => {
+    const activeId = state.active_agenda_id || "";
+    if (activeId && state.agenda_state_map && state.agenda_state_map[activeId]?.title) {
+      return state.agenda_state_map[activeId].title;
+    }
+    return state.analysis?.agenda?.active?.title || "아직 ACTIVE 아젠다가 없습니다.";
+  }, [state.active_agenda_id, state.agenda_state_map, state.analysis]);
+
+  const kCoreTags = useMemo(() => {
+    const core = state.analysis?.keywords?.k_core;
+    if (!core) {
+      return [];
+    }
+    const merged = [...core.object, ...core.constraints, ...core.criteria].filter((x) => String(x).trim());
+    return Array.from(new Set(merged)).slice(0, 8);
+  }, [state.analysis]);
+
+  const dpsPercent = useMemo(() => {
+    const raw = Number(state.analysis?.scores?.dps?.score ?? 0);
+    const pct = Math.round(raw * 100);
+    return Math.max(0, Math.min(100, pct));
+  }, [state.analysis]);
+  const evidenceStatus = state.evidence_status || state.analysis?.evidence_gate?.status || "UNVERIFIED";
+  const evidenceSnippetLines = useMemo(() => {
+    return String(state.evidence_snippet || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(0, 2);
+  }, [state.evidence_snippet]);
+  const evidenceLogPreview = useMemo(() => {
+    return [...(state.evidence_log || [])].slice(-5).reverse();
+  }, [state.evidence_log]);
+  const recoDebug = state.recommendation_debug;
+  const participantFrames = useMemo(() => {
+    const fromState = state.fairtalk_glow || [];
+    if (fromState.length > 0) {
+      return fromState;
+    }
+    const fallback = state.analysis?.scores?.participation?.fairtalk || [];
+    return fallback.map((p) => ({
+      speaker: p.speaker,
+      p_intent: Number(p.p_intent || 0),
+      glow: "none" as const,
+      intent_active: false,
+      last_seen_sec: 999,
+    }));
+  }, [state.fairtalk_glow, state.analysis]);
+  const fairtalkDebug = state.fairtalk_debug;
+  const transcriptCount = state.transcript.length;
+  const activeAgendaCount = agendaBuckets.active.length;
+  const proposedAgendaCount = agendaBuckets.proposed.length;
+  const closedAgendaCount = agendaBuckets.closed.length;
+  const lastTranscript = transcriptCount > 0 ? state.transcript[transcriptCount - 1] : null;
+
+  const activeAgendaState = useMemo(() => {
+    const aid = state.active_agenda_id || "";
+    if (!aid || !state.agenda_state_map || !state.agenda_state_map[aid]) {
+      return "";
+    }
+    return state.agenda_state_map[aid].state;
+  }, [state.active_agenda_id, state.agenda_state_map]);
+
+  const driftState = state.drift_state || "Normal";
+  const driftCues = state.drift_ui_cues || {
+    glow_k_core: false,
+    fix_k_core_focus: false,
+    reduce_facets: false,
+    show_banner: false,
+  };
+  const coreGlow = Boolean(driftCues.glow_k_core);
+  const fixedFocus = Boolean(driftCues.fix_k_core_focus);
+  const reduceFacets = Boolean(driftCues.reduce_facets);
+  const closingModeActive = Boolean(
+    state.analysis?.intervention?.decision_lock?.triggered || activeAgendaState === "CLOSING",
+  );
+
+  useEffect(() => {
+    const activeAgendaId = state.active_agenda_id || "";
+    const decisionLock = Boolean(state.analysis?.intervention?.decision_lock?.triggered);
+    const isL2 = state.analysis?.intervention?.level === "L2";
+    const l2Banner = state.analysis?.intervention?.banner_text || "논의 재정렬이 필요합니다.";
+
+    if (!bannerInitializedRef.current) {
+      prevActiveAgendaIdRef.current = activeAgendaId;
+      prevDecisionLockRef.current = decisionLock;
+      prevL2Ref.current = isL2;
+      bannerInitializedRef.current = true;
+      return;
+    }
+
+    if (activeAgendaId && activeAgendaId !== prevActiveAgendaIdRef.current) {
+      showLiveBanner(`Re-orientation: CURRENT AGENDA 변경 -> ${currentAgendaText}`, "warn");
+    }
+    if (decisionLock && !prevDecisionLockRef.current) {
+      showLiveBanner("Decision Lock: 결론 단계(CLOSING)로 전환 신호가 감지되었습니다.", "lock");
+    }
+    if (isL2 && !prevL2Ref.current) {
+      showLiveBanner(`L2 Prompt: ${l2Banner}`, "warn");
+    }
+    if (driftState === "Re-orient" && prevDriftStateRef.current !== "Re-orient") {
+      showLiveBanner("Re-orientation: 논의를 CURRENT AGENDA와 K_core 중심으로 재정렬하세요.", "warn");
+    }
+
+    prevActiveAgendaIdRef.current = activeAgendaId;
+    prevDecisionLockRef.current = decisionLock;
+    prevL2Ref.current = isL2;
+    prevDriftStateRef.current = driftState;
+  }, [state.active_agenda_id, state.analysis, currentAgendaText, showLiveBanner, driftState]);
 
   const apply = async (action: () => Promise<MeetingState>) => {
     setLoading(true);
@@ -122,6 +275,35 @@ function App() {
         window_size: state.window_size,
       }),
     );
+
+  const onActionVote = () =>
+    apply(async () => {
+      await addUtterance({
+        speaker: "SYSTEM",
+        text: "[ACTION] 표결 진행: 현재 안건에 대해 최종 동의/승인을 요청합니다.",
+      });
+      return tickAnalysis();
+    });
+
+  const onActionSummary = () =>
+    apply(async () => {
+      await addUtterance({
+        speaker: "SYSTEM",
+        text: "[ACTION] 클로징 요약: 결론 요약을 공유하고 확정 여부를 확인합니다.",
+      });
+      await tickAnalysis();
+      return createArtifact("meeting_summary");
+    });
+
+  const onActionDecide = () =>
+    apply(async () => {
+      await addUtterance({
+        speaker: "SYSTEM",
+        text: "[ACTION] 최종확정/승인: 결론을 확정하고 CLOSED 전환을 진행합니다.",
+      });
+      await tickAnalysis();
+      return createArtifact("decision_results");
+    });
 
   const sendChunk = async (sessionId: number, localSeq: number, blob: Blob, filename: string, source: string) => {
     if (sessionId !== sttSessionRef.current) {
@@ -427,6 +609,8 @@ function App() {
         </div>
       </header>
 
+      {liveBanner ? <div className={`live-banner live-banner-${liveBanner.kind}`}>{liveBanner.text}</div> : null}
+
       {error ? <div className="error-box">{error}</div> : null}
 
       <section className="config-panel">
@@ -459,23 +643,121 @@ function App() {
         </button>
       </section>
 
-      <main className="grid">
-        <aside className="card">
-          <h2>아젠다 스택</h2>
-          {STATUS_ORDER.map((status) => (
-            <div key={status} className="agenda-block">
-              <h3>{status}</h3>
-              {(groupedAgenda.get(status) ?? []).map((title) => (
-                <div key={`${status}-${title}`} className="agenda-item">
-                  {title}
+      <section className="overview-strip">
+        <article className="overview-card">
+          <span className="overview-label">STT</span>
+          <strong>{sttStatusText}</strong>
+          <small>{sttStep}</small>
+        </article>
+        <article className="overview-card">
+          <span className="overview-label">AGENDA</span>
+          <strong>{activeAgendaCount}</strong>
+          <small>active / {proposedAgendaCount} proposed / {closedAgendaCount} closed</small>
+        </article>
+        <article className="overview-card">
+          <span className="overview-label">DPS</span>
+          <strong>{dpsPercent}%</strong>
+          <small>{closingModeActive ? "closing mode" : "discussion mode"}</small>
+        </article>
+        <article className="overview-card">
+          <span className="overview-label">EVIDENCE</span>
+          <strong>{evidenceStatus}</strong>
+          <small>{state.evidence_log?.length ?? 0} logs</small>
+        </article>
+        <article className="overview-card">
+          <span className="overview-label">FAIRTALK</span>
+          <strong>{fairtalkDebug?.active_speakers ?? participantFrames.length}</strong>
+          <small>strong {fairtalkDebug?.strong_count ?? 0} / soft {fairtalkDebug?.soft_count ?? 0}</small>
+        </article>
+        <article className="overview-card">
+          <span className="overview-label">LAST TURN</span>
+          <strong>{lastTranscript ? `${lastTranscript.timestamp} · ${lastTranscript.speaker}` : "none"}</strong>
+          <small>{lastTranscript ? lastTranscript.text.slice(0, 42) : "전사가 아직 없습니다."}</small>
+        </article>
+      </section>
+
+      <main className="workspace-grid">
+        <aside className="card nav-column-card">
+          <h2>Agenda Navigation</h2>
+          <div className="agenda-block">
+            <h3>ACTIVE</h3>
+            {agendaBuckets.active.length === 0 ? (
+              <div className="agenda-item agenda-item-empty">없음</div>
+            ) : (
+              agendaBuckets.active.map((item) => (
+                <div
+                  key={`active-${item.status}-${item.title}`}
+                  className={item.status === "ACTIVE" ? "agenda-item agenda-item-active" : "agenda-item agenda-item-closing"}
+                >
+                  {item.title} {item.status === "CLOSING" ? "(CLOSING)" : ""}
+                </div>
+              ))
+            )}
+          </div>
+          <div className="agenda-block">
+            <h3>PROPOSED</h3>
+            {agendaBuckets.proposed.length === 0 ? (
+              <div className="agenda-item agenda-item-empty">없음</div>
+            ) : (
+              agendaBuckets.proposed.map((item) => (
+                <div key={`proposed-${item.title}`} className="agenda-item">
+                  {item.title}
+                </div>
+              ))
+            )}
+          </div>
+          <div className="agenda-block">
+            <h3>CLOSED</h3>
+            {agendaBuckets.closed.length === 0 ? (
+              <div className="agenda-item agenda-item-empty">없음</div>
+            ) : (
+              agendaBuckets.closed.map((item) => (
+                <div key={`closed-${item.title}`} className="agenda-item agenda-item-closed">
+                  {item.title}
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="keyword-block">
+            <b>Agenda FSM</b>
+            <div className="keyword-line">active_agenda_id: {state.active_agenda_id || "(none)"}</div>
+            {Object.values(state.agenda_state_map ?? {}).map((entry) => (
+              <div className="keyword-line" key={entry.agenda_id}>
+                [{entry.state}] {entry.title}
+              </div>
+            ))}
+          </div>
+
+          <div className="keyword-block">
+            <b>Active Change Events</b>
+            {(state.agenda_events ?? [])
+              .filter((ev) => ev.type === "active_agenda_changed")
+              .slice(-8)
+              .map((ev, idx) => (
+                <div className="keyword-line" key={`${ev.ts}-${idx}`}>
+                  {ev.ts} | {ev.active_before || "(none)"} {"->"} {ev.active_after || "(none)"}
                 </div>
               ))}
-            </div>
-          ))}
+          </div>
         </aside>
 
-        <section className="card">
-          <h2>Live STT 전사</h2>
+        <section className="card live-column-card">
+          <h2>Live Stream & Participation</h2>
+          <div className={fixedFocus ? "focus-card focus-fixed" : "focus-card"}>
+            <div className="focus-title">CURRENT AGENDA: {currentAgendaText}</div>
+            <div className={coreGlow ? "core-tags core-tags-glow" : "core-tags"}>
+              {kCoreTags.length === 0 ? (
+                <span className="hint">K_core 태그 없음</span>
+              ) : (
+                kCoreTags.map((tag) => (
+                  <span key={tag} className="core-tag">
+                    {tag}
+                  </span>
+                ))
+              )}
+            </div>
+          </div>
           <div className="stt-box">
             <div className="row">
               <select value={sttSource} onChange={(e) => setSttSource(e.target.value as "mic" | "system")}>
@@ -523,66 +805,102 @@ function App() {
               ))}
             </div>
 
-            <h4 className="stt-subtitle">마지막 청크 서버 처리 단계</h4>
-            {lastDebug ? (
-              <div className="stt-step-table-wrap">
-                <table className="stt-step-table">
-                  <thead>
-                    <tr>
-                      <th>Step</th>
-                      <th>누적(ms)</th>
-                      <th>구간(ms)</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {lastDebug.steps.map((step, idx) => {
-                      const prev = idx > 0 ? lastDebug.steps[idx - 1].t_ms : 0;
-                      return (
-                        <tr key={`${lastDebug.chunk_id}-${step.step}-${idx}`}>
-                          <td>{step.step}</td>
-                          <td>{step.t_ms}</td>
-                          <td>{step.t_ms - prev}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+            <details className="debug-fold" open>
+              <summary>STT 처리 파이프라인/로그</summary>
+              <h4 className="stt-subtitle">마지막 청크 서버 처리 단계</h4>
+              {lastDebug ? (
+                <div className="stt-step-table-wrap">
+                  <table className="stt-step-table">
+                    <thead>
+                      <tr>
+                        <th>Step</th>
+                        <th>누적(ms)</th>
+                        <th>구간(ms)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {lastDebug.steps.map((step, idx) => {
+                        const prev = idx > 0 ? lastDebug.steps[idx - 1].t_ms : 0;
+                        return (
+                          <tr key={`${lastDebug.chunk_id}-${step.step}-${idx}`}>
+                            <td>{step.step}</td>
+                            <td>{step.t_ms}</td>
+                            <td>{step.t_ms - prev}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="hint">아직 서버 처리 step 데이터가 없습니다.</div>
+              )}
+
+              <h4 className="stt-subtitle">최근 청크 처리 기록</h4>
+              <div className="stt-debug-history">
+                {debugHistory.length === 0 ? (
+                  <div className="hint">기록 없음</div>
+                ) : (
+                  debugHistory.slice(0, 8).map((d) => (
+                    <div key={`h-${d.chunk_id}`} className="stt-debug-row">
+                      <span>#{d.chunk_id}</span>
+                      <span>{d.status}</span>
+                      <span>{d.duration_ms}ms</span>
+                      <span>{formatBytes(d.bytes)}</span>
+                    </div>
+                  ))
+                )}
               </div>
-            ) : (
-              <div className="hint">아직 서버 처리 step 데이터가 없습니다.</div>
-            )}
 
-            <h4 className="stt-subtitle">최근 청크 처리 기록</h4>
-            <div className="stt-debug-history">
-              {debugHistory.length === 0 ? (
-                <div className="hint">기록 없음</div>
-              ) : (
-                debugHistory.slice(0, 8).map((d) => (
-                  <div key={`h-${d.chunk_id}`} className="stt-debug-row">
-                    <span>#{d.chunk_id}</span>
-                    <span>{d.status}</span>
-                    <span>{d.duration_ms}ms</span>
-                    <span>{formatBytes(d.bytes)}</span>
-                  </div>
-                ))
-              )}
-            </div>
-
-            <h4 className="stt-subtitle">STT 로그</h4>
-            <div className="stt-log-box">
-              {sttLogs.length === 0 ? (
-                <div className="hint">STT 로그가 아직 없습니다.</div>
-              ) : (
-                sttLogs.slice(-14).map((line, idx) => (
-                  <div className="stt-log-line" key={`${idx}-${line}`}>
-                    {line}
-                  </div>
-                ))
-              )}
-            </div>
+              <h4 className="stt-subtitle">STT 로그</h4>
+              <div className="stt-log-box">
+                {sttLogs.length === 0 ? (
+                  <div className="hint">STT 로그가 아직 없습니다.</div>
+                ) : (
+                  sttLogs.slice(-14).map((line, idx) => (
+                    <div className="stt-log-line" key={`${idx}-${line}`}>
+                      {line}
+                    </div>
+                  ))
+                )}
+              </div>
+            </details>
           </div>
 
           <h3>실시간 전사 피드</h3>
+          <div className="participant-wrap">
+            <div className="participant-header">
+              <h3>FairTalk Participant Frames</h3>
+              <span className="hint">
+                strong {fairtalkDebug?.strong_count ?? 0} / soft {fairtalkDebug?.soft_count ?? 0} / active{" "}
+                {fairtalkDebug?.active_speakers ?? participantFrames.length}
+              </span>
+            </div>
+            <div className="participant-grid">
+              {participantFrames.length === 0 ? (
+                <div className="hint">발언 의도(P_intent) 신호가 아직 없습니다.</div>
+              ) : (
+                participantFrames.slice(0, 8).map((p) => (
+                  <article
+                    key={`participant-${p.speaker}`}
+                    className={
+                      p.glow === "strong"
+                        ? "participant-frame participant-frame-strong"
+                        : p.glow === "soft"
+                          ? "participant-frame participant-frame-soft"
+                          : "participant-frame"
+                    }
+                  >
+                    <div className="participant-name">{p.speaker}</div>
+                    <div className="participant-meta">
+                      P_intent {p.p_intent.toFixed(2)} | glow {p.glow} | last {p.last_seen_sec.toFixed(1)}s
+                    </div>
+                  </article>
+                ))
+              )}
+            </div>
+            <div className="hint">침묵 자체는 트리거하지 않고, 발언 의도 신호가 있을 때만 glow를 표시합니다.</div>
+          </div>
           <div className="feed">
             {state.transcript.slice(-100).map((item, idx) => (
               <div key={`${item.timestamp}-${idx}`} className="feed-row">
@@ -595,97 +913,149 @@ function App() {
           </div>
         </section>
 
-        <aside className="card">
-          <h2>의사결정 콕핏</h2>
+        <aside className="card decision-column-card">
+          <h2>Decision Intelligence</h2>
           {state.analysis ? (
             <>
-              <p>근거 상태: {state.analysis.evidence_gate.status}</p>
-              <p>DPS: {state.analysis.scores.dps.score}</p>
-              <p>Drift: {state.analysis.scores.drift.score}</p>
-              <p>Stagnation: {state.analysis.scores.stagnation.score}</p>
-
-              <h3>Keyword Engine</h3>
-              <p>Object Focus: {state.analysis.keywords.summary.object_focus || "없음"}</p>
-              <p>
-                Core/Facet: {state.analysis.keywords.summary.core_count} / {state.analysis.keywords.summary.facet_count}
-              </p>
-
-              <div className="keyword-block">
-                <b>K_core</b>
-                <div className="keyword-line">
-                  OBJECT: {state.analysis.keywords.k_core.object.join(", ") || "없음"}
-                </div>
-                <div className="keyword-line">
-                  CONSTRAINT: {state.analysis.keywords.k_core.constraints.join(", ") || "없음"}
-                </div>
-                <div className="keyword-line">
-                  CRITERION: {state.analysis.keywords.k_core.criteria.join(", ") || "없음"}
+              <div className="cockpit-stat-row">
+                <span className={`status-badge status-badge-${String(evidenceStatus).toLowerCase()}`}>
+                  Evidence: {evidenceStatus}
+                </span>
+                <span className="cockpit-stat">Drift {state.analysis.scores.drift.score}</span>
+                <span className={`status-badge drift-state-badge drift-state-${driftState.toLowerCase().replace("-", "")}`}>
+                  Drift Dampener: {driftState}
+                </span>
+                <span
+                  className={`status-badge loop-state-badge loop-state-${String(state.loop_state || "Normal").toLowerCase()}`}
+                >
+                  Flow Pulse: {state.loop_state || "Normal"}
+                </span>
+              </div>
+              <div className="evidence-snippet-box">
+                <b>Evidence Gate Summary</b>
+                {evidenceSnippetLines.length === 0 ? (
+                  <div className="hint">아직 Evidence Gate 요약이 없습니다.</div>
+                ) : (
+                  evidenceSnippetLines.map((line, idx) => (
+                    <div className="evidence-line" key={`evi-snippet-${idx}`}>
+                      {line}
+                    </div>
+                  ))
+                )}
+                <div className="evidence-log-mini">
+                  {evidenceLogPreview.length === 0 ? (
+                    <div className="hint">최근 evidence_log 없음</div>
+                  ) : (
+                    evidenceLogPreview.map((entry, idx) => (
+                      <div className="evidence-log-row" key={`evi-log-${idx}`}>
+                        <span className={`status-badge status-badge-${String(entry.status).toLowerCase()}`}>
+                          {entry.status}
+                        </span>
+                        <span className="evidence-log-text">
+                          {entry.claim} | v={entry.verifiability.toFixed(2)} | eqs{" "}
+                          {entry.eqs === null || entry.eqs === undefined ? "-" : entry.eqs.toFixed(2)}
+                        </span>
+                      </div>
+                    ))
+                  )}
                 </div>
               </div>
 
-              <div className="keyword-block">
-                <b>K_facet</b>
-                <div className="keyword-line">
-                  OPTION: {state.analysis.keywords.k_facet.options.join(", ") || "없음"}
+              <div className="cockpit-stat">
+                S45 {state.drift_debug?.s45?.toFixed?.(3) ?? "0.000"} | band {state.drift_debug?.band || "Green"} |
+                yellow {state.drift_debug?.yellow_seconds ?? 0}s | red {state.drift_debug?.red_seconds ?? 0}s
+              </div>
+              <div className="cockpit-stat">
+                Novelty {state.flow_pulse_debug?.novelty_rate_3m?.toFixed?.(3) ?? "1.000"} | ArgNovelty{" "}
+                {state.flow_pulse_debug?.arg_novelty?.toFixed?.(3) ?? "1.000"} | ΔDPS{" "}
+                {state.flow_pulse_debug?.delta_dps?.toFixed?.(3) ?? "0.000"} | AnchorRatio{" "}
+                {state.flow_pulse_debug?.anchor_ratio?.toFixed?.(3) ?? "0.000"}
+              </div>
+
+              <div className="dps-wrap">
+                <div className="dps-header">
+                  <b>DPS</b>
+                  <span>{dpsPercent}%</span>
                 </div>
-                <div className="keyword-line">
-                  EVIDENCE: {state.analysis.keywords.k_facet.evidence.join(", ") || "없음"}
+                <div className="dps-bar">
+                  <div className="dps-fill" style={{ width: `${dpsPercent}%` }} />
                 </div>
-                <div className="keyword-line">
-                  ACTION: {state.analysis.keywords.k_facet.actions.join(", ") || "없음"}
+                {state.dps_breakdown ? (
+                  <div className="cockpit-stat">
+                    O {state.dps_breakdown.option_coverage.toFixed(2)} / C {state.dps_breakdown.constraint_coverage.toFixed(2)} /
+                    E {state.dps_breakdown.evidence_coverage.toFixed(2)} / T {state.dps_breakdown.tradeoff_coverage.toFixed(2)} /
+                    R {state.dps_breakdown.closing_readiness.toFixed(2)}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className={closingModeActive ? "closing-panel closing-panel-active" : "closing-panel"}>
+                <div className="closing-title">
+                  Closing UI: {closingModeActive ? "ACTIVE" : "WAITING TRIGGER"}
+                </div>
+                <div className="cockpit-stat">
+                  stance {state.decision_lock_debug?.stance_convergence?.toFixed?.(2) ?? "0.00"} | elapsed{" "}
+                  {Math.round(state.decision_lock_debug?.elapsed_sec ?? 0)}s | trigger(stance/stag/timebox)=
+                  {state.decision_lock_debug?.trigger_stance ? "1" : "0"}/
+                  {state.decision_lock_debug?.trigger_stagnation ? "1" : "0"}/
+                  {state.decision_lock_debug?.trigger_timebox ? "1" : "0"}
+                </div>
+                <div className="cockpit-actions">
+                  <button onClick={() => void onActionVote()} disabled={loading || !closingModeActive}>
+                  vote
+                  </button>
+                  <button onClick={() => void onActionSummary()} disabled={loading || !closingModeActive}>
+                  summary
+                  </button>
+                  <button onClick={() => void onActionDecide()} disabled={loading || !closingModeActive}>
+                  decide
+                  </button>
                 </div>
               </div>
 
-              <div className="keyword-block">
-                <b>Keyword Items (K1~K6)</b>
-                <div className="keyword-table-wrap">
-                  <table className="keyword-table">
-                    <thead>
-                      <tr>
-                        <th>Keyword</th>
-                        <th>Type</th>
-                        <th>Score</th>
-                        <th>Seen</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {state.analysis.keywords.items.slice(0, 12).map((item) => (
-                        <tr key={`${item.keyword}-${item.type}`}>
-                          <td>{item.keyword}</td>
-                          <td>{item.type}</td>
-                          <td>{item.score.toFixed(2)}</td>
-                          <td>{item.first_seen || "-"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+              {state.analysis.intervention.level === "L2" ? (
+                <div className="l2-prompt-box">L2 Shared Prompt: {state.analysis.intervention.banner_text}</div>
+              ) : null}
+              <div className="cockpit-stat">
+                Reco Trigger A/B/C = {recoDebug?.trigger_a_info_seeking ? "1" : "0"}/
+                {recoDebug?.trigger_b_evidence_weak ? "1" : "0"}/{recoDebug?.trigger_c_slot_fulfillment ? "1" : "0"} |
+                info60s {recoDebug?.info_signal_count_60s ?? 0} | cards R1 {recoDebug?.shown_r1 ?? 0}, R2{" "}
+                {recoDebug?.shown_r2 ?? 0}
               </div>
 
-              <div className="keyword-block">
-                <b>Pipeline</b>
-                <div className="keyword-line">
-                  Candidates: {state.analysis.keywords.pipeline.candidates.length} (Top 40)
-                </div>
-                <div className="keyword-line">
-                  Diversity Boost:{" "}
-                  {state.analysis.keywords.pipeline.final_selection.diversity_boost_applied ? "ON" : "OFF"}
-                </div>
-                <div className="keyword-line">
-                  Selected Core: {state.analysis.keywords.pipeline.final_selection.selected_core.join(", ") || "없음"}
-                </div>
-              </div>
-
-              <h3>R1 리소스</h3>
-              <ul>
-                {state.analysis.recommendations.r1_resources.map((r) => (
-                  <li key={r.url}>
+              <div className="recommend-grid">
+                {state.analysis.recommendations.r1_resources.slice(0, 2).map((r) => (
+                  <article key={`r1-${r.url}`} className="recommend-card">
+                    <div className="recommend-badge">R1</div>
                     <a href={r.url} target="_blank" rel="noreferrer">
                       {r.title}
                     </a>
-                  </li>
+                    <p>{r.reason}</p>
+                  </article>
                 ))}
-              </ul>
+                {!reduceFacets
+                  ? state.analysis.recommendations.r2_options.slice(0, 2).map((o) => (
+                      <article key={`r2-${o.option}`} className="recommend-card">
+                        <div className="recommend-badge">R2</div>
+                        <b>{o.option}</b>
+                        <p>{o.evidence_note}</p>
+                    </article>
+                  ))
+                  : (
+                    <article className="recommend-card">
+                      <div className="recommend-badge">R2</div>
+                      <p>Red/Re-orient 상태로 Facet 노출을 축소하고 K_core 중심으로 고정합니다.</p>
+                    </article>
+                  )}
+                {state.analysis.recommendations.r1_resources.length === 0 &&
+                state.analysis.recommendations.r2_options.length === 0 ? (
+                  <article className="recommend-card">
+                    <div className="recommend-badge">Reco</div>
+                    <p>현재 트리거 조건(A/B/C)이 충족되지 않아 추천 카드를 숨깁니다.</p>
+                  </article>
+                ) : null}
+              </div>
+
               <h3>산출물</h3>
               <div className="artifact-actions">
                 {(["meeting_summary", "decision_results", "action_items", "evidence_log"] as ArtifactKind[]).map(
@@ -703,8 +1073,8 @@ function App() {
         </aside>
       </main>
 
-      <section className="card">
-        <h2>생성된 결과</h2>
+      <section className="card outputs-stage">
+        <h2>Live Deliverables</h2>
         <div className="artifact-grid">
           {Object.values(state.artifacts).map((artifact) => (
             <article key={artifact.kind} className="artifact-card">

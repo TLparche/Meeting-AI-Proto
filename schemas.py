@@ -153,7 +153,7 @@ class ParticipationScore(StrictModel):
 
 
 class DPSScore(StrictModel):
-    score: int = Field(ge=0, le=100, default=0)
+    score: float = Field(ge=0.0, le=1.0, default=0.0)
     why: str = ""
 
 
