@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List
 
+from keyword_engine import build_keyword_engine_output
 from schemas import ArtifactKind
 
 
@@ -16,6 +17,7 @@ def build_analysis_template(
     meeting_goal: str,
     current_active_agenda: str,
     agenda_stack: List[dict],
+    transcript_window: List[dict] | None = None,
 ) -> Dict[str, Any]:
     active_title = current_active_agenda or "의사결정 대상을 명확히 하기"
     candidate_titles = [item.get("title", "") for item in agenda_stack if item.get("title")]
@@ -26,6 +28,12 @@ def build_analysis_template(
             "의사결정 책임자와 다음 단계 확정",
         ]
 
+    keywords = build_keyword_engine_output(
+        meeting_goal=meeting_goal,
+        current_active_agenda=current_active_agenda,
+        transcript_window=transcript_window or [],
+    )
+
     return {
         "agenda": {
             "active": {"title": active_title, "status": "ACTIVE", "confidence": 0.5},
@@ -34,14 +42,7 @@ def build_analysis_template(
                 for i, title in enumerate(candidate_titles[:3])
             ],
         },
-        "keywords": {
-            "k_core": {
-                "object": [meeting_goal or "다음 행동과 담당자를 정한다"],
-                "constraints": [],
-                "criteria": [],
-            },
-            "k_facet": {"options": [], "evidence": [], "actions": []},
-        },
+        "keywords": keywords,
         "scores": {
             "drift": {"score": 0, "band": "GREEN", "why": ""},
             "stagnation": {"score": 0, "why": ""},
@@ -154,6 +155,12 @@ def build_mock_analysis(
     ):
         evidence_status = "VERIFIED"
 
+    keywords = build_keyword_engine_output(
+        meeting_goal=meeting_goal,
+        current_active_agenda=current_active_agenda,
+        transcript_window=transcript_window,
+    )
+
     return {
         "agenda": {
             "active": {
@@ -166,18 +173,7 @@ def build_mock_analysis(
                 for i, title in enumerate(candidate_titles[:3])
             ],
         },
-        "keywords": {
-            "k_core": {
-                "object": [meeting_goal or "다음 행동과 담당자를 정한다"],
-                "constraints": ["현재 회의 시간 안에서 결론 낼 수 있도록 논의 범위를 제한"],
-                "criteria": ["효과", "노력", "리스크"],
-            },
-            "k_facet": {
-                "options": ["옵션 A", "옵션 B"],
-                "evidence": ["내부 벤치마크 요약", "외부 사례 연구"],
-                "actions": ["권고안 초안 작성", "승인자 확인"],
-            },
-        },
+        "keywords": keywords,
         "scores": {
             "drift": {"score": drift_score, "band": drift_band, "why": drift_why},
             "stagnation": {"score": stagnation_score, "why": stagnation_why},

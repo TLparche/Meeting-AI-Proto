@@ -257,6 +257,45 @@ textarea {
   gap: 6px;
 }
 
+.keyword-block {
+  border: 1px solid #d9e2ec;
+  border-radius: 8px;
+  background: #f9fcff;
+  padding: 8px;
+  margin: 8px 0;
+}
+
+.keyword-line {
+  font-size: 0.82rem;
+  margin-top: 4px;
+  word-break: break-word;
+}
+
+.keyword-table-wrap {
+  margin-top: 6px;
+  border: 1px solid #d9e2ec;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.keyword-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.keyword-table th,
+.keyword-table td {
+  padding: 5px 6px;
+  border-bottom: 1px solid #e2eaf1;
+  text-align: left;
+}
+
+.keyword-table th {
+  background: #eef5fb;
+}
+
 .artifact-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));

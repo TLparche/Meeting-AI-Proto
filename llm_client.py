@@ -10,6 +10,7 @@ import requests
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
+from keyword_engine import build_keyword_engine_output
 from mock_data import build_analysis_template, build_mock_analysis, build_mock_artifact
 from schemas import (
     AnalysisOutput,
@@ -29,8 +30,41 @@ ANALYSIS_JSON_SHAPE = {
         "candidates": [{"title": "string", "confidence": "0-1"}],
     },
     "keywords": {
+        "taxonomy": {
+            "K1_OBJECT": "string",
+            "K2_OPTION": "string",
+            "K3_CONSTRAINT": "string",
+            "K4_CRITERION": "string",
+            "K5_EVIDENCE": "string",
+            "K6_ACTION": "string",
+        },
         "k_core": {"object": ["string"], "constraints": ["string"], "criteria": ["string"]},
         "k_facet": {"options": ["string"], "evidence": ["string"], "actions": ["string"]},
+        "items": [
+            {
+                "keyword": "string",
+                "type": "K1_OBJECT|K2_OPTION|K3_CONSTRAINT|K4_CRITERION|K5_EVIDENCE|K6_ACTION",
+                "score": "0-1",
+                "first_seen": "HH:MM:SS",
+                "frequency": ">=1",
+                "decision_value": "0-1",
+                "evidence_boost": "0-1",
+                "is_core": "bool",
+            }
+        ],
+        "pipeline": {
+            "candidates": [{"keyword": "string", "frequency": ">=1", "first_seen": "HH:MM:SS"}],
+            "classification": [{"keyword": "string", "type": "K1_OBJECT|...|K6_ACTION"}],
+            "scoring": [{"keyword": "string", "decision_value": "0-1", "evidence_boost": "0-1", "score": "0-1"}],
+            "final_selection": {
+                "k_core_required": ["string"],
+                "k_facet_target": "3~8",
+                "selected_core": ["string"],
+                "selected_facet": ["string"],
+                "diversity_boost_applied": "bool",
+            },
+        },
+        "summary": {"object_focus": "string", "core_count": ">=0", "facet_count": ">=0"},
     },
     "scores": {
         "drift": {"score": "0-100", "band": "GREEN|YELLOW|RED", "why": "string"},
@@ -104,6 +138,12 @@ class GeminiClient:
             meeting_goal=meeting_goal,
             current_active_agenda=current_active_agenda,
             agenda_stack=agenda_stack,
+            transcript_window=transcript_window,
+        )
+        engine_keywords = build_keyword_engine_output(
+            meeting_goal=meeting_goal,
+            current_active_agenda=current_active_agenda,
+            transcript_window=transcript_window,
         )
 
         prompt = self._analysis_prompt(
@@ -118,6 +158,7 @@ class GeminiClient:
             raw_text = self._generate_content(prompt=prompt)
             payload = self._parse_json_with_repair(raw_text)
             merged_payload = self._deep_merge(defaults, payload)
+            merged_payload["keywords"] = engine_keywords
             return validate_analysis_payload(merged_payload)
         except (requests.RequestException, json.JSONDecodeError, ValidationError):
             return validate_analysis_payload(defaults)

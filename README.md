@@ -65,6 +65,12 @@ npm run dev
 
 - 회의 설정/전사/아젠다/분석/산출물 생성
 - `틱 / 업데이트` 단일 분석 호출
+- Keyword Engine (K1~K6):
+  - Candidates: Top 40 후보 추출
+  - Classification: K1 OBJECT / K2 OPTION / K3 CONSTRAINT / K4 CRITERION / K5 EVIDENCE / K6 ACTION
+  - Scoring: `DecisionValue + EvidenceBoost`
+  - Final Selection: Slot Filling (`K_core` 3~5, `K_facet` 3~8, Diversity Boost)
+  - 출력: `k_core`, `k_facet`, `items(타입/점수/출현시점)`, `pipeline`
 - Live STT:
   - 마이크 입력 (`getUserMedia`)
   - 시스템 오디오 (`getDisplayMedia` 오디오 공유)

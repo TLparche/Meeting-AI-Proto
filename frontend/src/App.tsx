@@ -603,6 +603,79 @@ function App() {
               <p>DPS: {state.analysis.scores.dps.score}</p>
               <p>Drift: {state.analysis.scores.drift.score}</p>
               <p>Stagnation: {state.analysis.scores.stagnation.score}</p>
+
+              <h3>Keyword Engine</h3>
+              <p>Object Focus: {state.analysis.keywords.summary.object_focus || "없음"}</p>
+              <p>
+                Core/Facet: {state.analysis.keywords.summary.core_count} / {state.analysis.keywords.summary.facet_count}
+              </p>
+
+              <div className="keyword-block">
+                <b>K_core</b>
+                <div className="keyword-line">
+                  OBJECT: {state.analysis.keywords.k_core.object.join(", ") || "없음"}
+                </div>
+                <div className="keyword-line">
+                  CONSTRAINT: {state.analysis.keywords.k_core.constraints.join(", ") || "없음"}
+                </div>
+                <div className="keyword-line">
+                  CRITERION: {state.analysis.keywords.k_core.criteria.join(", ") || "없음"}
+                </div>
+              </div>
+
+              <div className="keyword-block">
+                <b>K_facet</b>
+                <div className="keyword-line">
+                  OPTION: {state.analysis.keywords.k_facet.options.join(", ") || "없음"}
+                </div>
+                <div className="keyword-line">
+                  EVIDENCE: {state.analysis.keywords.k_facet.evidence.join(", ") || "없음"}
+                </div>
+                <div className="keyword-line">
+                  ACTION: {state.analysis.keywords.k_facet.actions.join(", ") || "없음"}
+                </div>
+              </div>
+
+              <div className="keyword-block">
+                <b>Keyword Items (K1~K6)</b>
+                <div className="keyword-table-wrap">
+                  <table className="keyword-table">
+                    <thead>
+                      <tr>
+                        <th>Keyword</th>
+                        <th>Type</th>
+                        <th>Score</th>
+                        <th>Seen</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {state.analysis.keywords.items.slice(0, 12).map((item) => (
+                        <tr key={`${item.keyword}-${item.type}`}>
+                          <td>{item.keyword}</td>
+                          <td>{item.type}</td>
+                          <td>{item.score.toFixed(2)}</td>
+                          <td>{item.first_seen || "-"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="keyword-block">
+                <b>Pipeline</b>
+                <div className="keyword-line">
+                  Candidates: {state.analysis.keywords.pipeline.candidates.length} (Top 40)
+                </div>
+                <div className="keyword-line">
+                  Diversity Boost:{" "}
+                  {state.analysis.keywords.pipeline.final_selection.diversity_boost_applied ? "ON" : "OFF"}
+                </div>
+                <div className="keyword-line">
+                  Selected Core: {state.analysis.keywords.pipeline.final_selection.selected_core.join(", ") || "없음"}
+                </div>
+              </div>
+
               <h3>R1 리소스</h3>
               <ul>
                 {state.analysis.recommendations.r1_resources.map((r) => (

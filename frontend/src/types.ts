@@ -29,8 +29,46 @@ export interface AnalysisOutput {
     candidates: Array<{ title: string; confidence: number }>;
   };
   keywords: {
+    taxonomy: {
+      K1_OBJECT: string;
+      K2_OPTION: string;
+      K3_CONSTRAINT: string;
+      K4_CRITERION: string;
+      K5_EVIDENCE: string;
+      K6_ACTION: string;
+    };
     k_core: { object: string[]; constraints: string[]; criteria: string[] };
     k_facet: { options: string[]; evidence: string[]; actions: string[] };
+    items: Array<{
+      keyword: string;
+      type: "K1_OBJECT" | "K2_OPTION" | "K3_CONSTRAINT" | "K4_CRITERION" | "K5_EVIDENCE" | "K6_ACTION";
+      score: number;
+      first_seen: string;
+      frequency: number;
+      decision_value: number;
+      evidence_boost: number;
+      is_core: boolean;
+    }>;
+    pipeline: {
+      candidates: Array<{ keyword: string; frequency: number; first_seen: string }>;
+      classification: Array<{
+        keyword: string;
+        type: "K1_OBJECT" | "K2_OPTION" | "K3_CONSTRAINT" | "K4_CRITERION" | "K5_EVIDENCE" | "K6_ACTION";
+      }>;
+      scoring: Array<{ keyword: string; decision_value: number; evidence_boost: number; score: number }>;
+      final_selection: {
+        k_core_required: string[];
+        k_facet_target: string;
+        selected_core: string[];
+        selected_facet: string[];
+        diversity_boost_applied: boolean;
+      };
+    };
+    summary: {
+      object_focus: string;
+      core_count: number;
+      facet_count: number;
+    };
   };
   scores: {
     drift: { score: number; band: "GREEN" | "YELLOW" | "RED"; why: string };
