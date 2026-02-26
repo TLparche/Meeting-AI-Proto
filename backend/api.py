@@ -110,12 +110,16 @@ def _pick_first_str(row: dict, keys: tuple[str, ...]) -> str:
 
 def _extract_rows_from_json_payload(payload: Any) -> list[dict]:
     out: list[dict] = []
+    seen: set[tuple[str, str, str | None]] = set()
 
     def push_row(item: Any) -> None:
         if isinstance(item, str):
             text = item.strip()
             if text:
-                out.append({"speaker": "화자", "text": text, "timestamp": None})
+                key = ("화자", text, None)
+                if key not in seen:
+                    seen.add(key)
+                    out.append({"speaker": "화자", "text": text, "timestamp": None})
             return
         if not isinstance(item, dict):
             return
@@ -141,11 +145,32 @@ def _extract_rows_from_json_payload(payload: Any) -> list[dict]:
             item, ("speaker", "spk", "speaker_id", "speaker_role", "role", "name", "participant", "author")
         ) or "화자"
         ts_raw = item.get("timestamp", item.get("time", item.get("ts", item.get("start_time", item.get("start")))))
-        out.append({"speaker": speaker, "text": text, "timestamp": _normalize_timestamp(ts_raw)})
+        ts_norm = _normalize_timestamp(ts_raw)
+        key = (speaker, text, ts_norm)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"speaker": speaker, "text": text, "timestamp": ts_norm})
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 12:
+            return
+        if isinstance(node, dict):
+            push_row(node)
+            for v in node.values():
+                walk(v, depth + 1)
+            return
+        if isinstance(node, list):
+            for v in node:
+                walk(v, depth + 1)
+            return
+        if isinstance(node, str):
+            # 문자열 배열 형태도 전사로 흡수
+            push_row(node)
+            return
 
     if isinstance(payload, list):
-        for entry in payload:
-            push_row(entry)
+        walk(payload)
         return out
 
     if isinstance(payload, dict):
@@ -167,10 +192,10 @@ def _extract_rows_from_json_payload(payload: Any) -> list[dict]:
             "records",
         ):
             if isinstance(payload.get(key), list):
-                for entry in payload.get(key, []):
-                    push_row(entry)
-                if out:
-                    return out
+                walk(payload.get(key, []))
+        # 루트 키 패턴이 없더라도 재귀 탐색으로 전사 후보를 찾는다.
+        if not out:
+            walk(payload)
     return out
 
 
@@ -311,6 +336,7 @@ class MeetingRuntime:
             self.fairtalk_glow: list[dict] = []
             self.fairtalk_debug: dict[str, object] = {}
             self.fairtalk_monitor: dict[str, dict[str, float | str | None]] = {}
+            self.analysis_runtime: dict[str, object] = {}
             self._refresh_live_artifacts()
 
     def snapshot(self) -> dict:
@@ -342,6 +368,8 @@ class MeetingRuntime:
                 "recommendation_debug": self.recommendation_debug,
                 "fairtalk_glow": self.fairtalk_glow,
                 "fairtalk_debug": self.fairtalk_debug,
+                "analysis_runtime": self.analysis_runtime,
+                "llm_status": self.client.get_status(),
                 "analysis": self.analysis,
                 "artifacts": self.artifacts,
             }
@@ -492,6 +520,129 @@ class MeetingRuntime:
             )[:2]
             self.recommendation_debug = dict(recommendation_out.get("debug") or {})
 
+            def _run_local_control_pipeline(reason: str) -> None:
+                tracker_output = run_agenda_tracker(
+                    transcript=tracker_window,
+                    active_agenda=(self.analysis.get("agenda", {}).get("active", {}).get("title") or current_active),
+                    agenda_stack=self.agenda_stack,
+                    keywords=self.analysis.get("keywords", {}),
+                    existing_vectors=self.agenda_vectors,
+                )
+                self.agenda_candidates = tracker_output.get("agenda_candidates", [])
+                self.agenda_vectors = tracker_output.get("agenda_vectors", {})
+                self.agenda_tracker_debug = tracker_output.get("tracker_debug", {})
+                self.agenda_tracker_debug["fallback_reason"] = reason
+
+                existing_titles = {
+                    (c.get("title") or "").strip()
+                    for c in self.analysis.get("agenda", {}).get("candidates", [])
+                    if (c.get("title") or "").strip()
+                }
+                for cand in self.agenda_candidates:
+                    title = (cand.get("title") or "").strip()
+                    if not title or title in existing_titles:
+                        continue
+                    self.analysis.setdefault("agenda", {}).setdefault("candidates", []).append(
+                        {
+                            "title": title,
+                            "confidence": float(cand.get("confidence", 0.6)),
+                        }
+                    )
+                    existing_titles.add(title)
+
+                dps_pre = compute_dps(
+                    analysis=self.analysis,
+                    agenda_state_map=self.agenda_state_map,
+                    active_agenda_id=self.active_agenda_id,
+                )
+                local_now_ts = time.time()
+                history_for_flow = [h for h in self.dps_history if local_now_ts - float(h.get("ts", local_now_ts)) <= 180.0]
+                history_for_flow.append({"ts": local_now_ts, "score": float(dps_pre.get("score", 0.0))})
+                k_core = (self.analysis.get("keywords", {}) or {}).get("k_core", {}) or {}
+                flow_out = run_flow_pulse(
+                    transcript=flow_window,
+                    k_core=k_core,
+                    dps_history=history_for_flow,
+                    now_ts=local_now_ts,
+                )
+                self.stagnation_flag = bool(flow_out.get("stagnation_flag", False))
+                self.loop_state = str(flow_out.get("loop_state", "Normal"))
+                self.flow_pulse_debug = dict(flow_out.get("debug", {}))
+
+                if self.stagnation_flag:
+                    lock = self.analysis.setdefault("intervention", {}).setdefault("decision_lock", {})
+                    existing_reason = str(lock.get("reason") or "").strip()
+                    trigger_text = "Flow Pulse trigger #2: circular stagnation detected"
+                    lock["triggered"] = True
+                    if trigger_text not in existing_reason:
+                        lock["reason"] = f"{existing_reason}; {trigger_text}" if existing_reason else trigger_text
+
+                prev_lock = bool(
+                    ((self.analysis.get("intervention") or {}).get("decision_lock") or {}).get("triggered", False)
+                )
+                lock_out = run_decision_lock(
+                    transcript=lock_window,
+                    meeting_elapsed_sec=time.time() - self.meeting_started_at,
+                    stagnation_flag=self.stagnation_flag,
+                    previous_decision_lock=prev_lock,
+                )
+                lock_payload = self.analysis.setdefault("intervention", {}).setdefault("decision_lock", {})
+                lock_payload["triggered"] = bool(lock_out.get("triggered", False))
+                lock_payload["reason"] = str(lock_out.get("reason", ""))
+                self.decision_lock_debug = dict(lock_out.get("debug") or {})
+
+                fsm_out = run_agenda_fsm(
+                    agenda_state_map=self.agenda_state_map,
+                    active_agenda_id=self.active_agenda_id,
+                    agenda_candidates=self.agenda_candidates,
+                    analysis=self.analysis,
+                    transcript=fsm_window,
+                    existing_events=self.agenda_events,
+                )
+                self.agenda_state_map = fsm_out.get("agenda_state_map", {})
+                self.active_agenda_id = str(fsm_out.get("active_agenda_id", "") or "")
+                self.agenda_events = list(fsm_out.get("events", []))
+                self._sync_agenda_stack_from_state_map()
+
+                dps_out = compute_dps(
+                    analysis=self.analysis,
+                    agenda_state_map=self.agenda_state_map,
+                    active_agenda_id=self.active_agenda_id,
+                )
+                self.dps_t = float(dps_out.get("score", 0.0))
+                self.dps_breakdown = dict(dps_out.get("breakdown", {}))
+                self.analysis.setdefault("scores", {}).setdefault("dps", {})["score"] = self.dps_t
+                self.analysis["scores"]["dps"]["why"] = (
+                    "Option {option_coverage:.2f} | Constraint {constraint_coverage:.2f} | "
+                    "Evidence {evidence_coverage:.2f} | Trade-off {tradeoff_coverage:.2f} | "
+                    "Closing {closing_readiness:.2f}"
+                ).format(**self.dps_breakdown)
+                self.dps_history = [h for h in self.dps_history if local_now_ts - float(h.get("ts", local_now_ts)) <= 180.0]
+                self.dps_history.append({"ts": local_now_ts, "score": self.dps_t})
+
+                active_title_for_drift = ""
+                if self.active_agenda_id and self.active_agenda_id in self.agenda_state_map:
+                    active_title_for_drift = str(self.agenda_state_map[self.active_agenda_id].get("title") or "")
+                if not active_title_for_drift:
+                    active_title_for_drift = str(
+                        (self.analysis.get("agenda", {}).get("active", {}).get("title") or "")
+                    ).strip()
+                active_vec = self.agenda_vectors.get(active_title_for_drift, {})
+                drift_out = run_drift_dampener(
+                    transcript=drift_window,
+                    active_agenda_title=active_title_for_drift,
+                    active_agenda_vector=active_vec,
+                    monitor_state=self.drift_monitor,
+                    meeting_elapsed_sec=time.time() - self.meeting_started_at,
+                )
+                self.drift_state = str(drift_out.get("drift_state") or "Normal")
+                self.drift_ui_cues = dict(drift_out.get("ui_cues") or {})
+                self.drift_debug = dict(drift_out.get("debug") or {})
+                self.drift_monitor = dict(drift_out.get("monitor") or self.drift_monitor)
+
+            control_plane_source = "local_disabled"
+            control_plane_reason = "USE_LLM_CONTROL_PLANE=0"
+            used_local_fallback = False
             if USE_LLM_CONTROL_PLANE:
                 control_payload = self.client.infer_control_plane(
                     meeting_goal=self.meeting_goal,
@@ -518,6 +669,11 @@ class MeetingRuntime:
                         "decision_lock_debug": self.decision_lock_debug,
                     },
                 )
+                control_meta = dict(control_payload.get("_meta") or {})
+                control_plane_source = str(control_meta.get("source") or "unknown")
+                control_plane_reason = str(control_meta.get("reason") or "")
+                if "_meta" in control_payload:
+                    control_payload.pop("_meta", None)
                 control_keywords = control_payload.get("keywords")
                 if isinstance(control_keywords, dict) and control_keywords:
                     self.analysis["keywords"] = control_keywords
@@ -584,124 +740,26 @@ class MeetingRuntime:
                 )
                 self.drift_debug = dict(drift_payload.get("drift_debug") or {})
                 self.drift_monitor = dict(drift_payload.get("monitor") or self.drift_monitor)
+                payload_sparse = (not self.agenda_state_map) or (
+                    len(self.agenda_candidates) == 0 and len(self.agenda_vectors) == 0
+                )
+                if control_plane_source != "llm" or payload_sparse:
+                    used_local_fallback = True
+                    local_reason = "llm_payload_sparse" if payload_sparse and control_plane_source == "llm" else control_plane_source
+                    _run_local_control_pipeline(local_reason)
             else:
-                tracker_output = run_agenda_tracker(
-                    transcript=tracker_window,
-                    active_agenda=(self.analysis.get("agenda", {}).get("active", {}).get("title") or current_active),
-                    agenda_stack=self.agenda_stack,
-                    keywords=self.analysis.get("keywords", {}),
-                    existing_vectors=self.agenda_vectors,
-                )
-                self.agenda_candidates = tracker_output.get("agenda_candidates", [])
-                self.agenda_vectors = tracker_output.get("agenda_vectors", {})
-                self.agenda_tracker_debug = tracker_output.get("tracker_debug", {})
+                used_local_fallback = True
+                _run_local_control_pipeline(control_plane_reason)
 
-                # Merge tracker candidates into agenda candidate pool used by stack sync.
-                existing_titles = {
-                    (c.get("title") or "").strip()
-                    for c in self.analysis.get("agenda", {}).get("candidates", [])
-                    if (c.get("title") or "").strip()
-                }
-                for cand in self.agenda_candidates:
-                    title = (cand.get("title") or "").strip()
-                    if not title or title in existing_titles:
-                        continue
-                    self.analysis.setdefault("agenda", {}).setdefault("candidates", []).append(
-                        {
-                            "title": title,
-                            "confidence": float(cand.get("confidence", 0.6)),
-                        }
-                    )
-                    existing_titles.add(title)
-                dps_pre = compute_dps(
-                    analysis=self.analysis,
-                    agenda_state_map=self.agenda_state_map,
-                    active_agenda_id=self.active_agenda_id,
-                )
-                now_ts = time.time()
-                history_for_flow = [h for h in self.dps_history if now_ts - float(h.get("ts", now_ts)) <= 180.0]
-                history_for_flow.append({"ts": now_ts, "score": float(dps_pre.get("score", 0.0))})
-                k_core = (self.analysis.get("keywords", {}) or {}).get("k_core", {}) or {}
-                flow_out = run_flow_pulse(
-                    transcript=flow_window,
-                    k_core=k_core,
-                    dps_history=history_for_flow,
-                    now_ts=now_ts,
-                )
-                self.stagnation_flag = bool(flow_out.get("stagnation_flag", False))
-                self.loop_state = str(flow_out.get("loop_state", "Normal"))
-                self.flow_pulse_debug = dict(flow_out.get("debug", {}))
-
-                if self.stagnation_flag:
-                    lock = self.analysis.setdefault("intervention", {}).setdefault("decision_lock", {})
-                    existing_reason = str(lock.get("reason") or "").strip()
-                    trigger_text = "Flow Pulse trigger #2: circular stagnation detected"
-                    lock["triggered"] = True
-                    if trigger_text not in existing_reason:
-                        lock["reason"] = f"{existing_reason}; {trigger_text}" if existing_reason else trigger_text
-
-                prev_lock = bool(
-                    ((self.analysis.get("intervention") or {}).get("decision_lock") or {}).get("triggered", False)
-                )
-                lock_out = run_decision_lock(
-                    transcript=lock_window,
-                    meeting_elapsed_sec=time.time() - self.meeting_started_at,
-                    stagnation_flag=self.stagnation_flag,
-                    previous_decision_lock=prev_lock,
-                )
-                lock_payload = self.analysis.setdefault("intervention", {}).setdefault("decision_lock", {})
-                lock_payload["triggered"] = bool(lock_out.get("triggered", False))
-                lock_payload["reason"] = str(lock_out.get("reason", ""))
-                self.decision_lock_debug = dict(lock_out.get("debug") or {})
-
-                fsm_out = run_agenda_fsm(
-                    agenda_state_map=self.agenda_state_map,
-                    active_agenda_id=self.active_agenda_id,
-                    agenda_candidates=self.agenda_candidates,
-                    analysis=self.analysis,
-                    transcript=fsm_window,
-                    existing_events=self.agenda_events,
-                )
-                self.agenda_state_map = fsm_out.get("agenda_state_map", {})
-                self.active_agenda_id = str(fsm_out.get("active_agenda_id", "") or "")
-                self.agenda_events = list(fsm_out.get("events", []))
-                self._sync_agenda_stack_from_state_map()
-
-                dps_out = compute_dps(
-                    analysis=self.analysis,
-                    agenda_state_map=self.agenda_state_map,
-                    active_agenda_id=self.active_agenda_id,
-                )
-                self.dps_t = float(dps_out.get("score", 0.0))
-                self.dps_breakdown = dict(dps_out.get("breakdown", {}))
-                self.analysis.setdefault("scores", {}).setdefault("dps", {})["score"] = self.dps_t
-                self.analysis["scores"]["dps"]["why"] = (
-                    "Option {option_coverage:.2f} | Constraint {constraint_coverage:.2f} | "
-                    "Evidence {evidence_coverage:.2f} | Trade-off {tradeoff_coverage:.2f} | "
-                    "Closing {closing_readiness:.2f}"
-                ).format(**self.dps_breakdown)
-                self.dps_history = [h for h in self.dps_history if now_ts - float(h.get("ts", now_ts)) <= 180.0]
-                self.dps_history.append({"ts": now_ts, "score": self.dps_t})
-
-                active_title_for_drift = ""
-                if self.active_agenda_id and self.active_agenda_id in self.agenda_state_map:
-                    active_title_for_drift = str(self.agenda_state_map[self.active_agenda_id].get("title") or "")
-                if not active_title_for_drift:
-                    active_title_for_drift = str(
-                        (self.analysis.get("agenda", {}).get("active", {}).get("title") or "")
-                    ).strip()
-                active_vec = self.agenda_vectors.get(active_title_for_drift, {})
-                drift_out = run_drift_dampener(
-                    transcript=drift_window,
-                    active_agenda_title=active_title_for_drift,
-                    active_agenda_vector=active_vec,
-                    monitor_state=self.drift_monitor,
-                    meeting_elapsed_sec=time.time() - self.meeting_started_at,
-                )
-                self.drift_state = str(drift_out.get("drift_state") or "Normal")
-                self.drift_ui_cues = dict(drift_out.get("ui_cues") or {})
-                self.drift_debug = dict(drift_out.get("debug") or {})
-                self.drift_monitor = dict(drift_out.get("monitor") or self.drift_monitor)
+            self.analysis_runtime = {
+                "tick_mode": "full_context" if use_full_context else "windowed",
+                "transcript_count": len(self.transcript),
+                "llm_window_turns": len(llm_window),
+                "engine_window_turns": len(engine_window),
+                "control_plane_source": control_plane_source,
+                "control_plane_reason": control_plane_reason,
+                "used_local_fallback": used_local_fallback,
+            }
 
             if self.active_agenda_id and self.active_agenda_id in self.agenda_state_map:
                 active_entry = self.agenda_state_map[self.active_agenda_id]
@@ -866,6 +924,20 @@ def get_state():
     return runtime.snapshot()
 
 
+@app.get("/api/llm/status")
+def get_llm_status():
+    return runtime.client.get_status()
+
+
+@app.post("/api/llm/ping")
+def post_llm_ping():
+    result = runtime.client.ping()
+    return {
+        "result": result,
+        "llm_status": runtime.client.get_status(),
+    }
+
+
 @app.post("/api/config")
 def post_config(payload: ConfigInput):
     runtime.update_config(payload)
@@ -906,6 +978,7 @@ def post_import_json_dir(payload: DatasetImportInput):
             "auto_tick": payload.auto_tick,
             "ticked": ticked,
             "analysis_mode": "full_context_once" if ticked else "none",
+            "warning": "업로드한 JSON에서 전사 문장을 찾지 못했습니다." if added == 0 else "",
         },
     }
 
@@ -981,6 +1054,7 @@ async def post_import_json_files(
             "auto_tick": auto_tick,
             "ticked": ticked,
             "analysis_mode": "full_context_once" if ticked else "none",
+            "warning": "업로드한 JSON에서 전사 문장을 찾지 못했습니다." if added == 0 else "",
         },
     }
 

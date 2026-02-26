@@ -219,6 +219,96 @@ class GeminiClient:
         self.config = cfg
         self.mock_mode = not bool(cfg.api_key)
         self._session = requests.Session()
+        self._last_request_at: str = ""
+        self._last_success_at: str = ""
+        self._last_error: str = ""
+        self._last_error_at: str = ""
+        self._last_operation: str = ""
+        self._request_count: int = 0
+        self._success_count: int = 0
+        self._error_count: int = 0
+
+    def get_status(self) -> Dict[str, Any]:
+        note = ""
+        connected = bool(self.config.api_key)
+        if self.mock_mode:
+            connected = False
+            note = "GOOGLE_API_KEY가 없어 mock/fallback 모드로 동작 중입니다."
+        elif self._last_error:
+            connected = False
+            note = "LLM 호출 실패 후 기본값으로 폴백 중입니다."
+        elif not self._last_success_at:
+            connected = False
+            note = "아직 LLM 호출 성공 이력이 없습니다."
+        else:
+            note = "LLM 연결 정상"
+        return {
+            "provider": "gemini",
+            "model": self.config.model,
+            "base_url": self.config.base_url,
+            "mode": "mock" if self.mock_mode else "live",
+            "api_key_present": bool(self.config.api_key),
+            "connected": connected,
+            "note": note,
+            "request_count": self._request_count,
+            "success_count": self._success_count,
+            "error_count": self._error_count,
+            "last_operation": self._last_operation,
+            "last_request_at": self._last_request_at,
+            "last_success_at": self._last_success_at,
+            "last_error": self._last_error,
+            "last_error_at": self._last_error_at,
+        }
+
+    def _mark_request(self, operation: str) -> None:
+        self._last_operation = operation
+        self._last_request_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._request_count += 1
+
+    def _mark_success(self) -> None:
+        self._last_success_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._last_error = ""
+        self._last_error_at = ""
+        self._success_count += 1
+
+    def _mark_error(self, exc: Exception) -> None:
+        self._last_error = str(exc)[:500]
+        self._last_error_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._error_count += 1
+
+    def ping(self) -> Dict[str, Any]:
+        self._mark_request("ping")
+        if self.mock_mode:
+            self._last_error = "LLM 미연결: GOOGLE_API_KEY 없음 (mock mode)"
+            self._last_error_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._error_count += 1
+            return {
+                "ok": False,
+                "message": self._last_error,
+                "mode": "mock",
+            }
+        try:
+            raw_text = self._generate_content(
+                prompt=(
+                    "다음 JSON 객체를 그대로 반환하세요: "
+                    '{"ok": true, "pong": "ready"}'
+                )
+            )
+            parsed = self._parse_json_with_repair(raw_text)
+            self._mark_success()
+            return {
+                "ok": True,
+                "message": "LLM 응답 성공",
+                "mode": "live",
+                "response_preview": parsed,
+            }
+        except (requests.RequestException, json.JSONDecodeError, ValidationError) as exc:
+            self._mark_error(exc)
+            return {
+                "ok": False,
+                "message": str(exc)[:500],
+                "mode": "live",
+            }
 
     def analyze_meeting(
         self,
@@ -228,7 +318,9 @@ class GeminiClient:
         transcript_window: list[dict],
         agenda_stack: list[dict],
     ) -> AnalysisOutput:
+        self._mark_request("analyze_meeting")
         if self.mock_mode:
+            self._last_error = "LLM 미연결: GOOGLE_API_KEY 없음 (mock mode)"
             return validate_analysis_payload(
                 build_mock_analysis(
                     meeting_goal=meeting_goal,
@@ -262,8 +354,10 @@ class GeminiClient:
             payload = self._parse_json_with_repair(raw_text)
             merged_payload = self._deep_merge(defaults, payload)
             merged_payload["keywords"] = engine_keywords
+            self._mark_success()
             return validate_analysis_payload(merged_payload)
-        except (requests.RequestException, json.JSONDecodeError, ValidationError):
+        except (requests.RequestException, json.JSONDecodeError, ValidationError) as exc:
+            self._mark_error(exc)
             return validate_analysis_payload(defaults)
 
     def generate_artifact(
@@ -274,6 +368,7 @@ class GeminiClient:
         transcript_window: list[dict],
         analysis: Optional[dict] = None,
     ) -> ArtifactOutput:
+        self._mark_request("generate_artifact")
         fallback = build_mock_artifact(
             kind=kind,
             context={
@@ -284,6 +379,7 @@ class GeminiClient:
             },
         )
         if self.mock_mode:
+            self._last_error = "LLM 미연결: GOOGLE_API_KEY 없음 (mock mode)"
             return validate_artifact_payload(fallback)
 
         prompt = self._artifact_prompt(
@@ -299,8 +395,10 @@ class GeminiClient:
                 raw_text = self._generate_content(prompt=prompt)
                 parsed = self._parse_json_with_repair(raw_text)
                 merged_payload = self._deep_merge(fallback, parsed)
+                self._mark_success()
                 return validate_artifact_payload(merged_payload)
-            except (requests.RequestException, json.JSONDecodeError, ValidationError):
+            except (requests.RequestException, json.JSONDecodeError, ValidationError) as exc:
+                self._mark_error(exc)
                 continue
 
         return validate_artifact_payload(fallback)
@@ -316,6 +414,7 @@ class GeminiClient:
         analysis: dict,
         previous_state: dict[str, Any],
     ) -> Dict[str, Any]:
+        self._mark_request("infer_control_plane")
         seed_keywords = build_keyword_engine_output(
             meeting_goal=meeting_goal,
             current_active_agenda=current_active_agenda,
@@ -345,6 +444,10 @@ class GeminiClient:
             }
 
         defaults: Dict[str, Any] = {
+            "_meta": {
+                "source": "default_seed",
+                "reason": "seeded_from_previous_state",
+            },
             "keywords": seed_keywords,
             "agenda_tracker": {
                 "agenda_candidates": list(previous_state.get("agenda_candidates") or []),
@@ -393,6 +496,11 @@ class GeminiClient:
             },
         }
         if self.mock_mode:
+            self._last_error = "LLM 미연결: GOOGLE_API_KEY 없음 (mock mode)"
+            defaults["_meta"] = {
+                "source": "fallback_mock",
+                "reason": self._last_error,
+            }
             return defaults
 
         prompt = self._control_plane_prompt(
@@ -407,8 +515,19 @@ class GeminiClient:
         try:
             raw_text = self._generate_content(prompt=prompt)
             payload = self._parse_json_with_repair(raw_text)
-            return self._deep_merge(defaults, payload)
-        except (requests.RequestException, json.JSONDecodeError, ValidationError):
+            self._mark_success()
+            merged = self._deep_merge(defaults, payload)
+            meta = dict(merged.get("_meta") or {})
+            meta["source"] = "llm"
+            meta["reason"] = "llm_response_merged"
+            merged["_meta"] = meta
+            return merged
+        except (requests.RequestException, json.JSONDecodeError, ValidationError) as exc:
+            self._mark_error(exc)
+            defaults["_meta"] = {
+                "source": "fallback_error",
+                "reason": str(exc)[:300],
+            }
             return defaults
 
     def _analysis_prompt(
@@ -532,7 +651,14 @@ class GeminiClient:
             json=payload,
             timeout=self.config.timeout_seconds,
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            body_preview = (response.text or "").strip()
+            if len(body_preview) > 500:
+                body_preview = body_preview[:500] + "...(truncated)"
+            raise requests.HTTPError(
+                f"Gemini HTTP {response.status_code}: {body_preview}",
+                response=response,
+            )
         data = response.json()
         candidates = data.get("candidates") or []
         if not candidates:

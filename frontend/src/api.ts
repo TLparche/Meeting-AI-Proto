@@ -1,4 +1,11 @@
-import type { ArtifactKind, ImportJsonDirResponse, MeetingState, SttChunkResponse } from "./types";
+import type {
+  ArtifactKind,
+  ImportJsonDirResponse,
+  LlmPingResponse,
+  LlmStatus,
+  MeetingState,
+  SttChunkResponse,
+} from "./types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
@@ -13,6 +20,16 @@ async function parse<T>(res: Response): Promise<T> {
 export async function getState(): Promise<MeetingState> {
   const res = await fetch("/api/state");
   return parse<MeetingState>(res);
+}
+
+export async function getLlmStatus(): Promise<LlmStatus> {
+  const res = await fetch("/api/llm/status");
+  return parse<LlmStatus>(res);
+}
+
+export async function pingLlm(): Promise<LlmPingResponse> {
+  const res = await fetch("/api/llm/ping", { method: "POST" });
+  return parse<LlmPingResponse>(res);
 }
 
 export async function saveConfig(payload: {

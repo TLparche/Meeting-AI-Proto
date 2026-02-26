@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   addUtterance,
   createArtifact,
+  getLlmStatus,
   getState,
   importJsonDir,
   importJsonFiles,
+  pingLlm,
   resetState,
   saveConfig,
   tickAnalysis,
@@ -76,6 +80,9 @@ function App() {
   const [datasetFolder, setDatasetFolder] = useState("dataset/economy");
   const [datasetFiles, setDatasetFiles] = useState<File[]>([]);
   const [datasetImportInfo, setDatasetImportInfo] = useState("");
+  const [llmChecking, setLlmChecking] = useState(false);
+  const [llmPingMessage, setLlmPingMessage] = useState("");
+  const [llmPingOk, setLlmPingOk] = useState<boolean | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -108,6 +115,15 @@ function App() {
     }
   }, []);
 
+  const refreshLlmStatus = useCallback(async () => {
+    try {
+      const status = await getLlmStatus();
+      setState((prev) => ({ ...prev, llm_status: status }));
+    } catch {
+      // ignore to avoid noisy UI on periodic polling
+    }
+  }, []);
+
   useEffect(() => {
     void loadState();
   }, [loadState]);
@@ -118,6 +134,13 @@ function App() {
     }, 1200);
     return () => window.clearInterval(id);
   }, [loadState]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      void refreshLlmStatus();
+    }, 3000);
+    return () => window.clearInterval(id);
+  }, [refreshLlmStatus]);
 
   const showLiveBanner = useCallback((text: string, kind: "info" | "lock" | "warn" = "info") => {
     if (bannerTimerRef.current !== null) {
@@ -206,6 +229,20 @@ function App() {
     }));
   }, [state.fairtalk_glow, state.analysis]);
   const fairtalkDebug = state.fairtalk_debug;
+  const llmStatus = state.llm_status;
+  const llmDisconnected = Boolean(llmStatus) && !Boolean(llmStatus?.connected);
+  const llmDetail = useMemo(() => {
+    if (!llmStatus) {
+      return "";
+    }
+    const parts = [
+      `provider=${llmStatus.provider}`,
+      `model=${llmStatus.model}`,
+      `mode=${llmStatus.mode}`,
+      llmStatus.last_error ? `last_error=${llmStatus.last_error}` : "",
+    ].filter(Boolean);
+    return parts.join(" | ");
+  }, [llmStatus]);
   const transcriptCount = state.transcript.length;
   const activeAgendaCount = agendaBuckets.active.length;
   const proposedAgendaCount = agendaBuckets.proposed.length;
@@ -320,6 +357,9 @@ function App() {
       setDatasetImportInfo(
         `loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}`,
       );
+      if (d.warning) {
+        setError(d.warning);
+      }
     } catch (err) {
       setError((err as Error).message);
       setDatasetImportInfo("");
@@ -346,11 +386,31 @@ function App() {
       setDatasetImportInfo(
         `uploaded=${datasetFiles.length}, loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}`,
       );
+      if (d.warning) {
+        setError(d.warning);
+      }
     } catch (err) {
       setError((err as Error).message);
       setDatasetImportInfo("");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const onPingLlm = async () => {
+    setLlmChecking(true);
+    try {
+      const res = await pingLlm();
+      setState((prev) => ({ ...prev, llm_status: res.llm_status }));
+      setLlmPingOk(Boolean(res.result.ok));
+      setLlmPingMessage(res.result.message || (res.result.ok ? "LLM 응답 성공" : "LLM 응답 실패"));
+      setError("");
+    } catch (err) {
+      setLlmPingOk(false);
+      setLlmPingMessage((err as Error).message);
+      setError((err as Error).message);
+    } finally {
+      setLlmChecking(false);
     }
   };
 
@@ -690,6 +750,51 @@ function App() {
       {liveBanner ? <div className={`live-banner live-banner-${liveBanner.kind}`}>{liveBanner.text}</div> : null}
 
       {error ? <div className="error-box">{error}</div> : null}
+      {llmDisconnected ? (
+        <div className="llm-warning-box">
+          <b>LLM 연결 경고:</b> {llmStatus?.note || "LLM이 연결되지 않았습니다."}
+          {llmDetail ? <div className="hint">{llmDetail}</div> : null}
+        </div>
+      ) : null}
+      <section className="llm-status-panel">
+        <div className="llm-status-head">
+          <div className="llm-status-title">LLM 연결 상태</div>
+          <span className={llmDisconnected ? "llm-chip llm-chip-off" : "llm-chip llm-chip-on"}>
+            {llmDisconnected ? "DISCONNECTED" : "CONNECTED"}
+          </span>
+        </div>
+        <div className="llm-status-grid">
+          <div>provider: {llmStatus?.provider || "-"}</div>
+          <div>model: {llmStatus?.model || "-"}</div>
+          <div>mode: {llmStatus?.mode || "-"}</div>
+          <div>api_key_present: {String(Boolean(llmStatus?.api_key_present))}</div>
+          <div>
+            req/success/error: {llmStatus?.request_count ?? 0}/{llmStatus?.success_count ?? 0}/{llmStatus?.error_count ?? 0}
+          </div>
+          <div>last_request_at: {llmStatus?.last_request_at || "-"}</div>
+          <div>last_success_at: {llmStatus?.last_success_at || "-"}</div>
+          <div>last_error_at: {llmStatus?.last_error_at || "-"}</div>
+          <div>control_plane_source: {state.analysis_runtime?.control_plane_source || "-"}</div>
+          <div>local_fallback: {String(Boolean(state.analysis_runtime?.used_local_fallback))}</div>
+        </div>
+        {state.analysis_runtime?.control_plane_reason ? (
+          <div className="hint">control_plane_reason: {state.analysis_runtime.control_plane_reason}</div>
+        ) : null}
+        {llmStatus?.last_error ? <pre className="llm-error-pre">{llmStatus.last_error}</pre> : null}
+        {llmPingMessage ? (
+          <div className={llmPingOk ? "llm-ping-result llm-ping-ok" : "llm-ping-result llm-ping-fail"}>
+            Ping 결과: {llmPingMessage}
+          </div>
+        ) : null}
+        <div className="llm-status-actions">
+          <button onClick={() => void onPingLlm()} disabled={llmChecking}>
+            {llmChecking ? "LLM 확인 중..." : "LLM 연결 테스트"}
+          </button>
+          <button onClick={() => void refreshLlmStatus()} disabled={llmChecking}>
+            상태 새로고침
+          </button>
+        </div>
+      </section>
 
       <section className="config-panel">
         <label>
@@ -864,6 +969,22 @@ function App() {
               )}
             </div>
           </div>
+          <section className="transcript-main-section">
+            <div className="transcript-main-header">
+              <h3>전사 메인 피드</h3>
+              <span className="hint">전체 {state.transcript.length}줄</span>
+            </div>
+            <div className="feed feed-main">
+              {state.transcript.map((item, idx) => (
+                <div key={`${item.timestamp}-${idx}`} className="feed-row">
+                  <b>
+                    {item.timestamp} · {item.speaker}
+                  </b>
+                  <span>{item.text}</span>
+                </div>
+              ))}
+            </div>
+          </section>
           <div className="stt-box">
             <div className="row">
               <select value={sttSource} onChange={(e) => setSttSource(e.target.value as "mic" | "system")}>
@@ -911,7 +1032,7 @@ function App() {
               ))}
             </div>
 
-            <details className="debug-fold" open>
+            <details className="debug-fold">
               <summary>STT 처리 파이프라인/로그</summary>
               <h4 className="stt-subtitle">마지막 청크 서버 처리 단계</h4>
               {lastDebug ? (
@@ -973,7 +1094,6 @@ function App() {
             </details>
           </div>
 
-          <h3>전사 피드 (전체 {state.transcript.length}줄)</h3>
           <div className="participant-wrap">
             <div className="participant-header">
               <h3>FairTalk Participant Frames</h3>
@@ -1006,16 +1126,6 @@ function App() {
               )}
             </div>
             <div className="hint">침묵 자체는 트리거하지 않고, 발언 의도 신호가 있을 때만 glow를 표시합니다.</div>
-          </div>
-          <div className="feed">
-            {state.transcript.map((item, idx) => (
-              <div key={`${item.timestamp}-${idx}`} className="feed-row">
-                <b>
-                  {item.timestamp} · {item.speaker}
-                </b>
-                <span>{item.text}</span>
-              </div>
-            ))}
           </div>
         </section>
 
@@ -1180,19 +1290,34 @@ function App() {
       </main>
 
       <section className="card outputs-stage">
-        <h2>Live Deliverables</h2>
+        <div className="outputs-header">
+          <h2>Live Deliverables</h2>
+          <span className="hint">회의 중 즉시 생성된 결과물</span>
+        </div>
         <div className="artifact-grid">
-          {Object.values(state.artifacts).map((artifact) => (
-            <article key={artifact.kind} className="artifact-card">
-              <h3>{artifact.title}</h3>
-              <pre>{artifact.markdown}</pre>
-              <ul>
-                {artifact.bullets.map((b, i) => (
-                  <li key={`${artifact.kind}-${i}`}>{b}</li>
-                ))}
-              </ul>
+          {Object.values(state.artifacts).length === 0 ? (
+            <article className="artifact-card artifact-empty">
+              <h3>아직 생성된 산출물이 없습니다.</h3>
+              <p className="hint">우측 Decision Intelligence에서 산출물 버튼을 누르면 여기에 즉시 표시됩니다.</p>
             </article>
-          ))}
+          ) : (
+            Object.values(state.artifacts).map((artifact) => (
+              <article key={artifact.kind} className="artifact-card">
+                <header className="artifact-head">
+                  <h3>{artifact.title}</h3>
+                  <span className="artifact-kind">{artifact.kind}</span>
+                </header>
+                <div className="artifact-markdown">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{artifact.markdown || ""}</ReactMarkdown>
+                </div>
+                <ul className="artifact-bullets">
+                  {artifact.bullets.map((b, i) => (
+                    <li key={`${artifact.kind}-${i}`}>{b}</li>
+                  ))}
+                </ul>
+              </article>
+            ))
+          )}
         </div>
       </section>
     </div>

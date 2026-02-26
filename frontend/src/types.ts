@@ -62,6 +62,34 @@ export interface AgendaEvent {
   active_after?: string | null;
 }
 
+export interface LlmStatus {
+  provider: string;
+  model: string;
+  base_url: string;
+  mode: "mock" | "live";
+  api_key_present: boolean;
+  connected: boolean;
+  note: string;
+  request_count?: number;
+  success_count?: number;
+  error_count?: number;
+  last_operation?: string;
+  last_request_at?: string;
+  last_success_at?: string;
+  last_error?: string;
+  last_error_at?: string;
+}
+
+export interface LlmPingResponse {
+  result: {
+    ok: boolean;
+    message: string;
+    mode: "mock" | "live";
+    response_preview?: Record<string, unknown>;
+  };
+  llm_status: LlmStatus;
+}
+
 export interface ArtifactOutput {
   kind: ArtifactKind;
   title: string;
@@ -250,6 +278,16 @@ export interface MeetingState {
     strong_count: number;
     rule: string;
   };
+  analysis_runtime?: {
+    tick_mode?: "full_context" | "windowed";
+    transcript_count?: number;
+    llm_window_turns?: number;
+    engine_window_turns?: number;
+    control_plane_source?: string;
+    control_plane_reason?: string;
+    used_local_fallback?: boolean;
+  };
+  llm_status?: LlmStatus;
   agenda_tracker_debug?: {
     topic_shift_sustained: boolean;
     collective_intent: boolean;
@@ -306,6 +344,7 @@ export interface ImportJsonDirResponse {
     auto_tick: boolean;
     ticked: boolean;
     analysis_mode?: "full_context_once" | "none";
+    warning?: string;
     file_stats: Array<{ file: string; rows: number }>;
   };
 }
