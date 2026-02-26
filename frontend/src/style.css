@@ -88,7 +88,7 @@ body {
 
 .config-panel {
   display: grid;
-  grid-template-columns: 1fr 2fr 120px 120px;
+  grid-template-columns: 1fr 2fr 120px 1.1fr 1.2fr 110px 130px 150px;
   gap: 10px;
   margin-bottom: 12px;
   padding: 10px;
@@ -584,6 +584,35 @@ textarea {
   margin: 2px 0 0;
   font-size: 0.8rem;
   color: var(--text-dim);
+}
+
+.engine-checklist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 10px;
+}
+
+.engine-chip {
+  display: inline-block;
+  border-radius: 999px;
+  border: 1px solid #b9cad5;
+  background: #edf3f8;
+  color: #24495a;
+  padding: 2px 8px;
+  font-size: 0.74rem;
+}
+
+.engine-chip-ok {
+  border-color: #7fb293;
+  background: #e9f7ef;
+  color: #225a3a;
+}
+
+.engine-chip-pending {
+  border-color: #cba5a5;
+  background: #fff1f1;
+  color: #783535;
 }
 
 .cockpit-stat-row {

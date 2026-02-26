@@ -1,4 +1,4 @@
-import type { ArtifactKind, MeetingState, SttChunkResponse } from "./types";
+import type { ArtifactKind, ImportJsonDirResponse, MeetingState, SttChunkResponse } from "./types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
@@ -39,6 +39,37 @@ export async function addUtterance(payload: {
     body: JSON.stringify(payload),
   });
   return parse<MeetingState>(res);
+}
+
+export async function importJsonDir(payload: {
+  folder: string;
+  recursive?: boolean;
+  reset_state?: boolean;
+  auto_tick?: boolean;
+  max_files?: number;
+}): Promise<ImportJsonDirResponse> {
+  const res = await fetch("/api/transcript/import-json-dir", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+  return parse<ImportJsonDirResponse>(res);
+}
+
+export async function importJsonFiles(payload: {
+  files: File[];
+  reset_state?: boolean;
+  auto_tick?: boolean;
+}): Promise<ImportJsonDirResponse> {
+  const form = new FormData();
+  payload.files.forEach((file) => form.append("files", file, file.name));
+  form.append("reset_state", String(payload.reset_state ?? true));
+  form.append("auto_tick", String(payload.auto_tick ?? true));
+  const res = await fetch("/api/transcript/import-json-files", {
+    method: "POST",
+    body: form,
+  });
+  return parse<ImportJsonDirResponse>(res);
 }
 
 export async function tickAnalysis(): Promise<MeetingState> {

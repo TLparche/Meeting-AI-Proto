@@ -292,3 +292,20 @@ export interface SttChunkResponse {
   state: MeetingState;
   stt_debug: SttDebug;
 }
+
+export interface ImportJsonDirResponse {
+  state: MeetingState;
+  import_debug: {
+    folder: string;
+    files_scanned: number;
+    files_parsed: number;
+    files_skipped: number;
+    rows_loaded: number;
+    added: number;
+    reset_state: boolean;
+    auto_tick: boolean;
+    ticked: boolean;
+    analysis_mode?: "full_context_once" | "none";
+    file_stats: Array<{ file: string; rows: number }>;
+  };
+}

@@ -187,3 +187,4 @@ frontend/.vite/
 
 # Local temp artifacts
 .tmp_whisperlive/
+/dataset

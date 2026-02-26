@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { addUtterance, createArtifact, getState, resetState, saveConfig, tickAnalysis, transcribeChunk } from "./api";
+import {
+  addUtterance,
+  createArtifact,
+  getState,
+  importJsonDir,
+  importJsonFiles,
+  resetState,
+  saveConfig,
+  tickAnalysis,
+  transcribeChunk,
+} from "./api";
 import type { ArtifactKind, MeetingState, SttDebug } from "./types";
 
 const EMPTY_STATE: MeetingState = {
@@ -63,6 +73,9 @@ function App() {
   const [lastDebug, setLastDebug] = useState<SttDebug | null>(null);
   const [debugHistory, setDebugHistory] = useState<SttDebug[]>([]);
   const [liveBanner, setLiveBanner] = useState<{ text: string; kind: "info" | "lock" | "warn" } | null>(null);
+  const [datasetFolder, setDatasetFolder] = useState("dataset/economy");
+  const [datasetFiles, setDatasetFiles] = useState<File[]>([]);
+  const [datasetImportInfo, setDatasetImportInfo] = useState("");
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -198,6 +211,21 @@ function App() {
   const proposedAgendaCount = agendaBuckets.proposed.length;
   const closedAgendaCount = agendaBuckets.closed.length;
   const lastTranscript = transcriptCount > 0 ? state.transcript[transcriptCount - 1] : null;
+  const engineChecklist = useMemo(
+    () => [
+      { name: "Keyword Engine", ok: Boolean(state.analysis?.keywords) },
+      {
+        name: "Agenda Tracker",
+        ok: (state.agenda_candidates?.length ?? 0) > 0 || Object.keys(state.agenda_vectors || {}).length > 0,
+      },
+      { name: "Agenda FSM", ok: Object.keys(state.agenda_state_map || {}).length > 0 || Boolean(state.active_agenda_id) },
+      { name: "Drift Dampener", ok: Boolean(state.drift_state) },
+      { name: "DPS", ok: typeof state.dps_t === "number" || Boolean(state.analysis?.scores?.dps) },
+      { name: "Flow Pulse", ok: Boolean(state.loop_state) },
+      { name: "Decision Lock", ok: Boolean(state.decision_lock_debug || state.analysis?.intervention?.decision_lock) },
+    ],
+    [state],
+  );
 
   const activeAgendaState = useMemo(() => {
     const aid = state.active_agenda_id || "";
@@ -275,6 +303,56 @@ function App() {
         window_size: state.window_size,
       }),
     );
+
+  const onImportDataset = async () => {
+    setLoading(true);
+    try {
+      const res = await importJsonDir({
+        folder: datasetFolder || "dataset/economy",
+        recursive: true,
+        reset_state: true,
+        auto_tick: true,
+        max_files: 500,
+      });
+      setState(res.state);
+      setError("");
+      const d = res.import_debug;
+      setDatasetImportInfo(
+        `loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}`,
+      );
+    } catch (err) {
+      setError((err as Error).message);
+      setDatasetImportInfo("");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const onImportDatasetFiles = async () => {
+    if (datasetFiles.length === 0) {
+      setError("업로드할 JSON 파일을 먼저 선택하세요.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await importJsonFiles({
+        files: datasetFiles,
+        reset_state: true,
+        auto_tick: true,
+      });
+      setState(res.state);
+      setError("");
+      const d = res.import_debug;
+      setDatasetImportInfo(
+        `uploaded=${datasetFiles.length}, loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}`,
+      );
+    } catch (err) {
+      setError((err as Error).message);
+      setDatasetImportInfo("");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const onActionVote = () =>
     apply(async () => {
@@ -638,10 +716,38 @@ function App() {
             onChange={(e) => setState((s) => ({ ...s, window_size: Number(e.target.value) || 12 }))}
           />
         </label>
+        <label>
+          JSON 폴더 경로
+          <input value={datasetFolder} onChange={(e) => setDatasetFolder(e.target.value)} placeholder="dataset/economy" />
+        </label>
+        <label>
+          JSON 파일 업로드
+          <input
+            type="file"
+            accept=".json,application/json"
+            multiple
+            onChange={(e) => setDatasetFiles(Array.from(e.target.files || []))}
+          />
+        </label>
         <button onClick={() => void onSaveConfig()} disabled={loading}>
           설정 저장
         </button>
+        <button onClick={() => void onImportDataset()} disabled={loading}>
+          JSON 폴더 로드
+        </button>
+        <button onClick={() => void onImportDatasetFiles()} disabled={loading || datasetFiles.length === 0}>
+          JSON 파일 업로드
+        </button>
       </section>
+      {datasetFiles.length > 0 ? <div className="hint">선택 파일: {datasetFiles.length}개</div> : null}
+      {datasetImportInfo ? <div className="hint">{datasetImportInfo}</div> : null}
+      <div className="engine-checklist">
+        {engineChecklist.map((e) => (
+          <span key={e.name} className={e.ok ? "engine-chip engine-chip-ok" : "engine-chip engine-chip-pending"}>
+            {e.name}: {e.ok ? "applied" : "pending"}
+          </span>
+        ))}
+      </div>
 
       <section className="overview-strip">
         <article className="overview-card">
@@ -867,7 +973,7 @@ function App() {
             </details>
           </div>
 
-          <h3>실시간 전사 피드</h3>
+          <h3>전사 피드 (전체 {state.transcript.length}줄)</h3>
           <div className="participant-wrap">
             <div className="participant-header">
               <h3>FairTalk Participant Frames</h3>
@@ -902,7 +1008,7 @@ function App() {
             <div className="hint">침묵 자체는 트리거하지 않고, 발언 의도 신호가 있을 때만 glow를 표시합니다.</div>
           </div>
           <div className="feed">
-            {state.transcript.slice(-100).map((item, idx) => (
+            {state.transcript.map((item, idx) => (
               <div key={`${item.timestamp}-${idx}`} className="feed-row">
                 <b>
                   {item.timestamp} · {item.speaker}
