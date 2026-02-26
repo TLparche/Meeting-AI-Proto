@@ -1,16 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, Dict, List
-
-from keyword_engine import build_keyword_engine_output
-from schemas import ArtifactKind
-
-
-def _safe_get_latest_text(transcript_window: List[dict]) -> str:
-    if not transcript_window:
-        return ""
-    return (transcript_window[-1].get("text") or "").lower()
 
 
 def build_analysis_template(
@@ -19,55 +9,32 @@ def build_analysis_template(
     agenda_stack: List[dict],
     transcript_window: List[dict] | None = None,
 ) -> Dict[str, Any]:
-    active_title = current_active_agenda or "의사결정 대상을 명확히 하기"
-    candidate_titles = [item.get("title", "") for item in agenda_stack if item.get("title")]
+    transcript_window = transcript_window or []
+    active_title = current_active_agenda or "핵심 아젠다 정리"
+    candidate_titles = [str(item.get("title") or "").strip() for item in agenda_stack if str(item.get("title") or "").strip()]
     if not candidate_titles:
-        candidate_titles = [
-            "범위와 가정 정리",
-            "후보 옵션 비교",
-            "의사결정 책임자와 다음 단계 확정",
-        ]
+        candidate_titles = [active_title]
 
-    keywords = build_keyword_engine_output(
-        meeting_goal=meeting_goal,
-        current_active_agenda=current_active_agenda,
-        transcript_window=transcript_window or [],
-    )
-
-    return {
-        "agenda": {
-            "active": {"title": active_title, "status": "ACTIVE", "confidence": 0.5},
-            "candidates": [
-                {"title": title, "confidence": max(0.3, 0.9 - i * 0.2)}
-                for i, title in enumerate(candidate_titles[:3])
-            ],
-        },
-        "agenda_outcomes": [
+    outcomes = []
+    for i, title in enumerate(candidate_titles[:8]):
+        outcomes.append(
             {
                 "agenda_title": title,
-                "agenda_state": "ACTIVE" if i == 0 else "PROPOSED",
-                "flow_type": "문제정의",
                 "key_utterances": [],
-                "summary": f"{title} 관련 결정/실행 항목을 정리 중입니다.",
+                "summary": f"{title} 관련 발언을 정리 중입니다.",
+                "agenda_keywords": [],
                 "decision_results": [],
                 "action_items": [],
             }
-            for i, title in enumerate(candidate_titles[:4])
-        ],
-        "keywords": keywords,
-        "scores": {
-            "drift": {"score": 0, "band": "GREEN", "why": ""},
-            "stagnation": {"score": 0, "why": ""},
-            "participation": {"imbalance": 0, "fairtalk": []},
-            "dps": {"score": 0, "why": ""},
+        )
+
+    return {
+        "agenda": {
+            "active": {"title": active_title, "confidence": 0.5},
+            "candidates": [{"title": t, "confidence": max(0.3, 0.9 - i * 0.1)} for i, t in enumerate(candidate_titles[:10])],
         },
-        "evidence_gate": {"status": "UNVERIFIED", "claims": []},
-        "intervention": {
-            "level": "L0",
-            "banner_text": "",
-            "decision_lock": {"triggered": False, "reason": ""},
-        },
-        "recommendations": {"r1_resources": [], "r2_options": []},
+        "agenda_outcomes": outcomes,
+        "evidence_gate": {"claims": []},
     }
 
 
@@ -77,284 +44,48 @@ def build_mock_analysis(
     transcript_window: List[dict],
     agenda_stack: List[dict],
 ) -> Dict[str, Any]:
-    latest_text = _safe_get_latest_text(transcript_window)
-    utterance_count = len(transcript_window)
-
-    drift_score = 20
-    drift_band = "GREEN"
-    drift_why = "대화 흐름이 현재 아젠다와 대체로 일치합니다."
-    if (
-        "later" in latest_text
-        or "unrelated" in latest_text
-        or "off topic" in latest_text
-        or "off-topic" in latest_text
-        or "tangent" in latest_text
-        or "parking lot" in latest_text
-        or "나중에" in latest_text
-        or "딴 얘기" in latest_text
-        or "주제 벗" in latest_text
-    ):
-        drift_score = 72
-        drift_band = "RED"
-        drift_why = "최근 발화가 의사결정과 직접 연결되지 않은 사이드 토픽을 제시합니다."
-    elif (
-        "maybe" in latest_text
-        or "also" in latest_text
-        or "아마" in latest_text
-        or "또한" in latest_text
-        or "한편" in latest_text
-    ):
-        drift_score = 46
-        drift_band = "YELLOW"
-        drift_why = "논의 분기가 일부 감지됩니다."
-
-    stagnation_score = 18 if utterance_count < 4 else 38
-    stagnation_why = "새로운 논점이 계속 등장하고 있습니다."
-    if utterance_count >= 8:
-        stagnation_score = 63
-        stagnation_why = "반복 표현이 늘어 정체 루프 위험이 있습니다."
-
-    dps_score = min(0.88, (20 + utterance_count * 7) / 100.0)
-    dps_why = "옵션과 실행 항목이 구체화되며 진행도가 상승했습니다."
-
-    imbalance = 25
-    speaker_counts: Dict[str, int] = {}
-    for item in transcript_window:
-        speaker = item.get("speaker", "미상")
-        speaker_counts[speaker] = speaker_counts.get(speaker, 0) + 1
-    if speaker_counts:
-        max_turns = max(speaker_counts.values())
-        min_turns = min(speaker_counts.values())
-        if max_turns > 0:
-            imbalance = int(((max_turns - min_turns) / max_turns) * 100)
-
-    active_title = current_active_agenda or "의사결정 대상을 명확히 하기"
-    candidate_titles = [item.get("title", "") for item in agenda_stack if item.get("title")]
-    if not candidate_titles:
-        candidate_titles = [
-            "범위와 가정 정리",
-            "후보 옵션 비교",
-            "의사결정 책임자와 다음 단계 확정",
-        ]
-
-    decision_lock_triggered = dps_score >= 0.70 and drift_band != "RED"
-    intervention_level = "L0"
-    banner_text = ""
-    if drift_band == "RED":
-        intervention_level = "L2"
-        banner_text = "짧게 정렬: 이 발화가 어떤 아젠다 결정에 기여하나요?"
-    elif drift_band == "YELLOW" or stagnation_score >= 50:
-        intervention_level = "L1"
-        banner_text = "가벼운 유도: 계속하기 전에 새 인사이트 1가지를 요약해 주세요."
-
-    evidence_status = "UNVERIFIED"
-    if (
-        "source" in latest_text
-        or "data" in latest_text
-        or "citation" in latest_text
-        or "paper" in latest_text
-        or "출처" in latest_text
-        or "데이터" in latest_text
-        or "근거" in latest_text
-        or "링크" in latest_text
-    ):
-        evidence_status = "MIXED"
-    if (
-        "report link" in latest_text
-        or "benchmark result" in latest_text
-        or "보고서 링크" in latest_text
-        or "벤치마크 결과" in latest_text
-    ):
-        evidence_status = "VERIFIED"
-
-    keywords = build_keyword_engine_output(
+    base = build_analysis_template(
         meeting_goal=meeting_goal,
         current_active_agenda=current_active_agenda,
+        agenda_stack=agenda_stack,
         transcript_window=transcript_window,
     )
-
-    return {
-        "agenda": {
-            "active": {
-                "title": active_title,
-                "status": "CLOSING" if dps_score > 75 else "ACTIVE",
-                "confidence": 0.81,
-            },
-            "candidates": [
-                {"title": title, "confidence": max(0.3, 0.9 - i * 0.2)}
-                for i, title in enumerate(candidate_titles[:3])
-            ],
-        },
-        "agenda_outcomes": [
+    if base["agenda_outcomes"]:
+        base["agenda_outcomes"][0]["key_utterances"] = [
+            "핵심 안건에 대한 입장 차이를 먼저 정리하자",
+            "결론 전에 실행 책임자와 기한을 확정하자",
+        ]
+        base["agenda_outcomes"][0]["summary"] = "핵심 안건의 의견 차이를 좁히고 결론 조건을 확인 중입니다."
+        base["agenda_outcomes"][0]["decision_results"] = [
             {
-                "agenda_title": candidate_titles[0] if candidate_titles else active_title,
-                "agenda_state": "ACTIVE",
-                "flow_type": "대안비교",
-                "key_utterances": [
-                    "파일럿 먼저 진행 후 확장하자",
-                    "즉시 전면 적용이 효과를 빠르게 낼 수 있다",
+                "opinions": [
+                    "파일럿 후 확장", "즉시 전체 적용"
                 ],
-                "summary": "핵심 옵션 비교 후 단계적 파일럿 방향으로 의견이 수렴되었습니다.",
-                "decision_results": [
+                "conclusion": "리스크 완화를 위해 파일럿 우선",
+            }
+        ]
+        base["agenda_outcomes"][0]["action_items"] = [
+            {
+                "item": "이번 주 금요일까지 파일럿 계획안 작성",
+                "owner": "제품 리드",
+                "due": "이번 주 금요일",
+                "reasons": [
                     {
-                        "decision": "롤아웃 방식",
-                        "opinions": [
-                            "파일럿 먼저 진행 후 확장하자",
-                            "즉시 전면 적용이 효과를 빠르게 낼 수 있다",
-                        ],
-                        "conclusion": "리스크 완화를 위해 파일럿 우선 진행",
-                    },
-                    {
-                        "decision": "성공지표",
-                        "opinions": [
-                            "온보딩 시간 단축을 1차 지표로 두자",
-                            "활성 사용자 전환율도 같이 보자",
-                        ],
-                        "conclusion": "온보딩 시간 + 전환율을 병행 모니터링",
-                    },
-                ],
-                "action_items": [
-                    {
-                        "item": "이번 주 금요일까지 파일럿 계획안 작성",
-                        "owner": "제품 리드",
-                        "due": "이번주",
-                        "reasons": [
-                            {
-                                "speaker": "DG0001",
-                                "timestamp": "",
-                                "quote": "리스크를 줄이려면 작은 범위로 먼저 검증하자",
-                                "why": "전면 적용 리스크를 낮추기 위해 파일럿 선행 필요",
-                            },
-                            {
-                                "speaker": "DG0005",
-                                "timestamp": "",
-                                "quote": "일정이 밀리면 다음 스프린트 의사결정이 지연된다",
-                                "why": "다음 의사결정 일정 보호",
-                            },
-                        ],
+                        "speaker": "화자1",
+                        "timestamp": "",
+                        "quote": "작게 시작하고 지표를 보고 확장하자",
+                        "why": "전면 적용 리스크를 낮추기 위해",
                     }
                 ],
-            },
+            }
+        ]
+    base["evidence_gate"] = {
+        "claims": [
             {
-                "agenda_title": candidate_titles[1] if len(candidate_titles) > 1 else "이해관계자 커뮤니케이션",
-                "agenda_state": "PROPOSED",
-                "flow_type": "실행정의",
-                "key_utterances": ["누가 어떤 메시지로 공유할지 다음 라운드에서 확정하자"],
-                "summary": "커뮤니케이션 대상/메시지는 다음 아젠다에서 확정 예정입니다.",
-                "decision_results": [],
-                "action_items": [],
-            },
-        ],
-        "keywords": keywords,
-        "scores": {
-            "drift": {"score": drift_score, "band": drift_band, "why": drift_why},
-            "stagnation": {"score": stagnation_score, "why": stagnation_why},
-            "participation": {
-                "imbalance": imbalance,
-                "fairtalk": [
-                    {"speaker": speaker, "p_intent": round(count / max(1, utterance_count), 2)}
-                    for speaker, count in list(speaker_counts.items())[:5]
-                ],
-            },
-            "dps": {"score": dps_score, "why": dps_why},
-        },
-        "evidence_gate": {
-            "status": evidence_status,
-            "claims": [
-                {
-                    "claim": "옵션 A가 온보딩 시간을 20% 단축한다",
-                    "verifiability": 0.62,
-                    "note": "파일럿 지표 출처가 필요합니다.",
-                },
-                {
-                    "claim": "이해관계자들이 단계적 롤아웃을 선호한다",
-                    "verifiability": 0.44,
-                    "note": "정성 피드백 중심이라 추가 근거가 필요합니다.",
-                },
-            ],
-        },
-        "intervention": {
-            "level": intervention_level,
-            "banner_text": banner_text,
-            "decision_lock": {
-                "triggered": decision_lock_triggered,
-                "reason": "의사결정 변수가 충분히 수렴되어 다음 단계 진행이 가능합니다.",
-            },
-        },
-        "recommendations": {
-            "r1_resources": [
-                {
-                    "title": "의사결정 매트릭스 템플릿",
-                    "url": "https://www.atlassian.com/work-management/decision-matrix",
-                    "reason": "가중 기준으로 옵션을 빠르게 비교할 수 있습니다.",
-                },
-                {
-                    "title": "NIST 근거 품질 가이드",
-                    "url": "https://www.nist.gov/",
-                    "reason": "근거 상태가 약하거나 혼합일 때 점검 기준으로 사용하세요.",
-                },
-            ],
-            "r2_options": [
-                {
-                    "option": "단계적 파일럿으로 진행",
-                    "pros": ["롤아웃 리스크를 낮춤", "피드백 루프가 빠름"],
-                    "risks": ["전체 효과 발현이 지연될 수 있음"],
-                    "evidence_note": "운영팀 일정 확인이 필요합니다.",
-                },
-                {
-                    "option": "즉시 전면 적용",
-                    "pros": ["초기 효과를 크게 기대 가능"],
-                    "risks": ["변화관리 리스크가 높음"],
-                    "evidence_note": "도입 준비도 데이터 보강이 필요합니다.",
-                },
-            ],
-        },
+                "claim": "파일럿이 비용 리스크를 줄인다",
+                "verifiability": 0.64,
+                "note": "비용 추정 근거 문서 확인 필요",
+            }
+        ]
     }
-
-
-def build_mock_artifact(kind: ArtifactKind, context: Dict[str, Any]) -> Dict[str, Any]:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    active_agenda = context.get("active_agenda") or "현재 의사결정 주제"
-    if kind == ArtifactKind.MEETING_SUMMARY:
-        return {
-            "kind": kind.value,
-            "title": "회의 요약",
-            "markdown": f"### 요약 ({now})\n**{active_agenda}** 중심으로 논의가 수렴되었고 다음 단계가 명확해졌습니다.",
-            "bullets": [
-                "팀이 의사결정 대상과 제약을 명확히 했습니다.",
-                "두 가지 옵션을 리스크와 함께 비교했습니다.",
-                "파일럿 우선 경로로 공감대가 형성되었습니다.",
-            ],
-        }
-    if kind == ArtifactKind.DECISION_RESULTS:
-        return {
-            "kind": kind.value,
-            "title": "의사결정 결과",
-            "markdown": "### 결정 스냅샷\n권고안: **단계적 파일럿 진행**",
-            "bullets": [
-                "담당자: 제품 리드",
-                "목표 시점: 이번 스프린트 종료 전",
-                "성공 기준: 온보딩 시간 단축 및 도입률",
-            ],
-        }
-    if kind == ArtifactKind.ACTION_ITEMS:
-        return {
-            "kind": kind.value,
-            "title": "액션 아이템",
-            "markdown": "### 할당된 작업\n논의에서 바로 수행할 후속 작업입니다.",
-            "bullets": [
-                "핵심 주장에 대한 근거 링크 정리",
-                "파일럿 계획 및 일정 초안 작성",
-                "이해관계자 검증 체크인 일정 확정",
-            ],
-        }
-    return {
-        "kind": kind.value,
-        "title": "근거 로그",
-        "markdown": "### 근거 로그\n주장별 검증 가능 상태를 중립적으로 기록합니다.",
-        "bullets": [
-            "주장: 20% 개선 -> 상태: MIXED",
-            "주장: 이해관계자 선호 -> 상태: UNVERIFIED",
-            "주장: 롤아웃 리스크 완화 -> 상태: VERIFIED",
-        ],
-    }
+    return base

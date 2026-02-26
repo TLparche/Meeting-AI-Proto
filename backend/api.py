@@ -15,18 +15,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from agenda_fsm import run_agenda_fsm
-from agenda_tracker import run_agenda_tracker
-from decision_lock_engine import run_decision_lock
-from deliverables_engine import build_live_artifact
-from dps_engine import compute_dps
-from drift_dampener import run_drift_dampener
-from evidence_gate_engine import run_evidence_gate
-from fairtalk_engine import run_fairtalk_engine
-from flow_pulse import run_flow_pulse
 from llm_client import get_client
-from recommendation_engine import run_recommendation_engine
-from schemas import AgendaStatus, ArtifactKind, TranscriptUtterance
+from schemas import TranscriptUtterance
 
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "large")
 WHISPER_ENABLE_FALLBACK = os.environ.get("WHISPER_ENABLE_FALLBACK", "0") == "1"
@@ -54,7 +44,7 @@ FLOW_TYPE_KEYWORDS = {
 
 class ConfigInput(BaseModel):
     meeting_goal: str
-    initial_context: str
+    initial_context: str = ""
     window_size: int = Field(ge=4, le=80)
 
 
@@ -666,7 +656,7 @@ class MeetingRuntime:
     def reset(self) -> None:
         with self._lock:
             self.meeting_goal = "롤아웃 방식과 최종 의사결정 책임자를 정한다."
-            self.initial_context = "엔지니어링/운영이 함께하는 주간 제품 회의."
+            self.initial_context = ""
             self.window_size = 12
             self.transcript: list[dict] = []
             self.agenda_stack: list[dict] = []
@@ -758,7 +748,7 @@ class MeetingRuntime:
     def update_config(self, cfg: ConfigInput) -> None:
         with self._lock:
             self.meeting_goal = cfg.meeting_goal.strip()
-            self.initial_context = cfg.initial_context.strip()
+            self.initial_context = ""
             self.window_size = cfg.window_size
 
     def set_meeting_goal(self, goal: str) -> None:
@@ -776,7 +766,7 @@ class MeetingRuntime:
         snap = self.snapshot()
         cfg = ConfigInput(
             meeting_goal=str(snap.get("meeting_goal") or "").strip(),
-            initial_context=str(snap.get("initial_context") or "").strip(),
+            initial_context="",
             window_size=int(snap.get("window_size") or 12),
         )
         self.reset()
@@ -816,35 +806,29 @@ class MeetingRuntime:
     def _sync_agenda_stack(self, analysis: dict) -> None:
         agenda_map = {item["title"]: item["status"] for item in self.agenda_stack}
         active_title = (analysis.get("agenda", {}).get("active", {}).get("title") or "").strip()
-        active_status = analysis.get("agenda", {}).get("active", {}).get("status", AgendaStatus.ACTIVE.value)
         if active_title:
-            agenda_map[active_title] = active_status
+            agenda_map[active_title] = "ACTIVE"
 
         for candidate in analysis.get("agenda", {}).get("candidates", []):
             title = (candidate.get("title") or "").strip()
             if title and title not in agenda_map:
-                agenda_map[title] = AgendaStatus.PROPOSED.value
+                agenda_map[title] = "PROPOSED"
 
         self.agenda_stack = [{"title": title, "status": status} for title, status in agenda_map.items()]
 
     def _sync_agenda_stack_from_state_map(self) -> None:
+        # Legacy compatibility only: keep normalized stack order.
         order = {"ACTIVE": 0, "CLOSING": 1, "PROPOSED": 2, "CLOSED": 3}
         entries = list(self.agenda_state_map.values())
         entries.sort(key=lambda e: (order.get(str(e.get("state") or "PROPOSED"), 9), -float(e.get("confidence", 0.0))))
         stack: list[dict] = []
         for entry in entries:
             title = (entry.get("title") or "").strip()
-            state = str(entry.get("state") or "PROPOSED")
-            if not title:
-                continue
-            if state not in {
-                AgendaStatus.PROPOSED.value,
-                AgendaStatus.ACTIVE.value,
-                AgendaStatus.CLOSING.value,
-                AgendaStatus.CLOSED.value,
-            }:
-                state = AgendaStatus.PROPOSED.value
-            stack.append({"title": title, "status": state})
+            state = str(entry.get("state") or "PROPOSED").upper()
+            if state not in {"PROPOSED", "ACTIVE", "CLOSING", "CLOSED"}:
+                state = "PROPOSED"
+            if title:
+                stack.append({"title": title, "status": state})
         self.agenda_stack = stack
 
     def tick_analysis(self, use_full_context: bool = False) -> bool:
@@ -872,14 +856,6 @@ class MeetingRuntime:
                 max_turns=llm_turn_limit,
                 clip_chars=LLM_TEXT_CLIP_CHARS,
             )
-            fairtalk_window = engine_window if use_full_context else self.transcript[-240:]
-            evidence_window = engine_window if use_full_context else self.transcript[-240:]
-            recommendation_window = engine_window if use_full_context else self.transcript[-240:]
-            tracker_window = engine_window if use_full_context else self.transcript[-80:]
-            flow_window = engine_window if use_full_context else self.transcript[-200:]
-            lock_window = engine_window if use_full_context else self.transcript[-180:]
-            fsm_window = engine_window if use_full_context else self.transcript[-80:]
-            drift_window = engine_window if use_full_context else self.transcript[-120:]
             current_active = ""
             if self.analysis:
                 current_active = (
@@ -895,334 +871,75 @@ class MeetingRuntime:
                 agenda_stack=self.agenda_stack,
             )
             self.analysis = analysis.model_dump()
-            now_tick = time.time()
-            fairtalk_out = run_fairtalk_engine(
-                transcript=fairtalk_window,
-                monitor_state=self.fairtalk_monitor,
-                now_ts=now_tick,
-            )
-            self.fairtalk_glow = list(fairtalk_out.get("participants") or [])
-            self.fairtalk_debug = dict(fairtalk_out.get("debug") or {})
-            self.fairtalk_monitor = dict(fairtalk_out.get("monitor") or {})
-            self.analysis.setdefault("scores", {}).setdefault("participation", {})["fairtalk"] = list(
-                fairtalk_out.get("fairtalk_schema") or []
-            )
-            self.analysis["scores"]["participation"]["imbalance"] = int(fairtalk_out.get("imbalance", 0))
+            # Scoring-style local engines are intentionally disabled in this prototype.
+            self.fairtalk_glow = []
+            self.fairtalk_debug = {"rule": "disabled"}
+            self.fairtalk_monitor = {}
 
-            evidence_out = run_evidence_gate(transcript=evidence_window)
-            self.evidence_status = str(evidence_out.get("evidence_status") or "UNVERIFIED")
-            self.evidence_snippet = str(evidence_out.get("evidence_snippet") or "")
-            self.evidence_log = list(evidence_out.get("evidence_log") or [])[-120:]
-            self.analysis.setdefault("evidence_gate", {})["status"] = self.evidence_status
-            self.analysis["evidence_gate"]["claims"] = list(evidence_out.get("claims_for_schema") or [])[:8]
-            recommendation_out = run_recommendation_engine(
-                transcript=recommendation_window,
-                analysis=self.analysis,
-                evidence_status=self.evidence_status,
-            )
-            self.analysis.setdefault("recommendations", {})["r1_resources"] = list(
-                recommendation_out.get("r1_resources") or []
-            )[:3]
-            self.analysis["recommendations"]["r2_options"] = list(
-                recommendation_out.get("r2_options") or []
-            )[:2]
-            self.recommendation_debug = dict(recommendation_out.get("debug") or {})
-
-            def _run_local_control_pipeline(reason: str) -> None:
-                tracker_output = run_agenda_tracker(
-                    transcript=tracker_window,
-                    active_agenda=(self.analysis.get("agenda", {}).get("active", {}).get("title") or current_active),
-                    agenda_stack=self.agenda_stack,
-                    keywords=self.analysis.get("keywords", {}),
-                    existing_vectors=self.agenda_vectors,
-                )
-                self.agenda_candidates = tracker_output.get("agenda_candidates", [])
-                self.agenda_vectors = tracker_output.get("agenda_vectors", {})
-                self.agenda_tracker_debug = tracker_output.get("tracker_debug", {})
-                self.agenda_tracker_debug["fallback_reason"] = reason
-
-                existing_titles = {
-                    (c.get("title") or "").strip()
-                    for c in self.analysis.get("agenda", {}).get("candidates", [])
-                    if (c.get("title") or "").strip()
+            # Normalize agenda stack only from simplified analysis.
+            self._sync_agenda_stack(self.analysis)
+            self.agenda_candidates = [
+                {
+                    "title": str(c.get("title") or "").strip(),
+                    "status": "PROPOSED",
+                    "confidence": float(c.get("confidence", 0.5)),
                 }
-                for cand in self.agenda_candidates:
-                    title = (cand.get("title") or "").strip()
-                    if not title or title in existing_titles:
-                        continue
-                    self.analysis.setdefault("agenda", {}).setdefault("candidates", []).append(
-                        {
-                            "title": title,
-                            "confidence": float(cand.get("confidence", 0.6)),
-                        }
-                    )
-                    existing_titles.add(title)
+                for c in (self.analysis.get("agenda", {}).get("candidates") or [])
+                if str(c.get("title") or "").strip()
+            ]
+            self.agenda_vectors = {}
+            self.agenda_state_map = {}
+            self.active_agenda_id = ""
+            self.agenda_events = []
 
-                dps_pre = compute_dps(
-                    analysis=self.analysis,
-                    agenda_state_map=self.agenda_state_map,
-                    active_agenda_id=self.active_agenda_id,
-                )
-                local_now_ts = time.time()
-                history_for_flow = [h for h in self.dps_history if local_now_ts - float(h.get("ts", local_now_ts)) <= 180.0]
-                history_for_flow.append({"ts": local_now_ts, "score": float(dps_pre.get("score", 0.0))})
-                k_core = (self.analysis.get("keywords", {}) or {}).get("k_core", {}) or {}
-                flow_out = run_flow_pulse(
-                    transcript=flow_window,
-                    k_core=k_core,
-                    dps_history=history_for_flow,
-                    now_ts=local_now_ts,
-                )
-                self.stagnation_flag = bool(flow_out.get("stagnation_flag", False))
-                self.loop_state = str(flow_out.get("loop_state", "Normal"))
-                self.flow_pulse_debug = dict(flow_out.get("debug", {}))
-
-                if self.stagnation_flag:
-                    lock = self.analysis.setdefault("intervention", {}).setdefault("decision_lock", {})
-                    existing_reason = str(lock.get("reason") or "").strip()
-                    trigger_text = "Flow Pulse trigger #2: circular stagnation detected"
-                    lock["triggered"] = True
-                    if trigger_text not in existing_reason:
-                        lock["reason"] = f"{existing_reason}; {trigger_text}" if existing_reason else trigger_text
-
-                prev_lock = bool(
-                    ((self.analysis.get("intervention") or {}).get("decision_lock") or {}).get("triggered", False)
-                )
-                lock_out = run_decision_lock(
-                    transcript=lock_window,
-                    meeting_elapsed_sec=time.time() - self.meeting_started_at,
-                    stagnation_flag=self.stagnation_flag,
-                    previous_decision_lock=prev_lock,
-                )
-                lock_payload = self.analysis.setdefault("intervention", {}).setdefault("decision_lock", {})
-                lock_payload["triggered"] = bool(lock_out.get("triggered", False))
-                lock_payload["reason"] = str(lock_out.get("reason", ""))
-                self.decision_lock_debug = dict(lock_out.get("debug") or {})
-
-                fsm_out = run_agenda_fsm(
-                    agenda_state_map=self.agenda_state_map,
-                    active_agenda_id=self.active_agenda_id,
-                    agenda_candidates=self.agenda_candidates,
-                    analysis=self.analysis,
-                    transcript=fsm_window,
-                    existing_events=self.agenda_events,
-                )
-                self.agenda_state_map = fsm_out.get("agenda_state_map", {})
-                self.active_agenda_id = str(fsm_out.get("active_agenda_id", "") or "")
-                self.agenda_events = list(fsm_out.get("events", []))
-                self._sync_agenda_stack_from_state_map()
-
-                dps_out = compute_dps(
-                    analysis=self.analysis,
-                    agenda_state_map=self.agenda_state_map,
-                    active_agenda_id=self.active_agenda_id,
-                )
-                self.dps_t = float(dps_out.get("score", 0.0))
-                self.dps_breakdown = dict(dps_out.get("breakdown", {}))
-                self.analysis.setdefault("scores", {}).setdefault("dps", {})["score"] = self.dps_t
-                self.analysis["scores"]["dps"]["why"] = (
-                    "Option {option_coverage:.2f} | Constraint {constraint_coverage:.2f} | "
-                    "Evidence {evidence_coverage:.2f} | Trade-off {tradeoff_coverage:.2f} | "
-                    "Closing {closing_readiness:.2f}"
-                ).format(**self.dps_breakdown)
-                self.dps_history = [h for h in self.dps_history if local_now_ts - float(h.get("ts", local_now_ts)) <= 180.0]
-                self.dps_history.append({"ts": local_now_ts, "score": self.dps_t})
-
-                active_title_for_drift = ""
-                if self.active_agenda_id and self.active_agenda_id in self.agenda_state_map:
-                    active_title_for_drift = str(self.agenda_state_map[self.active_agenda_id].get("title") or "")
-                if not active_title_for_drift:
-                    active_title_for_drift = str(
-                        (self.analysis.get("agenda", {}).get("active", {}).get("title") or "")
-                    ).strip()
-                active_vec = self.agenda_vectors.get(active_title_for_drift, {})
-                drift_out = run_drift_dampener(
-                    transcript=drift_window,
-                    active_agenda_title=active_title_for_drift,
-                    active_agenda_vector=active_vec,
-                    monitor_state=self.drift_monitor,
-                    meeting_elapsed_sec=time.time() - self.meeting_started_at,
-                )
-                self.drift_state = str(drift_out.get("drift_state") or "Normal")
-                self.drift_ui_cues = dict(drift_out.get("ui_cues") or {})
-                self.drift_debug = dict(drift_out.get("debug") or {})
-                self.drift_monitor = dict(drift_out.get("monitor") or self.drift_monitor)
-
-            control_plane_source = "local_disabled"
-            control_plane_reason = "USE_LLM_CONTROL_PLANE=0"
-            used_local_fallback = False
-            if USE_LLM_CONTROL_PLANE:
-                control_payload = self.client.infer_control_plane(
-                    meeting_goal=self.meeting_goal,
-                    initial_context=self.initial_context,
-                    current_active_agenda=(self.analysis.get("agenda", {}).get("active", {}).get("title") or current_active),
-                    transcript_window=llm_window,
-                    agenda_stack=self.agenda_stack,
-                    analysis=self.analysis,
-                    previous_state={
-                        "agenda_candidates": self.agenda_candidates,
-                        "agenda_vectors": self.agenda_vectors,
-                        "agenda_tracker_debug": self.agenda_tracker_debug,
-                        "agenda_state_map": self.agenda_state_map,
-                        "active_agenda_id": self.active_agenda_id,
-                        "agenda_events": self.agenda_events,
-                        "drift_state": self.drift_state,
-                        "drift_ui_cues": self.drift_ui_cues,
-                        "drift_debug": self.drift_debug,
-                        "dps_t": self.dps_t,
-                        "dps_breakdown": self.dps_breakdown,
-                        "stagnation_flag": self.stagnation_flag,
-                        "loop_state": self.loop_state,
-                        "flow_pulse_debug": self.flow_pulse_debug,
-                        "decision_lock_debug": self.decision_lock_debug,
-                    },
-                )
-                control_meta = dict(control_payload.get("_meta") or {})
-                control_plane_source = str(control_meta.get("source") or "unknown")
-                control_plane_reason = str(control_meta.get("reason") or "")
-                if "_meta" in control_payload:
-                    control_payload.pop("_meta", None)
-                control_keywords = control_payload.get("keywords")
-                if isinstance(control_keywords, dict) and control_keywords:
-                    self.analysis["keywords"] = control_keywords
-
-                tracker_payload = dict(control_payload.get("agenda_tracker") or {})
-                self.agenda_candidates = list(tracker_payload.get("agenda_candidates") or [])
-                self.agenda_vectors = dict(tracker_payload.get("agenda_vectors") or {})
-                self.agenda_tracker_debug = dict(tracker_payload.get("tracker_debug") or {})
-
-                fsm_payload = dict(control_payload.get("agenda_fsm") or {})
-                self.agenda_state_map = dict(fsm_payload.get("agenda_state_map") or {})
-                self.active_agenda_id = str(fsm_payload.get("active_agenda_id") or "")
-                self.agenda_events = list(fsm_payload.get("agenda_events") or [])
-                if self.agenda_state_map:
-                    self._sync_agenda_stack_from_state_map()
-                elif self.analysis:
-                    self._sync_agenda_stack(self.analysis)
-
-                dps_payload = dict(control_payload.get("dps") or {})
-                self.dps_t = float(dps_payload.get("dps_t", self.dps_t or 0.0))
-                self.dps_breakdown = dict(
-                    dps_payload.get("dps_breakdown")
-                    or self.dps_breakdown
-                    or {
-                        "option_coverage": 0.0,
-                        "constraint_coverage": 0.0,
-                        "evidence_coverage": 0.0,
-                        "tradeoff_coverage": 0.0,
-                        "closing_readiness": 0.0,
-                        "counts": {"options": 0, "constraints": 0, "criteria": 0, "evidence": 0, "actions": 0},
-                        "active_state": "ACTIVE",
-                        "decision_lock": False,
+            # Keep only requested minimal agenda fields.
+            cleaned_outcomes: list[dict] = []
+            for row in (self.analysis.get("agenda_outcomes") or []):
+                if not isinstance(row, dict):
+                    continue
+                cleaned_outcomes.append(
+                    {
+                        "agenda_title": str(row.get("agenda_title") or "").strip() or "아젠다 미정",
+                        "key_utterances": [str(x).strip() for x in (row.get("key_utterances") or []) if str(x).strip()],
+                        "summary": str(row.get("summary") or "").strip(),
+                        "agenda_keywords": [str(x).strip() for x in (row.get("agenda_keywords") or []) if str(x).strip()],
+                        "decision_results": [
+                            {
+                                "opinions": [str(o).strip() for o in (d.get("opinions") or []) if str(o).strip()],
+                                "conclusion": str(d.get("conclusion") or "").strip(),
+                            }
+                            for d in (row.get("decision_results") or [])
+                            if isinstance(d, dict)
+                        ],
+                        "action_items": list(row.get("action_items") or []),
                     }
                 )
-                self.analysis.setdefault("scores", {}).setdefault("dps", {})["score"] = self.dps_t
-                self.analysis["scores"]["dps"]["why"] = (
-                    str(dps_payload.get("why") or "").strip()
-                    or (
-                        "Option {option_coverage:.2f} | Constraint {constraint_coverage:.2f} | "
-                        "Evidence {evidence_coverage:.2f} | Trade-off {tradeoff_coverage:.2f} | "
-                        "Closing {closing_readiness:.2f}"
-                    ).format(**self.dps_breakdown)
-                )
-                now_ts = time.time()
-                self.dps_history = [h for h in self.dps_history if now_ts - float(h.get("ts", now_ts)) <= 180.0]
-                self.dps_history.append({"ts": now_ts, "score": self.dps_t})
+            self.analysis["agenda_outcomes"] = cleaned_outcomes
 
-                flow_payload = dict(control_payload.get("flow_pulse") or {})
-                self.stagnation_flag = bool(flow_payload.get("stagnation_flag", False))
-                self.loop_state = str(flow_payload.get("loop_state") or "Normal")
-                self.flow_pulse_debug = dict(flow_payload.get("flow_pulse_debug") or {})
-
-                lock_payload_llm = dict(control_payload.get("decision_lock") or {})
-                lock_payload = self.analysis.setdefault("intervention", {}).setdefault("decision_lock", {})
-                lock_payload["triggered"] = bool(lock_payload_llm.get("triggered", False))
-                lock_payload["reason"] = str(lock_payload_llm.get("reason", ""))
-                self.decision_lock_debug = dict(lock_payload_llm.get("decision_lock_debug") or {})
-
-                drift_payload = dict(control_payload.get("drift_dampener") or {})
-                self.drift_state = str(drift_payload.get("drift_state") or "Normal")
-                self.drift_ui_cues = dict(
-                    drift_payload.get("drift_ui_cues")
-                    or {"glow_k_core": False, "fix_k_core_focus": False, "reduce_facets": False, "show_banner": False}
-                )
-                self.drift_debug = dict(drift_payload.get("drift_debug") or {})
-                self.drift_monitor = dict(drift_payload.get("monitor") or self.drift_monitor)
-                payload_sparse = (not self.agenda_state_map) or (
-                    len(self.agenda_candidates) == 0 and len(self.agenda_vectors) == 0
-                )
-                if control_plane_source != "llm":
-                    used_local_fallback = True
-                    _run_local_control_pipeline(control_plane_source)
-                elif payload_sparse:
-                    # Keep llm output if response exists; just mark sparsity for diagnostics.
-                    control_plane_reason = "llm_response_sparse"
-            else:
-                used_local_fallback = True
-                _run_local_control_pipeline(control_plane_reason)
+            claims = list((self.analysis.get("evidence_gate") or {}).get("claims") or [])
+            self.evidence_status = ""
+            self.evidence_log = claims[-120:]
+            self.evidence_snippet = "\n".join(
+                [str(c.get("claim") or "").strip() for c in claims[:2] if isinstance(c, dict) and str(c.get("claim") or "").strip()]
+            )
+            self.analysis["evidence_gate"] = {"claims": claims}
 
             self.analysis_runtime = {
                 "tick_mode": "full_context" if use_full_context else "windowed",
                 "transcript_count": len(self.transcript),
                 "llm_window_turns": len(llm_window),
                 "engine_window_turns": len(engine_window),
-                "control_plane_source": control_plane_source,
-                "control_plane_reason": control_plane_reason,
-                "used_local_fallback": used_local_fallback,
+                "control_plane_source": "disabled",
+                "control_plane_reason": "analysis_only",
+                "used_local_fallback": False,
             }
 
-            if self.active_agenda_id and self.active_agenda_id in self.agenda_state_map:
-                active_entry = self.agenda_state_map[self.active_agenda_id]
-                active_title = str(active_entry.get("title") or "").strip()
-                active_state = str(active_entry.get("state") or "ACTIVE")
-                if active_title:
-                    self.analysis.setdefault("agenda", {}).setdefault("active", {})["title"] = active_title
-                    if active_state in ("ACTIVE", "CLOSING", "CLOSED"):
-                        self.analysis["agenda"]["active"]["status"] = active_state
-            elif self.agenda_stack:
-                self._sync_agenda_stack(self.analysis)
-
-            # Hybrid enrichment for agenda flow type and key utterances:
-            # keep LLM structure if present, but normalize with keyword-based signals.
-            self.analysis["agenda_outcomes"] = _build_hybrid_agenda_outcomes(
-                existing_outcomes=list(self.analysis.get("agenda_outcomes") or []),
-                agenda_payload=dict(self.analysis.get("agenda") or {}),
-                agenda_stack=list(self.agenda_stack or []),
-                transcript=list(engine_window or []),
-            )
             self._refresh_live_artifacts()
             return True
 
     def _refresh_live_artifacts(self) -> None:
-        analysis_payload = dict(self.analysis or {})
-        for kind in ArtifactKind:
-            self.artifacts[kind.value] = build_live_artifact(
-                kind=kind,
-                meeting_goal=self.meeting_goal,
-                transcript=self.transcript[-240:],
-                analysis=analysis_payload,
-                agenda_state_map=self.agenda_state_map,
-                active_agenda_id=self.active_agenda_id,
-                evidence_status=self.evidence_status,
-                evidence_snippet=self.evidence_snippet,
-                evidence_log=self.evidence_log[-120:],
-                dps_t=self.dps_t,
-            )
-
-    def generate_artifact(self, kind: ArtifactKind) -> None:
-        with self._lock:
-            self.artifacts[kind.value] = build_live_artifact(
-                kind=kind,
-                meeting_goal=self.meeting_goal,
-                transcript=self.transcript[-240:],
-                analysis=dict(self.analysis or {}),
-                agenda_state_map=self.agenda_state_map,
-                active_agenda_id=self.active_agenda_id,
-                evidence_status=self.evidence_status,
-                evidence_snippet=self.evidence_snippet,
-                evidence_log=self.evidence_log[-120:],
-                dps_t=self.dps_t,
-            )
+        # Disabled: generate_artifact path removed per simplified prototype request.
+        self.artifacts = {}
 
     def next_chunk_id(self) -> int:
         with self._lock:
@@ -1525,13 +1242,6 @@ def post_analysis_tick():
     if not ok:
         raise HTTPException(status_code=409, detail="LLM 연결 버튼을 먼저 누르세요. 연결 전에는 분석 기능이 비활성화됩니다.")
     return runtime.snapshot()
-
-
-@app.post("/api/artifacts/{kind}")
-def post_artifact(kind: ArtifactKind):
-    runtime.generate_artifact(kind)
-    return runtime.snapshot()
-
 
 @app.post("/api/reset")
 def post_reset():

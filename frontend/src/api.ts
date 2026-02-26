@@ -1,12 +1,4 @@
-import type {
-  ArtifactKind,
-  LlmConnectResponse,
-  ImportJsonDirResponse,
-  LlmPingResponse,
-  LlmStatus,
-  MeetingState,
-  SttChunkResponse,
-} from "./types";
+import type { LlmConnectResponse, ImportJsonDirResponse, LlmPingResponse, LlmStatus, MeetingState, SttChunkResponse } from "./types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
@@ -45,7 +37,6 @@ export async function disconnectLlm(): Promise<LlmConnectResponse> {
 
 export async function saveConfig(payload: {
   meeting_goal: string;
-  initial_context: string;
   window_size: number;
 }): Promise<MeetingState> {
   const res = await fetch("/api/config", {
@@ -102,11 +93,6 @@ export async function importJsonFiles(payload: {
 
 export async function tickAnalysis(): Promise<MeetingState> {
   const res = await fetch("/api/analysis/tick", { method: "POST" });
-  return parse<MeetingState>(res);
-}
-
-export async function createArtifact(kind: ArtifactKind): Promise<MeetingState> {
-  const res = await fetch(`/api/artifacts/${kind}`, { method: "POST" });
   return parse<MeetingState>(res);
 }
 
