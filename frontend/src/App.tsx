@@ -3,7 +3,9 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   addUtterance,
+  connectLlm,
   createArtifact,
+  disconnectLlm,
   getLlmStatus,
   getState,
   importJsonDir,
@@ -32,6 +34,7 @@ const EMPTY_STATE: MeetingState = {
   evidence_log: [],
   fairtalk_glow: [],
   fairtalk_debug: { active_speakers: 0, soft_count: 0, strong_count: 0, rule: "intent_only" },
+  llm_enabled: false,
   analysis: null,
   artifacts: {},
 };
@@ -230,6 +233,7 @@ function App() {
   }, [state.fairtalk_glow, state.analysis]);
   const fairtalkDebug = state.fairtalk_debug;
   const llmStatus = state.llm_status;
+  const llmEnabled = Boolean(state.llm_enabled);
   const llmDisconnected = Boolean(llmStatus) && !Boolean(llmStatus?.connected);
   const llmDetail = useMemo(() => {
     if (!llmStatus) {
@@ -285,6 +289,11 @@ function App() {
   const closingModeActive = Boolean(
     state.analysis?.intervention?.decision_lock?.triggered || activeAgendaState === "CLOSING",
   );
+  const agendaOutcomeBoard = useMemo(() => {
+    const raw = state.analysis?.agenda_outcomes || [];
+    const order = { ACTIVE: 0, CLOSING: 1, PROPOSED: 2, CLOSED: 3 } as const;
+    return [...raw].sort((a, b) => (order[a.agenda_state] ?? 9) - (order[b.agenda_state] ?? 9));
+  }, [state.analysis]);
 
   useEffect(() => {
     const activeAgendaId = state.active_agenda_id || "";
@@ -355,7 +364,9 @@ function App() {
       setError("");
       const d = res.import_debug;
       setDatasetImportInfo(
-        `loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}`,
+        `loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}${
+          d.meeting_goal_applied ? `, goal=${d.meeting_goal}` : ""
+        }`,
       );
       if (d.warning) {
         setError(d.warning);
@@ -384,7 +395,9 @@ function App() {
       setError("");
       const d = res.import_debug;
       setDatasetImportInfo(
-        `uploaded=${datasetFiles.length}, loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}`,
+        `uploaded=${datasetFiles.length}, loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}${
+          d.meeting_goal_applied ? `, goal=${d.meeting_goal}` : ""
+        }`,
       );
       if (d.warning) {
         setError(d.warning);
@@ -408,6 +421,46 @@ function App() {
     } catch (err) {
       setLlmPingOk(false);
       setLlmPingMessage((err as Error).message);
+      setError((err as Error).message);
+    } finally {
+      setLlmChecking(false);
+    }
+  };
+
+  const onConnectLlm = async () => {
+    setLlmChecking(true);
+    try {
+      const res = await connectLlm();
+      setState(res.state);
+      setLlmPingOk(Boolean(res.enabled));
+      setLlmPingMessage(
+        res.enabled
+          ? "LLM 연결 완료. 이제 분석 기능을 사용할 수 있습니다."
+          : (res.result?.message || "LLM 연결 실패"),
+      );
+      if (!res.enabled) {
+        setError(res.result?.message || "LLM 연결 실패");
+      } else {
+        setError("");
+      }
+    } catch (err) {
+      setLlmPingOk(false);
+      setLlmPingMessage((err as Error).message);
+      setError((err as Error).message);
+    } finally {
+      setLlmChecking(false);
+    }
+  };
+
+  const onDisconnectLlm = async () => {
+    setLlmChecking(true);
+    try {
+      const res = await disconnectLlm();
+      setState(res.state);
+      setLlmPingOk(null);
+      setLlmPingMessage("LLM 연결 해제됨. 연결 버튼을 눌러야 분석이 다시 동작합니다.");
+      setError("");
+    } catch (err) {
       setError((err as Error).message);
     } finally {
       setLlmChecking(false);
@@ -738,7 +791,7 @@ function App() {
       <header className="topbar">
         <h1>Meeting Rhythm AI (React)</h1>
         <div className="top-actions">
-          <button onClick={() => void apply(() => tickAnalysis())} disabled={loading}>
+          <button onClick={() => void apply(() => tickAnalysis())} disabled={loading || !llmEnabled}>
             틱 / 업데이트
           </button>
           <button onClick={() => void apply(() => resetState())} disabled={loading}>
@@ -750,6 +803,11 @@ function App() {
       {liveBanner ? <div className={`live-banner live-banner-${liveBanner.kind}`}>{liveBanner.text}</div> : null}
 
       {error ? <div className="error-box">{error}</div> : null}
+      {!llmEnabled ? (
+        <div className="llm-warning-box">
+          <b>LLM 분석 비활성화:</b> 연결 버튼을 누르기 전까지 LLM 기반 분석 기능은 동작하지 않습니다.
+        </div>
+      ) : null}
       {llmDisconnected ? (
         <div className="llm-warning-box">
           <b>LLM 연결 경고:</b> {llmStatus?.note || "LLM이 연결되지 않았습니다."}
@@ -759,11 +817,13 @@ function App() {
       <section className="llm-status-panel">
         <div className="llm-status-head">
           <div className="llm-status-title">LLM 연결 상태</div>
-          <span className={llmDisconnected ? "llm-chip llm-chip-off" : "llm-chip llm-chip-on"}>
-            {llmDisconnected ? "DISCONNECTED" : "CONNECTED"}
+          <span className={llmEnabled ? "llm-chip llm-chip-on" : "llm-chip llm-chip-off"}>
+            {llmEnabled ? "ENABLED" : "DISABLED"}
           </span>
         </div>
         <div className="llm-status-grid">
+          <div>llm_enabled: {String(llmEnabled)}</div>
+          <div>connected: {String(Boolean(llmStatus?.connected))}</div>
           <div>provider: {llmStatus?.provider || "-"}</div>
           <div>model: {llmStatus?.model || "-"}</div>
           <div>mode: {llmStatus?.mode || "-"}</div>
@@ -787,7 +847,13 @@ function App() {
           </div>
         ) : null}
         <div className="llm-status-actions">
-          <button onClick={() => void onPingLlm()} disabled={llmChecking}>
+          <button onClick={() => void onConnectLlm()} disabled={llmChecking}>
+            {llmChecking ? "연결 중..." : "LLM 연결"}
+          </button>
+          <button onClick={() => void onDisconnectLlm()} disabled={llmChecking || !llmEnabled}>
+            연결 해제
+          </button>
+          <button onClick={() => void onPingLlm()} disabled={llmChecking || !llmEnabled}>
             {llmChecking ? "LLM 확인 중..." : "LLM 연결 테스트"}
           </button>
           <button onClick={() => void refreshLlmStatus()} disabled={llmChecking}>
@@ -1177,6 +1243,84 @@ function App() {
                 </div>
               </div>
 
+              <section className="agenda-outcome-board">
+                <div className="agenda-outcome-header">
+                  <b>Agenda Outcome Board</b>
+                  <span className="hint">{agendaOutcomeBoard.length} agendas</span>
+                </div>
+                {agendaOutcomeBoard.length === 0 ? (
+                  <div className="hint">아직 아젠다별 결정/액션 구조가 없습니다.</div>
+                ) : (
+                  <div className="agenda-outcome-grid">
+                    {agendaOutcomeBoard.map((ag, idx) => (
+                      <article key={`${ag.agenda_title}-${idx}`} className="agenda-outcome-card">
+                        <div className="agenda-outcome-title-row">
+                          <div className="agenda-outcome-title">{ag.agenda_title || "(untitled agenda)"}</div>
+                          <span className={`status-badge agenda-state-pill agenda-state-${ag.agenda_state.toLowerCase()}`}>
+                            {ag.agenda_state}
+                          </span>
+                        </div>
+                        <div className="agenda-outcome-flow">
+                          흐름 타입:{" "}
+                          <b>
+                            {ag.flow_type ||
+                              (ag.action_items.length > 0
+                                ? "실행정의"
+                                : ag.decision_results.length > 0
+                                  ? "대안비교"
+                                  : "문제정의")}
+                          </b>
+                        </div>
+                        <div className="agenda-outcome-key">
+                          핵심 발언:{" "}
+                          {ag.key_utterances && ag.key_utterances.length > 0
+                            ? ag.key_utterances.slice(0, 4).join(" | ")
+                            : "없음"}
+                        </div>
+                        <div className="agenda-outcome-summary">{ag.summary || "요약 없음"}</div>
+
+                        <div className="agenda-outcome-block">
+                          <div className="agenda-outcome-block-title">의사결정 결과 ({ag.decision_results.length})</div>
+                          {ag.decision_results.length === 0 ? (
+                            <div className="hint">결정 결과 없음</div>
+                          ) : (
+                            ag.decision_results.map((d, didx) => (
+                              <div key={`${ag.agenda_title}-d-${didx}`} className="agenda-outcome-item">
+                                <div className="agenda-outcome-item-head">결정: {d.decision}</div>
+                                <div className="agenda-outcome-line">의견: {d.opinions.join(" | ") || "-"}</div>
+                                <div className="agenda-outcome-line">결론: {d.conclusion || "-"}</div>
+                              </div>
+                            ))
+                          )}
+                        </div>
+
+                        <div className="agenda-outcome-block">
+                          <div className="agenda-outcome-block-title">액션 아이템 ({ag.action_items.length})</div>
+                          {ag.action_items.length === 0 ? (
+                            <div className="hint">액션 아이템 없음</div>
+                          ) : (
+                            ag.action_items.map((a, aidx) => (
+                              <div key={`${ag.agenda_title}-a-${aidx}`} className="agenda-outcome-item">
+                                <div className="agenda-outcome-item-head">
+                                  {a.item || "(item)"} | owner: {a.owner || "-"} | due: {a.due || "-"}
+                                </div>
+                                <div className="agenda-outcome-line">근거 로그 {a.reasons.length}개</div>
+                                {a.reasons.map((r, ridx) => (
+                                  <div key={`${ag.agenda_title}-a-${aidx}-r-${ridx}`} className="agenda-reason-row">
+                                    {r.timestamp ? `[${r.timestamp}] ` : ""}{r.speaker ? `${r.speaker}: ` : ""}
+                                    {r.quote || "-"} / 이유: {r.why || "-"}
+                                  </div>
+                                ))}
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </section>
+
               <div className="cockpit-stat">
                 S45 {state.drift_debug?.s45?.toFixed?.(3) ?? "0.000"} | band {state.drift_debug?.band || "Green"} |
                 yellow {state.drift_debug?.yellow_seconds ?? 0}s | red {state.drift_debug?.red_seconds ?? 0}s
@@ -1217,13 +1361,13 @@ function App() {
                   {state.decision_lock_debug?.trigger_timebox ? "1" : "0"}
                 </div>
                 <div className="cockpit-actions">
-                  <button onClick={() => void onActionVote()} disabled={loading || !closingModeActive}>
+                  <button onClick={() => void onActionVote()} disabled={loading || !closingModeActive || !llmEnabled}>
                   vote
                   </button>
-                  <button onClick={() => void onActionSummary()} disabled={loading || !closingModeActive}>
+                  <button onClick={() => void onActionSummary()} disabled={loading || !closingModeActive || !llmEnabled}>
                   summary
                   </button>
-                  <button onClick={() => void onActionDecide()} disabled={loading || !closingModeActive}>
+                  <button onClick={() => void onActionDecide()} disabled={loading || !closingModeActive || !llmEnabled}>
                   decide
                   </button>
                 </div>

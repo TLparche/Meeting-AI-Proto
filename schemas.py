@@ -204,8 +204,39 @@ class Recommendations(StrictModel):
     r2_options: List[OptionRecommendation] = Field(default_factory=list)
 
 
+class AgendaEvidenceLog(StrictModel):
+    speaker: str = ""
+    timestamp: str = ""
+    quote: str = ""
+    why: str = ""
+
+
+class AgendaActionItem(StrictModel):
+    item: str = ""
+    owner: str = ""
+    due: str = ""
+    reasons: List[AgendaEvidenceLog] = Field(default_factory=list)
+
+
+class AgendaDecisionResult(StrictModel):
+    decision: str = ""
+    opinions: List[str] = Field(default_factory=list)
+    conclusion: str = ""
+
+
+class AgendaOutcome(StrictModel):
+    agenda_title: str = ""
+    agenda_state: Literal["PROPOSED", "ACTIVE", "CLOSING", "CLOSED"] = "PROPOSED"
+    flow_type: str = ""
+    key_utterances: List[str] = Field(default_factory=list)
+    summary: str = ""
+    decision_results: List[AgendaDecisionResult] = Field(default_factory=list)
+    action_items: List[AgendaActionItem] = Field(default_factory=list)
+
+
 class AnalysisOutput(StrictModel):
     agenda: AgendaAnalysis
+    agenda_outcomes: List[AgendaOutcome] = Field(default_factory=list)
     keywords: Keywords
     scores: Scores
     evidence_gate: EvidenceGate

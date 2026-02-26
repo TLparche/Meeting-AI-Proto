@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Any
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -35,9 +35,20 @@ WHISPER_SILENCE_LOGPROB = float(os.environ.get("WHISPER_SILENCE_LOGPROB", "-0.35
 USE_LLM_CONTROL_PLANE = os.environ.get("USE_LLM_CONTROL_PLANE", "1") == "1"
 LLM_CONTEXT_MAX_TURNS = int(os.environ.get("LLM_CONTEXT_MAX_TURNS", "320"))
 FULL_CONTEXT_ENGINE_MAX_TURNS = int(os.environ.get("FULL_CONTEXT_ENGINE_MAX_TURNS", "3000"))
+LLM_FULL_CONTEXT_MAX_TURNS = int(os.environ.get("LLM_FULL_CONTEXT_MAX_TURNS", "900"))
+LLM_TEXT_CLIP_CHARS = int(os.environ.get("LLM_TEXT_CLIP_CHARS", "160"))
 HALLUCINATION_PHRASES = {
     "감사합니다",
     "고맙습니다",
+}
+FLOW_TYPE_ORDER = ["문제정의", "대안비교", "의견충돌", "근거검토", "결론수렴", "실행정의"]
+FLOW_TYPE_KEYWORDS = {
+    "문제정의": ["문제", "이슈", "현황", "배경", "원인", "정의", "목표", "과제", "왜"],
+    "대안비교": ["대안", "옵션", "비교", "장단점", "a안", "b안", "선택", "비용", "효과", "트레이드오프"],
+    "의견충돌": ["반대", "이견", "충돌", "논쟁", "우려", "동의하지", "의견이 다르", "갈린다"],
+    "근거검토": ["근거", "출처", "데이터", "지표", "통계", "검증", "사실", "레퍼런스", "증거"],
+    "결론수렴": ["결론", "정리", "합의", "결정", "확정", "채택", "수렴", "클로징", "마무리"],
+    "실행정의": ["액션", "실행", "담당", "기한", "언제", "누가", "까지", "하자", "진행", "todo"],
 }
 
 
@@ -63,6 +74,296 @@ class DatasetImportInput(BaseModel):
 
 def _now_ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def _compact_transcript_for_llm(turns: list[dict], max_turns: int, clip_chars: int) -> list[dict]:
+    if not turns:
+        return []
+
+    def compact_one(t: dict) -> dict:
+        txt = str(t.get("text") or "").strip()
+        if len(txt) > clip_chars:
+            txt = txt[: clip_chars - 1] + "…"
+        return {
+            "speaker": str(t.get("speaker") or "화자").strip() or "화자",
+            "text": txt,
+            "timestamp": str(t.get("timestamp") or "").strip(),
+        }
+
+    if len(turns) <= max_turns:
+        return [compact_one(t) for t in turns]
+
+    # Keep global flow by preserving head/tail and uniformly sampled middle turns.
+    head_n = max(50, min(160, max_turns // 4))
+    tail_n = max(90, min(260, max_turns // 3))
+    if head_n + tail_n >= max_turns:
+        head_n = max_turns // 2
+        tail_n = max_turns - head_n
+
+    head = turns[:head_n]
+    tail = turns[-tail_n:]
+    middle = turns[head_n : len(turns) - tail_n]
+    middle_budget = max_turns - head_n - tail_n
+
+    sampled_middle: list[dict] = []
+    if middle and middle_budget > 0:
+        stride = max(1, len(middle) // middle_budget)
+        sampled_middle = middle[::stride][:middle_budget]
+
+    merged = head + sampled_middle + tail
+    if len(merged) > max_turns:
+        merged = merged[-max_turns:]
+    return [compact_one(t) for t in merged]
+
+
+def _normalize_agenda_state(state: str) -> str:
+    s = str(state or "").upper().strip()
+    if s in {"PROPOSED", "ACTIVE", "CLOSING", "CLOSED"}:
+        return s
+    return "PROPOSED"
+
+
+def _normalize_flow_type(flow: str) -> str:
+    raw = str(flow or "").strip()
+    if raw in FLOW_TYPE_ORDER:
+        return raw
+    low = raw.lower()
+    mapping = {
+        "problem": "문제정의",
+        "issue": "문제정의",
+        "option": "대안비교",
+        "compare": "대안비교",
+        "conflict": "의견충돌",
+        "disagree": "의견충돌",
+        "evidence": "근거검토",
+        "verify": "근거검토",
+        "closing": "결론수렴",
+        "decision": "결론수렴",
+        "action": "실행정의",
+        "execution": "실행정의",
+    }
+    for k, v in mapping.items():
+        if k in low:
+            return v
+    return ""
+
+
+def _agenda_title_tokens(title: str) -> list[str]:
+    toks = re.findall(r"[A-Za-z][A-Za-z0-9_+\-./#]*|[가-힣]{2,}", str(title or ""))
+    return [t.lower() for t in toks if len(t.strip()) >= 2]
+
+
+def _related_turns_for_agenda(transcript: list[dict], agenda_title: str, limit: int = 6) -> list[dict]:
+    if not transcript:
+        return []
+    tokens = _agenda_title_tokens(agenda_title)
+    recent = transcript[-1200:]
+    scored: list[tuple[int, int, dict]] = []
+    for idx, turn in enumerate(recent):
+        text = str(turn.get("text") or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        score = 0
+        for tok in tokens:
+            if tok and tok in lowered:
+                score += 1
+        if score > 0:
+            scored.append((score, idx, turn))
+    if not scored:
+        return [t for t in recent[-limit:] if str(t.get("text") or "").strip()]
+    picked = sorted(scored, key=lambda x: (-x[0], -x[1]))[: max(limit * 3, limit)]
+    picked_turns = sorted([p[2] for p in picked], key=lambda t: str(t.get("timestamp") or ""))
+    return picked_turns[-limit:]
+
+
+def _infer_flow_type_hybrid(
+    llm_flow_type: str,
+    related_turns: list[dict],
+    decision_count: int,
+    action_count: int,
+) -> str:
+    scores = {k: 0.0 for k in FLOW_TYPE_ORDER}
+    normalized = _normalize_flow_type(llm_flow_type)
+    if normalized:
+        scores[normalized] += 2.0
+
+    for turn in related_turns:
+        txt = str(turn.get("text") or "").lower()
+        for label, kws in FLOW_TYPE_KEYWORDS.items():
+            for kw in kws:
+                if kw in txt:
+                    scores[label] += 1.0
+
+    if decision_count > 0:
+        scores["대안비교"] += 1.0
+        scores["결론수렴"] += 1.0
+    if action_count > 0:
+        scores["실행정의"] += 2.0
+
+    best = max(FLOW_TYPE_ORDER, key=lambda k: scores[k])
+    if scores[best] <= 0:
+        if action_count > 0:
+            return "실행정의"
+        if decision_count > 0:
+            return "결론수렴"
+        return "문제정의"
+    return best
+
+
+def _compose_key_utterances(llm_keys: Any, related_turns: list[dict]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    if isinstance(llm_keys, list):
+        for row in llm_keys:
+            s = str(row or "").strip()
+            if not s:
+                continue
+            if len(s) > 140:
+                s = s[:139] + "…"
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+            if len(out) >= 4:
+                return out
+
+    for turn in related_turns:
+        s = str(turn.get("text") or "").strip()
+        if not s:
+            continue
+        if len(s) > 140:
+            s = s[:139] + "…"
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _build_hybrid_agenda_outcomes(
+    *,
+    existing_outcomes: list[dict] | None,
+    agenda_payload: dict,
+    agenda_stack: list[dict],
+    transcript: list[dict],
+) -> list[dict]:
+    rows: list[dict] = []
+    existing_titles: set[str] = set()
+    state_rank = {"PROPOSED": 0, "CLOSED": 1, "CLOSING": 2, "ACTIVE": 3}
+
+    def _norm_title(raw: Any) -> str:
+        t = str(raw or "").strip()
+        return t if t else "아젠다 미정"
+
+    # Preserve multiple flow-units per same topic title from LLM output.
+    for row in (existing_outcomes or []):
+        if not isinstance(row, dict):
+            continue
+        title = _norm_title(row.get("agenda_title"))
+        existing_titles.add(title)
+        rows.append(
+            {
+                "agenda_title": title,
+                "agenda_state": _normalize_agenda_state(str(row.get("agenda_state") or "PROPOSED")),
+                "flow_type": str(row.get("flow_type") or "").strip(),
+                "key_utterances": list(row.get("key_utterances") or []),
+                "summary": str(row.get("summary") or "").strip(),
+                "decision_results": list(row.get("decision_results") or []),
+                "action_items": list(row.get("action_items") or []),
+            }
+        )
+
+    title_state_map: dict[str, str] = {}
+
+    def _upsert_title_state(title: str, state: str) -> None:
+        t = _norm_title(title)
+        s = _normalize_agenda_state(state)
+        prev = title_state_map.get(t)
+        if not prev or state_rank.get(s, 0) >= state_rank.get(prev, 0):
+            title_state_map[t] = s
+
+    active = (agenda_payload.get("active") or {})
+    active_title = str(active.get("title") or "").strip()
+    active_state = _normalize_agenda_state(str(active.get("status") or "ACTIVE"))
+    if active_title:
+        _upsert_title_state(active_title, active_state)
+    for cand in (agenda_payload.get("candidates") or []):
+        title = str((cand or {}).get("title") or "").strip()
+        if title:
+            _upsert_title_state(title, "PROPOSED")
+
+    for item in agenda_stack or []:
+        title = str((item or {}).get("title") or "").strip()
+        if not title:
+            continue
+        st = _normalize_agenda_state(str((item or {}).get("status") or "PROPOSED"))
+        _upsert_title_state(title, st)
+
+    # If title already exists with multiple flow rows, keep all rows and only normalize state.
+    for row in rows:
+        title = str(row.get("agenda_title") or "").strip()
+        mapped = title_state_map.get(title)
+        if mapped and state_rank.get(mapped, 0) >= state_rank.get(str(row.get("agenda_state") or "PROPOSED"), 0):
+            row["agenda_state"] = mapped
+
+    # Add missing titles from agenda tracker/fsm as placeholder rows.
+    for title, st in title_state_map.items():
+        if title in existing_titles:
+            continue
+        rows.append(
+            {
+                "agenda_title": title,
+                "agenda_state": st,
+                "flow_type": "",
+                "key_utterances": [],
+                "summary": "",
+                "decision_results": [],
+                "action_items": [],
+            }
+        )
+
+    enriched: list[tuple[int, dict]] = []
+    for idx, row in enumerate(rows):
+        title = str(row.get("agenda_title") or "").strip() or "아젠다 미정"
+        related = _related_turns_for_agenda(transcript, title, limit=6)
+        flow_type = _infer_flow_type_hybrid(
+            llm_flow_type=str(row.get("flow_type") or ""),
+            related_turns=related,
+            decision_count=len(row.get("decision_results") or []),
+            action_count=len(row.get("action_items") or []),
+        )
+        key_utts = _compose_key_utterances(row.get("key_utterances"), related)
+        summary = str(row.get("summary") or "").strip()
+        if not summary:
+            summary = key_utts[0] if key_utts else "핵심 발언을 수집 중입니다."
+        enriched.append(
+            (
+                idx,
+                {
+                    "agenda_title": title,
+                    "agenda_state": _normalize_agenda_state(str(row.get("agenda_state") or "PROPOSED")),
+                    "flow_type": flow_type,
+                    "key_utterances": key_utts,
+                    "summary": summary,
+                    "decision_results": list(row.get("decision_results") or []),
+                    "action_items": list(row.get("action_items") or []),
+                },
+            )
+        )
+
+    state_order = {"ACTIVE": 0, "CLOSING": 1, "PROPOSED": 2, "CLOSED": 3}
+    enriched.sort(
+        key=lambda item: (
+            state_order.get(str(item[1].get("agenda_state") or "PROPOSED"), 9),
+            str(item[1].get("agenda_title") or ""),
+            item[0],
+        )
+    )
+    return [item[1] for item in enriched]
 
 
 def _normalize_timestamp(raw: Any) -> str | None:
@@ -108,9 +409,80 @@ def _pick_first_str(row: dict, keys: tuple[str, ...]) -> str:
     return ""
 
 
-def _extract_rows_from_json_payload(payload: Any) -> list[dict]:
+def _format_age_label(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    if re.fullmatch(r"\d{2}", s):
+        return f"{s}대"
+    if re.fullmatch(r"\d{1,2}", s):
+        return f"{int(s)}대"
+    return s
+
+
+def _build_profile_label(age: Any, occupation: Any, role: Any, fallback_id: str) -> str:
+    parts = [_format_age_label(age), str(occupation or "").strip(), str(role or "").strip()]
+    label = " ".join([p for p in parts if p])
+    if label:
+        return label
+    if fallback_id:
+        return fallback_id
+    return "화자"
+
+
+def _extract_rows_from_json_payload(payload: Any) -> tuple[list[dict], dict]:
+    meta = {"meeting_goal": ""}
     out: list[dict] = []
     seen: set[tuple[str, str, str | None]] = set()
+
+    # Dataset schema first:
+    # - meeting goal: metadata.topic
+    # - text: utterance.original_form only
+    # - speaker label: speaker_id -> (age, occupation, role)
+    if isinstance(payload, dict):
+        md = payload.get("metadata")
+        if isinstance(md, dict):
+            topic = str(md.get("topic") or "").strip()
+            if topic:
+                meta["meeting_goal"] = topic
+
+        raw_speakers = payload.get("speaker", payload.get("speakers"))
+        raw_utterances = payload.get("utterance", payload.get("utterances"))
+        if isinstance(raw_utterances, list):
+            speaker_map: dict[str, dict] = {}
+            if isinstance(raw_speakers, list):
+                for s in raw_speakers:
+                    if not isinstance(s, dict):
+                        continue
+                    sid = str(s.get("id") or s.get("speaker_id") or "").strip()
+                    if sid:
+                        speaker_map[sid] = s
+
+            for item in raw_utterances:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("original_form") or "").strip()
+                if not text:
+                    continue
+                sid = str(item.get("speaker_id") or "").strip()
+                profile = speaker_map.get(sid, {})
+                label = _build_profile_label(
+                    profile.get("age"),
+                    profile.get("occupation"),
+                    profile.get("role", item.get("speaker_role")),
+                    sid or str(item.get("speaker") or "").strip(),
+                )
+                ts = _normalize_timestamp(item.get("timestamp", item.get("time", item.get("ts", item.get("start")))))
+                key = (label, text, ts)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"speaker": label, "text": text, "timestamp": ts})
+
+            if out:
+                return out, meta
 
     def push_row(item: Any) -> None:
         if isinstance(item, str):
@@ -123,22 +495,24 @@ def _extract_rows_from_json_payload(payload: Any) -> list[dict]:
             return
         if not isinstance(item, dict):
             return
-        text = _pick_first_str(
-            item,
-            (
-                "text",
-                "utterance",
-                "form",
-                "original_form",
-                "sentence",
-                "content",
-                "transcript",
-                "speech",
-                "message",
-                "asr",
-                "normalized_text",
-            ),
-        )
+        if "original_form" in item:
+            text = str(item.get("original_form") or "").strip()
+        else:
+            text = _pick_first_str(
+                item,
+                (
+                    "text",
+                    "utterance",
+                    "sentence",
+                    "content",
+                    "transcript",
+                    "speech",
+                    "message",
+                    "asr",
+                    "normalized_text",
+                    "form",
+                ),
+            )
         if not text:
             return
         speaker = _pick_first_str(
@@ -158,26 +532,27 @@ def _extract_rows_from_json_payload(payload: Any) -> list[dict]:
         if isinstance(node, dict):
             push_row(node)
             for v in node.values():
-                walk(v, depth + 1)
+                if isinstance(v, (dict, list)):
+                    walk(v, depth + 1)
             return
         if isinstance(node, list):
             for v in node:
-                walk(v, depth + 1)
-            return
-        if isinstance(node, str):
-            # 문자열 배열 형태도 전사로 흡수
-            push_row(node)
+                if isinstance(v, str):
+                    # Only accept explicit list entries as transcript candidates.
+                    push_row(v)
+                elif isinstance(v, (dict, list)):
+                    walk(v, depth + 1)
             return
 
     if isinstance(payload, list):
         walk(payload)
-        return out
+        return out, meta
 
     if isinstance(payload, dict):
         direct_text = _pick_first_str(payload, ("text", "utterance", "sentence", "content", "message"))
         if direct_text:
             push_row(payload)
-            return out
+            return out, meta
         for key in (
             "transcript",
             "utterance",
@@ -196,7 +571,7 @@ def _extract_rows_from_json_payload(payload: Any) -> list[dict]:
         # 루트 키 패턴이 없더라도 재귀 탐색으로 전사 후보를 찾는다.
         if not out:
             walk(payload)
-    return out
+    return out, meta
 
 
 def _read_json_file(path: Path) -> Any:
@@ -237,11 +612,14 @@ def _load_utterances_from_json_dir(folder: Path, recursive: bool, max_files: int
     total_rows = 0
     parsed_files = 0
     skipped_files = 0
+    meeting_goal = ""
 
     for fp in files:
         try:
             payload = _read_json_file(fp)
-            rows = _extract_rows_from_json_payload(payload)
+            rows, meta = _extract_rows_from_json_payload(payload)
+            if not meeting_goal:
+                meeting_goal = str(meta.get("meeting_goal") or "").strip()
             if not rows:
                 skipped_files += 1
                 continue
@@ -274,6 +652,7 @@ def _load_utterances_from_json_dir(folder: Path, recursive: bool, max_files: int
         "files_parsed": parsed_files,
         "files_skipped": skipped_files,
         "rows_loaded": total_rows,
+        "meeting_goal": meeting_goal,
         "file_stats": file_stats[:20],
     }
 
@@ -337,6 +716,7 @@ class MeetingRuntime:
             self.fairtalk_debug: dict[str, object] = {}
             self.fairtalk_monitor: dict[str, dict[str, float | str | None]] = {}
             self.analysis_runtime: dict[str, object] = {}
+            self.llm_enabled: bool = False
             self._refresh_live_artifacts()
 
     def snapshot(self) -> dict:
@@ -369,6 +749,7 @@ class MeetingRuntime:
                 "fairtalk_glow": self.fairtalk_glow,
                 "fairtalk_debug": self.fairtalk_debug,
                 "analysis_runtime": self.analysis_runtime,
+                "llm_enabled": self.llm_enabled,
                 "llm_status": self.client.get_status(),
                 "analysis": self.analysis,
                 "artifacts": self.artifacts,
@@ -379,6 +760,17 @@ class MeetingRuntime:
             self.meeting_goal = cfg.meeting_goal.strip()
             self.initial_context = cfg.initial_context.strip()
             self.window_size = cfg.window_size
+
+    def set_meeting_goal(self, goal: str) -> None:
+        goal = (goal or "").strip()
+        if not goal:
+            return
+        with self._lock:
+            self.meeting_goal = goal
+
+    def set_llm_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self.llm_enabled = bool(enabled)
 
     def reset_keep_config(self) -> None:
         snap = self.snapshot()
@@ -455,15 +847,31 @@ class MeetingRuntime:
             stack.append({"title": title, "status": state})
         self.agenda_stack = stack
 
-    def tick_analysis(self, use_full_context: bool = False) -> None:
+    def tick_analysis(self, use_full_context: bool = False) -> bool:
         with self._lock:
+            if not self.llm_enabled:
+                self.analysis_runtime = {
+                    "tick_mode": "full_context" if use_full_context else "windowed",
+                    "transcript_count": len(self.transcript),
+                    "llm_window_turns": 0,
+                    "engine_window_turns": 0,
+                    "control_plane_source": "blocked",
+                    "control_plane_reason": "llm_not_enabled",
+                    "used_local_fallback": False,
+                }
+                return False
             if use_full_context:
                 engine_window = self.transcript[-FULL_CONTEXT_ENGINE_MAX_TURNS:]
                 transcript_window = list(engine_window)
             else:
                 engine_window = self.transcript
                 transcript_window = self.transcript[-self.window_size :]
-            llm_window = transcript_window[-LLM_CONTEXT_MAX_TURNS:]
+            llm_turn_limit = LLM_FULL_CONTEXT_MAX_TURNS if use_full_context else LLM_CONTEXT_MAX_TURNS
+            llm_window = _compact_transcript_for_llm(
+                transcript_window,
+                max_turns=llm_turn_limit,
+                clip_chars=LLM_TEXT_CLIP_CHARS,
+            )
             fairtalk_window = engine_window if use_full_context else self.transcript[-240:]
             evidence_window = engine_window if use_full_context else self.transcript[-240:]
             recommendation_window = engine_window if use_full_context else self.transcript[-240:]
@@ -743,10 +1151,12 @@ class MeetingRuntime:
                 payload_sparse = (not self.agenda_state_map) or (
                     len(self.agenda_candidates) == 0 and len(self.agenda_vectors) == 0
                 )
-                if control_plane_source != "llm" or payload_sparse:
+                if control_plane_source != "llm":
                     used_local_fallback = True
-                    local_reason = "llm_payload_sparse" if payload_sparse and control_plane_source == "llm" else control_plane_source
-                    _run_local_control_pipeline(local_reason)
+                    _run_local_control_pipeline(control_plane_source)
+                elif payload_sparse:
+                    # Keep llm output if response exists; just mark sparsity for diagnostics.
+                    control_plane_reason = "llm_response_sparse"
             else:
                 used_local_fallback = True
                 _run_local_control_pipeline(control_plane_reason)
@@ -771,7 +1181,17 @@ class MeetingRuntime:
                         self.analysis["agenda"]["active"]["status"] = active_state
             elif self.agenda_stack:
                 self._sync_agenda_stack(self.analysis)
+
+            # Hybrid enrichment for agenda flow type and key utterances:
+            # keep LLM structure if present, but normalize with keyword-based signals.
+            self.analysis["agenda_outcomes"] = _build_hybrid_agenda_outcomes(
+                existing_outcomes=list(self.analysis.get("agenda_outcomes") or []),
+                agenda_payload=dict(self.analysis.get("agenda") or {}),
+                agenda_stack=list(self.agenda_stack or []),
+                transcript=list(engine_window or []),
+            )
             self._refresh_live_artifacts()
+            return True
 
     def _refresh_live_artifacts(self) -> None:
         analysis_payload = dict(self.analysis or {})
@@ -929,6 +1349,29 @@ def get_llm_status():
     return runtime.client.get_status()
 
 
+@app.post("/api/llm/connect")
+def post_llm_connect():
+    result = runtime.client.ping()
+    enabled = bool(result.get("ok"))
+    runtime.set_llm_enabled(enabled)
+    return {
+        "enabled": enabled,
+        "result": result,
+        "llm_status": runtime.client.get_status(),
+        "state": runtime.snapshot(),
+    }
+
+
+@app.post("/api/llm/disconnect")
+def post_llm_disconnect():
+    runtime.set_llm_enabled(False)
+    return {
+        "enabled": False,
+        "llm_status": runtime.client.get_status(),
+        "state": runtime.snapshot(),
+    }
+
+
 @app.post("/api/llm/ping")
 def post_llm_ping():
     result = runtime.client.ping()
@@ -960,14 +1403,16 @@ def post_import_json_dir(payload: DatasetImportInput):
         if alt.exists():
             folder = alt
     utterances, stats = _load_utterances_from_json_dir(folder, recursive=payload.recursive, max_files=payload.max_files)
+    goal_from_json = str(stats.get("meeting_goal") or "").strip()
 
     if payload.reset_state:
         runtime.reset_keep_config()
+    if goal_from_json:
+        runtime.set_meeting_goal(goal_from_json)
     added = runtime.append_utterances_bulk(utterances)
     ticked = False
     if payload.auto_tick and added > 0:
-        runtime.tick_analysis(use_full_context=True)
-        ticked = True
+        ticked = runtime.tick_analysis(use_full_context=True)
 
     return {
         "state": runtime.snapshot(),
@@ -978,7 +1423,12 @@ def post_import_json_dir(payload: DatasetImportInput):
             "auto_tick": payload.auto_tick,
             "ticked": ticked,
             "analysis_mode": "full_context_once" if ticked else "none",
-            "warning": "업로드한 JSON에서 전사 문장을 찾지 못했습니다." if added == 0 else "",
+            "meeting_goal_applied": bool(goal_from_json),
+            "warning": (
+                "업로드한 JSON에서 전사 문장을 찾지 못했습니다."
+                if added == 0
+                else ("LLM 연결 버튼을 누르지 않아 분석은 실행되지 않았습니다." if payload.auto_tick and not ticked else "")
+            ),
         },
     }
 
@@ -995,6 +1445,7 @@ async def post_import_json_files(
     synthetic_sec = 0
     parsed_files = 0
     skipped_files = 0
+    meeting_goal = ""
 
     for idx, upload in enumerate(files):
         name = (upload.filename or f"upload_{idx + 1}.json").strip() or f"upload_{idx + 1}.json"
@@ -1004,7 +1455,9 @@ async def post_import_json_files(
                 skipped_files += 1
                 continue
 
-            rows = _extract_rows_from_json_payload(_read_json_bytes(payload, label=name))
+            rows, meta = _extract_rows_from_json_payload(_read_json_bytes(payload, label=name))
+            if not meeting_goal:
+                meeting_goal = str(meta.get("meeting_goal") or "").strip()
             if not rows:
                 skipped_files += 1
                 continue
@@ -1034,11 +1487,12 @@ async def post_import_json_files(
 
     if reset_state:
         runtime.reset_keep_config()
+    if meeting_goal:
+        runtime.set_meeting_goal(meeting_goal)
     added = runtime.append_utterances_bulk(utterances)
     ticked = False
     if auto_tick and added > 0:
-        runtime.tick_analysis(use_full_context=True)
-        ticked = True
+        ticked = runtime.tick_analysis(use_full_context=True)
 
     return {
         "state": runtime.snapshot(),
@@ -1048,20 +1502,28 @@ async def post_import_json_files(
             "files_parsed": parsed_files,
             "files_skipped": skipped_files,
             "rows_loaded": len(utterances),
+            "meeting_goal": meeting_goal,
             "file_stats": file_stats[:20],
             "added": added,
             "reset_state": reset_state,
             "auto_tick": auto_tick,
             "ticked": ticked,
             "analysis_mode": "full_context_once" if ticked else "none",
-            "warning": "업로드한 JSON에서 전사 문장을 찾지 못했습니다." if added == 0 else "",
+            "meeting_goal_applied": bool(meeting_goal),
+            "warning": (
+                "업로드한 JSON에서 전사 문장을 찾지 못했습니다."
+                if added == 0
+                else ("LLM 연결 버튼을 누르지 않아 분석은 실행되지 않았습니다." if auto_tick and not ticked else "")
+            ),
         },
     }
 
 
 @app.post("/api/analysis/tick")
 def post_analysis_tick():
-    runtime.tick_analysis()
+    ok = runtime.tick_analysis()
+    if not ok:
+        raise HTTPException(status_code=409, detail="LLM 연결 버튼을 먼저 누르세요. 연결 전에는 분석 기능이 비활성화됩니다.")
     return runtime.snapshot()
 
 

@@ -30,6 +30,37 @@ ANALYSIS_JSON_SHAPE = {
         "active": {"title": "string", "status": "ACTIVE|CLOSING|CLOSED", "confidence": "0-1"},
         "candidates": [{"title": "string", "confidence": "0-1"}],
     },
+    "agenda_outcomes": [
+        {
+            "agenda_title": "string",
+            "agenda_state": "PROPOSED|ACTIVE|CLOSING|CLOSED",
+            "flow_type": "문제정의|대안비교|의견충돌|근거검토|결론수렴|실행정의",
+            "key_utterances": ["string", "string"],
+            "summary": "string",
+            "decision_results": [
+                {
+                    "decision": "string",
+                    "opinions": ["string", "string"],
+                    "conclusion": "string",
+                }
+            ],
+            "action_items": [
+                {
+                    "item": "string",
+                    "owner": "string",
+                    "due": "string",
+                    "reasons": [
+                        {
+                            "speaker": "string",
+                            "timestamp": "HH:MM:SS|''",
+                            "quote": "string",
+                            "why": "string",
+                        }
+                    ],
+                }
+            ],
+        }
+    ],
     "keywords": {
         "taxonomy": {
             "K1_OBJECT": "string",
@@ -353,7 +384,8 @@ class GeminiClient:
             raw_text = self._generate_content(prompt=prompt)
             payload = self._parse_json_with_repair(raw_text)
             merged_payload = self._deep_merge(defaults, payload)
-            merged_payload["keywords"] = engine_keywords
+            if not merged_payload.get("keywords"):
+                merged_payload["keywords"] = engine_keywords
             self._mark_success()
             return validate_analysis_payload(merged_payload)
         except (requests.RequestException, json.JSONDecodeError, ValidationError) as exc:
@@ -541,6 +573,7 @@ class GeminiClient:
         return (
             "당신은 실시간 회의 리듬 분석기입니다.\n"
             "반드시 JSON 객체 하나만 반환하고 다른 텍스트는 출력하지 마세요.\n"
+            "이 시스템의 목적은 단순 키워드 추출이 아니라, '아젠다 흐름 + 의사결정 + 실행항목'을 구조화하는 것입니다.\n"
             "규칙:\n"
             "- 서술은 중립적으로 작성합니다.\n"
             "- 입력 전사는 한국어 중심이며 일부 영어 단어가 혼용될 수 있습니다.\n"
@@ -550,6 +583,38 @@ class GeminiClient:
             "- 수치 범위는 스키마 제한을 준수합니다.\n"
             "- enum/URL/고유 키를 제외한 자유 텍스트 값은 한국어 중심으로 작성합니다.\n"
             "- 제품명/고유명사/기술 용어는 영어를 유지해도 됩니다.\n\n"
+            "핵심 해석 지침(필수):\n"
+            "1) agenda 추출:\n"
+            "- 회의록에서 시간 순으로 아젠다 흐름을 읽어 agenda.candidates에 반영합니다.\n"
+            "- agenda.active는 현재 가장 중심인 아젠다 1개를 선택합니다.\n"
+            "- 단순 주제가 아니라 '결론 가능 단위'를 아젠다로 봅니다.\n"
+            "- 같은 topic이라도 주요 흐름(문제정의/대안비교/의견충돌/근거검토/결론수렴/실행정의)이 달라지면 agenda_outcomes에 별도 항목으로 분리합니다.\n"
+            "- agenda_title은 topic만 쓰지 말고, 해당 흐름의 요지를 포함해 구체적으로 작성합니다.\n"
+            "- agenda_outcomes[*].flow_type은 다음 중 하나로 채웁니다: 문제정의/대안비교/의견충돌/근거검토/결론수렴/실행정의\n"
+            "- agenda_outcomes[*].key_utterances에는 해당 아젠다를 대표하는 핵심 발언 2~4개를 넣습니다.\n"
+            "2) 아젠다별 의사결정 요약:\n"
+            "- 한 아젠다 안에서 어떤 의견/대안이 있었는지 K2_OPTION, r2_options.pros/risks에 반영합니다.\n"
+            "- 결론/합의가 보이면 intervention.decision_lock.reason, scores.dps.why에 요약합니다.\n"
+            "- 반드시 agenda_outcomes[*].decision_results에 다건으로 정리합니다(아젠다당 여러 결정 허용).\n"
+            "3) 액션아이템 추출:\n"
+            "- '~~까지 ~~하자', '누가 언제 무엇을' 형태 발화를 K6_ACTION으로 우선 추출합니다.\n"
+            "- 후속 실행 항목은 keywords.k_facet.actions와 keywords.items(type=K6_ACTION)에 반영합니다.\n"
+            "- 반드시 agenda_outcomes[*].action_items에 다건으로 정리합니다(아젠다당 여러 액션 허용).\n"
+            "4) 액션아이템 근거 로그:\n"
+            "- 왜 그 액션이 필요한지 설명하는 발언을 evidence_gate.claims에 넣습니다.\n"
+            "- evidence_gate.claims.note에는 근거 발화 요지를 짧게 작성합니다.\n"
+            "- 각 action_item마다 reasons를 여러 개 둘 수 있습니다(한 액션당 근거 다건 허용).\n"
+            "5) 요약 우선순위:\n"
+            "- 말이 많은 부분보다 '결정/대안/제약/근거/실행' 신호가 강한 발화를 우선 반영합니다.\n\n"
+            "필드 매핑 규칙(엄수):\n"
+            "- agenda.active/candidates: 아젠다 흐름\n"
+            "- agenda_outcomes: 아젠다별 결정/액션/근거 로그의 계층 구조(핵심)\n"
+            "- agenda_outcomes.flow_type/key_utterances: 아젠다를 단순 topic이 아닌 '흐름+핵심발언'으로 설명\n"
+            "- keywords.items: K1~K6 결정 변수\n"
+            "- keywords.k_facet.actions: 후속 실행 항목 요약\n"
+            "- recommendations.r2_options: 아젠다 내 대안 비교(의견 구조)\n"
+            "- evidence_gate.claims: 액션/결정의 근거 발언 로그\n"
+            "- intervention.decision_lock.reason: 결론 상태 한 줄 요약\n\n"
             f"요구 JSON 형태:\n{json.dumps(ANALYSIS_JSON_SHAPE, indent=2)}\n\n"
             f"meeting_goal:\n{meeting_goal}\n\n"
             f"initial_context:\n{initial_context}\n\n"
@@ -580,6 +645,12 @@ class GeminiClient:
             "입력은 한국어 중심 + 영어 혼용일 수 있습니다.\n"
             "enum/URL/고유 키를 제외한 자유 텍스트 값은 한국어 중심으로 작성하세요.\n"
             "제품명/고유명사/기술 용어는 영어를 유지해도 됩니다.\n\n"
+            "산출물 작성 지침:\n"
+            "- meeting_summary: 아젠다 흐름(처음→전환→현재)과 아젠다별 결론 상태를 요약\n"
+            "- decision_results: 아젠다별 주요 의견(찬반/대안)과 최종 결론을 분리해서 정리\n"
+            "- action_items: '누가/언제/무엇' 중심으로 실행 항목만 짧게 나열\n"
+            "- evidence_log: 각 액션아이템/결론의 이유가 된 발언 요지를 근거로 기록\n"
+            "- 가능하면 대화록 표현(예: '~~까지 ~~하자')을 실행항목 문장으로 정규화\n\n"
             f"요구 JSON 형태:\n{json.dumps(output_schema, indent=2)}\n\n"
             f"meeting_goal:\n{meeting_goal}\n\n"
             f"initial_context:\n{initial_context}\n\n"
@@ -615,6 +686,18 @@ class GeminiClient:
             "- 근거 없는 확신을 피하고 reason/debug를 간단히 남깁니다.\n"
             "- enum 값은 요구 형태를 정확히 따릅니다.\n"
             "- 자유 텍스트는 한국어 중심으로 작성하세요.\n\n"
+            "제어 로직 지침(강화):\n"
+            "1) agenda_tracker:\n"
+            "- 회의록에서 아젠다 전환 흐름을 추적해 agenda_candidates를 업데이트\n"
+            "- 아젠다는 '결론 단위' 기준으로 분리\n"
+            "2) agenda_fsm:\n"
+            "- ACTIVE 아젠다 1개를 중심으로 상태 전이(PROPOSED→ACTIVE→CLOSING→CLOSED) 정합성 유지\n"
+            "3) dps/decision_lock:\n"
+            "- 한 아젠다의 의견 분포와 결론 신호를 반영해 진행도와 lock 여부 판단\n"
+            "4) action 중심 반영:\n"
+            "- 실행 약속(예: '~~까지 ~~하자')이 나오면 K6/ACTION 관련 점수와 상태에 반영\n"
+            "5) evidence 연결:\n"
+            "- 액션/결정의 이유 발언은 evidence 관련 신호에 반영해 과도한 확신을 방지\n\n"
             f"요구 JSON 형태:\n{json.dumps(CONTROL_PLANE_JSON_SHAPE, indent=2)}\n\n"
             f"meeting_goal:\n{meeting_goal}\n\n"
             f"initial_context:\n{initial_context}\n\n"

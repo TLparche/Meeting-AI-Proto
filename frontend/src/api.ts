@@ -1,5 +1,6 @@
 import type {
   ArtifactKind,
+  LlmConnectResponse,
   ImportJsonDirResponse,
   LlmPingResponse,
   LlmStatus,
@@ -30,6 +31,16 @@ export async function getLlmStatus(): Promise<LlmStatus> {
 export async function pingLlm(): Promise<LlmPingResponse> {
   const res = await fetch("/api/llm/ping", { method: "POST" });
   return parse<LlmPingResponse>(res);
+}
+
+export async function connectLlm(): Promise<LlmConnectResponse> {
+  const res = await fetch("/api/llm/connect", { method: "POST" });
+  return parse<LlmConnectResponse>(res);
+}
+
+export async function disconnectLlm(): Promise<LlmConnectResponse> {
+  const res = await fetch("/api/llm/disconnect", { method: "POST" });
+  return parse<LlmConnectResponse>(res);
 }
 
 export async function saveConfig(payload: {

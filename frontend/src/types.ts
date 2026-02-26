@@ -90,6 +90,18 @@ export interface LlmPingResponse {
   llm_status: LlmStatus;
 }
 
+export interface LlmConnectResponse {
+  enabled: boolean;
+  result?: {
+    ok: boolean;
+    message: string;
+    mode: "mock" | "live";
+    response_preview?: Record<string, unknown>;
+  };
+  llm_status: LlmStatus;
+  state: MeetingState;
+}
+
 export interface ArtifactOutput {
   kind: ArtifactKind;
   title: string;
@@ -97,11 +109,42 @@ export interface ArtifactOutput {
   bullets: string[];
 }
 
+export interface AgendaActionReason {
+  speaker: string;
+  timestamp: string;
+  quote: string;
+  why: string;
+}
+
+export interface AgendaActionItemDetail {
+  item: string;
+  owner: string;
+  due: string;
+  reasons: AgendaActionReason[];
+}
+
+export interface AgendaDecisionDetail {
+  decision: string;
+  opinions: string[];
+  conclusion: string;
+}
+
+export interface AgendaOutcomeDetail {
+  agenda_title: string;
+  agenda_state: "PROPOSED" | "ACTIVE" | "CLOSING" | "CLOSED";
+  flow_type: string;
+  key_utterances: string[];
+  summary: string;
+  decision_results: AgendaDecisionDetail[];
+  action_items: AgendaActionItemDetail[];
+}
+
 export interface AnalysisOutput {
   agenda: {
     active: { title: string; status: "ACTIVE" | "CLOSING" | "CLOSED"; confidence: number };
     candidates: Array<{ title: string; confidence: number }>;
   };
+  agenda_outcomes: AgendaOutcomeDetail[];
   keywords: {
     taxonomy: {
       K1_OBJECT: string;
@@ -278,6 +321,7 @@ export interface MeetingState {
     strong_count: number;
     rule: string;
   };
+  llm_enabled?: boolean;
   analysis_runtime?: {
     tick_mode?: "full_context" | "windowed";
     transcript_count?: number;
@@ -339,11 +383,13 @@ export interface ImportJsonDirResponse {
     files_parsed: number;
     files_skipped: number;
     rows_loaded: number;
+    meeting_goal?: string;
     added: number;
     reset_state: boolean;
     auto_tick: boolean;
     ticked: boolean;
     analysis_mode?: "full_context_once" | "none";
+    meeting_goal_applied?: boolean;
     warning?: string;
     file_stats: Array<{ file: string; rows: number }>;
   };

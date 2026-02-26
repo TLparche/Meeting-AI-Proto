@@ -94,14 +94,31 @@ def _related_turns(transcript: list[dict], agenda_title: str, max_turns: int = 3
     return list(reversed(matched))
 
 
+def _agenda_outcomes(analysis: dict) -> list[dict]:
+    raw = (analysis.get("agenda_outcomes") or [])
+    out: list[dict] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("agenda_title") or "").strip()
+        if not title:
+            continue
+        out.append(item)
+    return out
+
+
 def _build_meeting_summary(
     *,
     meeting_goal: str,
     active_agenda_title: str,
     agenda_entries: list[dict[str, Any]],
     transcript: list[dict],
+    analysis: dict,
 ) -> dict[str, Any]:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    outcomes = _agenda_outcomes(analysis)
     lines = [
         "### Meeting Summary (Live)",
         f"- generated_at: {ts}",
@@ -111,7 +128,25 @@ def _build_meeting_summary(
         "#### Agenda Units",
     ]
     bullets: list[str] = []
-    if not agenda_entries:
+    if outcomes:
+        for ag in outcomes[:20]:
+            title = str(ag.get("agenda_title") or "").strip()
+            state = str(ag.get("agenda_state") or "PROPOSED").upper()
+            flow_type = str(ag.get("flow_type") or "").strip() or "문제정의"
+            key_utterances = ag.get("key_utterances") or []
+            key_line = " | ".join(_clip(str(x), 48) for x in key_utterances[:3] if str(x).strip()) or "-"
+            summary = _clip(str(ag.get("summary") or "요약 없음"), 120)
+            decision_count = len(ag.get("decision_results") or [])
+            action_count = len(ag.get("action_items") or [])
+            lines.append(f"- [{state}] {title}")
+            lines.append(f"  - flow_type: {flow_type}")
+            lines.append(f"  - key_utterances: {key_line}")
+            lines.append(f"  - summary: {summary}")
+            lines.append(f"  - decisions: {decision_count}, actions: {action_count}")
+            bullets.append(
+                f"[{state}] {title} | flow={flow_type} | {summary} | decisions={decision_count}, actions={action_count}"
+            )
+    elif not agenda_entries:
         lines.append("- 아젠다가 아직 구조화되지 않았습니다.")
         bullets.append("아직 아젠다가 없어 요약을 생성하지 못했습니다.")
     else:
@@ -138,6 +173,39 @@ def _build_decision_results(
     active_agenda_title: str,
     dps_score: float,
 ) -> dict[str, Any]:
+    outcomes = _agenda_outcomes(analysis)
+    if outcomes:
+        lines = [
+            "### Decision Results (Agenda Grouped)",
+            f"- current_agenda: {active_agenda_title or '(none)'}",
+            f"- dps: {dps_score:.2f}",
+            "",
+        ]
+        bullets: list[str] = []
+        for ag in outcomes[:20]:
+            title = str(ag.get("agenda_title") or "").strip()
+            state = str(ag.get("agenda_state") or "PROPOSED").upper()
+            lines.append(f"#### [{state}] {title}")
+            decision_results = ag.get("decision_results") or []
+            if not decision_results:
+                lines.append("- 결정 결과 없음")
+                continue
+            for d in decision_results[:12]:
+                decision = _clip(str((d or {}).get("decision") or ""), 80)
+                conclusion = _clip(str((d or {}).get("conclusion") or ""), 100)
+                opinions = (d or {}).get("opinions") or []
+                opinions_txt = " | ".join(_clip(str(x), 50) for x in opinions[:5] if str(x).strip()) or "-"
+                lines.append(f"- decision: {decision}")
+                lines.append(f"  - opinions: {opinions_txt}")
+                lines.append(f"  - conclusion: {conclusion}")
+                bullets.append(f"[{title}] {decision} -> {conclusion}")
+        return {
+            "kind": ArtifactKind.DECISION_RESULTS.value,
+            "title": "의사결정 결과 (아젠다별)",
+            "markdown": "\n".join(lines),
+            "bullets": bullets[:20] or ["아젠다별 결정 결과가 없습니다."],
+        }
+
     intervention = (analysis.get("intervention") or {})
     lock = intervention.get("decision_lock") or {}
     k_core = ((analysis.get("keywords") or {}).get("k_core") or {})
@@ -204,6 +272,37 @@ def _extract_action_candidates(transcript: list[dict]) -> list[dict[str, str]]:
 
 
 def _build_action_items(*, analysis: dict, transcript: list[dict]) -> dict[str, Any]:
+    outcomes = _agenda_outcomes(analysis)
+    if outcomes:
+        lines = [
+            "### Action Items (Agenda Grouped)",
+            "- 형식: [agenda] owner / due / item",
+        ]
+        bullets: list[str] = []
+        for ag in outcomes[:20]:
+            title = str(ag.get("agenda_title") or "").strip()
+            items = ag.get("action_items") or []
+            if not items:
+                continue
+            lines.append(f"#### {title}")
+            for item in items[:16]:
+                owner = str((item or {}).get("owner") or "미지정").strip() or "미지정"
+                due = str((item or {}).get("due") or "미정").strip() or "미정"
+                task = _clip(str((item or {}).get("item") or ""), 110)
+                if not task:
+                    continue
+                line = f"[{title}] [owner: {owner} | due: {due}] {task}"
+                lines.append(f"- {line}")
+                bullets.append(line)
+        if not bullets:
+            bullets = ["아젠다별 액션 아이템이 아직 없습니다."]
+        return {
+            "kind": ArtifactKind.ACTION_ITEMS.value,
+            "title": "액션 아이템 (아젠다별)",
+            "markdown": "\n".join(lines),
+            "bullets": bullets[:24],
+        }
+
     candidates = _extract_action_candidates(transcript)
     k_actions = (((analysis.get("keywords") or {}).get("k_facet") or {}).get("actions") or [])
     for act in k_actions:
@@ -238,10 +337,43 @@ def _build_action_items(*, analysis: dict, transcript: list[dict]) -> dict[str, 
 
 def _build_evidence_log(
     *,
+    analysis: dict,
     evidence_status: str,
     evidence_snippet: str,
     evidence_log: list[dict],
 ) -> dict[str, Any]:
+    outcomes = _agenda_outcomes(analysis)
+    if outcomes:
+        lines = [
+            "### Evidence Log (Agenda Grouped)",
+            f"- status: {evidence_status}",
+        ]
+        bullets: list[str] = []
+        for ag in outcomes[:20]:
+            title = str(ag.get("agenda_title") or "").strip()
+            items = ag.get("action_items") or []
+            for item in items[:16]:
+                task = _clip(str((item or {}).get("item") or ""), 90)
+                reasons = (item or {}).get("reasons") or []
+                if not reasons:
+                    continue
+                lines.append(f"#### {title} / {task}")
+                for r in reasons[:12]:
+                    speaker = str((r or {}).get("speaker") or "").strip()
+                    ts = str((r or {}).get("timestamp") or "").strip()
+                    quote = _clip(str((r or {}).get("quote") or ""), 100)
+                    why = _clip(str((r or {}).get("why") or ""), 100)
+                    lines.append(f"- [{speaker}{' @'+ts if ts else ''}] {quote}")
+                    lines.append(f"  - why: {why}")
+                    bullets.append(f"[{title}] {task} | {speaker}: {quote} -> {why}")
+        if bullets:
+            return {
+                "kind": ArtifactKind.EVIDENCE_LOG.value,
+                "title": "근거 로그 (아젠다/액션별)",
+                "markdown": "\n".join(lines),
+                "bullets": bullets[:30],
+            }
+
     lines = [
         "### Evidence Log (Live)",
         f"- status: {evidence_status}",
@@ -295,6 +427,7 @@ def build_live_artifact(
             active_agenda_title=active_agenda_title,
             agenda_entries=agenda_entries,
             transcript=transcript,
+            analysis=analysis,
         )
     if kind == ArtifactKind.DECISION_RESULTS:
         return _build_decision_results(
@@ -305,6 +438,7 @@ def build_live_artifact(
     if kind == ArtifactKind.ACTION_ITEMS:
         return _build_action_items(analysis=analysis, transcript=transcript)
     return _build_evidence_log(
+        analysis=analysis,
         evidence_status=evidence_status,
         evidence_snippet=evidence_snippet,
         evidence_log=evidence_log,

@@ -841,6 +841,133 @@ textarea {
   word-break: break-word;
 }
 
+.agenda-outcome-board {
+  border: 1px solid #cfdde6;
+  border-radius: 11px;
+  background: #f8fbfe;
+  padding: 9px;
+  margin-bottom: 10px;
+}
+
+.agenda-outcome-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.agenda-outcome-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.agenda-outcome-card {
+  border: 1px solid #d3dfe8;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 8px;
+}
+
+.agenda-outcome-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.agenda-outcome-title {
+  font-weight: 700;
+  color: #23485b;
+}
+
+.agenda-state-pill {
+  margin-left: auto;
+}
+
+.agenda-state-active {
+  border-color: #7cae91;
+  background: #eaf8ef;
+  color: #265c3d;
+}
+
+.agenda-state-closing {
+  border-color: #d2ac68;
+  background: #fff7e7;
+  color: #6a4f11;
+}
+
+.agenda-state-proposed {
+  border-color: #9db6c8;
+  background: #edf4fb;
+  color: #2d516c;
+}
+
+.agenda-state-closed {
+  border-color: #bac8d4;
+  background: #f2f6f9;
+  color: #546b7a;
+}
+
+.agenda-outcome-summary {
+  font-size: 0.8rem;
+  color: #335565;
+  margin-bottom: 7px;
+}
+
+.agenda-outcome-flow,
+.agenda-outcome-key {
+  font-size: 0.77rem;
+  color: #35596d;
+  margin-bottom: 4px;
+  line-height: 1.35;
+}
+
+.agenda-outcome-block {
+  border-top: 1px dashed #d7e3ec;
+  padding-top: 6px;
+  margin-top: 6px;
+}
+
+.agenda-outcome-block-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #2e5164;
+  margin-bottom: 5px;
+}
+
+.agenda-outcome-item {
+  border: 1px solid #d8e3eb;
+  border-radius: 8px;
+  background: #f9fcff;
+  padding: 6px 7px;
+  margin-bottom: 5px;
+}
+
+.agenda-outcome-item-head {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #294a5d;
+  margin-bottom: 3px;
+}
+
+.agenda-outcome-line {
+  font-size: 0.77rem;
+  color: #3a5b6d;
+  line-height: 1.4;
+}
+
+.agenda-reason-row {
+  margin-top: 4px;
+  border-left: 2px solid #c8d8e4;
+  padding-left: 6px;
+  font-size: 0.75rem;
+  color: #4a6677;
+  line-height: 1.35;
+}
+
 .status-badge {
   display: inline-flex;
   align-items: center;

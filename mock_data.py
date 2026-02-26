@@ -42,6 +42,18 @@ def build_analysis_template(
                 for i, title in enumerate(candidate_titles[:3])
             ],
         },
+        "agenda_outcomes": [
+            {
+                "agenda_title": title,
+                "agenda_state": "ACTIVE" if i == 0 else "PROPOSED",
+                "flow_type": "문제정의",
+                "key_utterances": [],
+                "summary": f"{title} 관련 결정/실행 항목을 정리 중입니다.",
+                "decision_results": [],
+                "action_items": [],
+            }
+            for i, title in enumerate(candidate_titles[:4])
+        ],
         "keywords": keywords,
         "scores": {
             "drift": {"score": 0, "band": "GREEN", "why": ""},
@@ -173,6 +185,66 @@ def build_mock_analysis(
                 for i, title in enumerate(candidate_titles[:3])
             ],
         },
+        "agenda_outcomes": [
+            {
+                "agenda_title": candidate_titles[0] if candidate_titles else active_title,
+                "agenda_state": "ACTIVE",
+                "flow_type": "대안비교",
+                "key_utterances": [
+                    "파일럿 먼저 진행 후 확장하자",
+                    "즉시 전면 적용이 효과를 빠르게 낼 수 있다",
+                ],
+                "summary": "핵심 옵션 비교 후 단계적 파일럿 방향으로 의견이 수렴되었습니다.",
+                "decision_results": [
+                    {
+                        "decision": "롤아웃 방식",
+                        "opinions": [
+                            "파일럿 먼저 진행 후 확장하자",
+                            "즉시 전면 적용이 효과를 빠르게 낼 수 있다",
+                        ],
+                        "conclusion": "리스크 완화를 위해 파일럿 우선 진행",
+                    },
+                    {
+                        "decision": "성공지표",
+                        "opinions": [
+                            "온보딩 시간 단축을 1차 지표로 두자",
+                            "활성 사용자 전환율도 같이 보자",
+                        ],
+                        "conclusion": "온보딩 시간 + 전환율을 병행 모니터링",
+                    },
+                ],
+                "action_items": [
+                    {
+                        "item": "이번 주 금요일까지 파일럿 계획안 작성",
+                        "owner": "제품 리드",
+                        "due": "이번주",
+                        "reasons": [
+                            {
+                                "speaker": "DG0001",
+                                "timestamp": "",
+                                "quote": "리스크를 줄이려면 작은 범위로 먼저 검증하자",
+                                "why": "전면 적용 리스크를 낮추기 위해 파일럿 선행 필요",
+                            },
+                            {
+                                "speaker": "DG0005",
+                                "timestamp": "",
+                                "quote": "일정이 밀리면 다음 스프린트 의사결정이 지연된다",
+                                "why": "다음 의사결정 일정 보호",
+                            },
+                        ],
+                    }
+                ],
+            },
+            {
+                "agenda_title": candidate_titles[1] if len(candidate_titles) > 1 else "이해관계자 커뮤니케이션",
+                "agenda_state": "PROPOSED",
+                "flow_type": "실행정의",
+                "key_utterances": ["누가 어떤 메시지로 공유할지 다음 라운드에서 확정하자"],
+                "summary": "커뮤니케이션 대상/메시지는 다음 아젠다에서 확정 예정입니다.",
+                "decision_results": [],
+                "action_items": [],
+            },
+        ],
         "keywords": keywords,
         "scores": {
             "drift": {"score": drift_score, "band": drift_band, "why": drift_why},
