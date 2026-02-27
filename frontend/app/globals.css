@@ -239,6 +239,37 @@ select {
   }
 }
 
+.targetLink {
+  margin: 2px 0 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #1f4bb2;
+  font-size: 0.82rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.targetLink:hover {
+  text-decoration: underline;
+}
+
+.focusFlash {
+  outline: 2px solid #9cb8ff;
+  outline-offset: 2px;
+  border-radius: 8px;
+  animation: flashFocus 1.2s ease-out;
+}
+
+@keyframes flashFocus {
+  0% {
+    box-shadow: 0 0 0 0 rgba(47, 108, 244, 0.4);
+  }
+  100% {
+    box-shadow: 0 0 0 10px rgba(47, 108, 244, 0);
+  }
+}
+
 .mainArea {
   margin-left: 280px;
   height: 100vh;

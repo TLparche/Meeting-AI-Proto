@@ -176,6 +176,7 @@ export default function Home() {
   const [taskStartedAt, setTaskStartedAt] = useState<number | null>(null);
   const [taskElapsedSec, setTaskElapsedSec] = useState(0);
   const [analysisPending, setAnalysisPending] = useState(false);
+  const [focusedTargetDomId, setFocusedTargetDomId] = useState("");
   const [error, setError] = useState("");
 
   const [query, setQuery] = useState("");
@@ -534,6 +535,11 @@ export default function Home() {
     return state.analysis.agenda_outcomes as unknown as AgendaOutcome[];
   }, [state.analysis]);
 
+  const sortedOutcomeRows = useMemo<AgendaOutcome[]>(
+    () => [...outcomeRows].sort((a, b) => Number(a.start_turn_id || 0) - Number(b.start_turn_id || 0)),
+    [outcomeRows],
+  );
+
   const agendas = useMemo<Agenda[]>(() => {
     if (outcomeRows.length === 0) {
       const stack = state.agenda_stack || [];
@@ -560,7 +566,7 @@ export default function Home() {
       });
     }
     const activeTitle = safeText(state.analysis?.agenda?.active?.title);
-    const rows = [...outcomeRows].sort((a, b) => Number(a.start_turn_id || 0) - Number(b.start_turn_id || 0));
+    const rows = sortedOutcomeRows;
     const items: Agenda[] = rows.map((row, idx) => {
       const title = safeText(row.agenda_title, `안건 ${idx + 1}`);
       const agendaState = normalizeAgendaState(row.agenda_state);
@@ -585,6 +591,7 @@ export default function Home() {
         decisionSoFar: decisionConclusions.slice(0, 6),
         nextQuestions: [],
         keywords: Array.from(new Set(keywords)).slice(0, 8),
+        summaryPointIds: keyPoints.map((_, pointIdx) => `summary-${idx}-${pointIdx}`),
         summaryBullets: summaries.slice(0, 6),
         recommendation: actionNames[0] ? `우선 액션: ${actionNames[0]}` : "핵심 액션 정리가 필요합니다.",
         lastUpdated: formatNowTime(),
@@ -595,7 +602,7 @@ export default function Home() {
       ...agenda,
       nextUp: items[idx + 1] ? `${items[idx + 1].label}: ${items[idx + 1].title}` : "마무리",
     }));
-  }, [outcomeRows, state.agenda_stack, state.analysis?.agenda?.active?.confidence, state.analysis?.agenda?.active?.title]);
+  }, [sortedOutcomeRows, state.agenda_stack, state.analysis?.agenda?.active?.confidence, state.analysis?.agenda?.active?.title]);
 
   useEffect(() => {
     if (agendas.length === 0) {
@@ -613,7 +620,7 @@ export default function Home() {
   const transcript = useMemo<TranscriptUtterance[]>(() => {
     const src = state.transcript || [];
     if (src.length === 0) return [];
-    const sortedRanges = [...outcomeRows]
+    const sortedRanges = [...sortedOutcomeRows]
       .map((row, idx) => {
         const id = safeText(row.agenda_id, agendas[idx]?.id || `agenda-${idx + 1}`);
         return {
@@ -645,12 +652,12 @@ export default function Home() {
         agendaId,
       };
     });
-  }, [state.transcript, agendas, selectedAgenda?.id, outcomeRows]);
+  }, [state.transcript, agendas, selectedAgenda?.id, sortedOutcomeRows]);
 
   const decisions = useMemo<DecisionItem[]>(() => {
-    if (outcomeRows.length === 0) return [];
+    if (sortedOutcomeRows.length === 0) return [];
     const out: DecisionItem[] = [];
-    outcomeRows.forEach((row, ridx) => {
+    sortedOutcomeRows.forEach((row, ridx) => {
       const title = safeText(row.agenda_title, agendas[0]?.title || "");
       const agendaId = safeText(row.agenda_id, agendas[ridx]?.id || agendas[0]?.id || "agenda-1");
       (row.decision_results || []).forEach((decision, didx) => {
@@ -671,12 +678,12 @@ export default function Home() {
       });
     });
     return out;
-  }, [outcomeRows, agendas]);
+  }, [sortedOutcomeRows, agendas]);
 
   const actionItems = useMemo<ActionItem[]>(() => {
-    if (outcomeRows.length === 0) return [];
+    if (sortedOutcomeRows.length === 0) return [];
     const out: ActionItem[] = [];
-    outcomeRows.forEach((row, ridx) => {
+    sortedOutcomeRows.forEach((row, ridx) => {
       const agendaId = safeText(row.agenda_id, agendas[ridx]?.id || agendas[0]?.id || "agenda-1");
       (row.action_items || []).forEach((action, aidx) => {
         const evidence = (action.reasons || []).map((reason) => safeText(reason.timestamp)).filter(Boolean);
@@ -692,22 +699,52 @@ export default function Home() {
       });
     });
     return out;
-  }, [outcomeRows, agendas]);
+  }, [sortedOutcomeRows, agendas]);
 
   const evidenceLog = useMemo<EvidenceItem[]>(() => {
-    if (outcomeRows.length === 0) return [];
+    if (sortedOutcomeRows.length === 0) return [];
     const out: EvidenceItem[] = [];
-    outcomeRows.forEach((row, ridx) => {
+    sortedOutcomeRows.forEach((row, ridx) => {
       const agendaId = safeText(row.agenda_id, agendas[ridx]?.id || agendas[0]?.id || "agenda-1");
+      const agendaTitle = safeText(row.agenda_title, agendas[ridx]?.title || "안건");
+      const summaryItems = (row.agenda_summary_items || []).map((s) => safeText(s)).filter(Boolean);
       (row.summary_references || []).forEach((reason, qidx) => {
+        const summaryTarget = safeText(reason.why);
+        const targetLabel =
+          summaryTarget && summaryTarget !== "요약 근거"
+            ? summaryTarget
+            : safeText(summaryItems[qidx] || summaryItems[0], "요약 항목");
         out.push({
           id: `evidence-summary-${ridx}-${qidx}`,
           agendaId,
+          agendaTitle,
           supports: "Summary",
-          targetId: `summary-${ridx}`,
+          targetId: `summary-${ridx}-${Math.min(qidx, Math.max(0, summaryItems.length - 1))}`,
+          targetLabel,
           quote: safeText(reason.quote, "요약 근거 없음"),
           timestamp: safeText(reason.timestamp, "--:--"),
           speaker: safeText(reason.speaker, "화자"),
+        });
+      });
+      (row.decision_results || []).forEach((decision, didx) => {
+        const conclusion = safeText(decision.conclusion, `의사결정 ${didx + 1}`);
+        (decision.opinions || []).forEach((opinion, oidx) => {
+          const line = safeText(opinion);
+          if (!line) return;
+          const tsMatch = line.match(/\[(\d{2}:\d{2}(?::\d{2})?)\]/);
+          const ts = tsMatch ? tsMatch[1] : "--:--";
+          const quote = line.replace(/^\[\d{2}:\d{2}(?::\d{2})?\]\s*/, "").trim();
+          out.push({
+            id: `evidence-decision-${ridx}-${didx}-${oidx}`,
+            agendaId,
+            agendaTitle,
+            supports: "Decision",
+            targetId: `decision-${ridx}-${didx}`,
+            targetLabel: conclusion,
+            quote: quote || line,
+            timestamp: ts,
+            speaker: "토론자",
+          });
         });
       });
       (row.action_items || []).forEach((action, aidx) => {
@@ -715,8 +752,10 @@ export default function Home() {
           out.push({
             id: `evidence-${ridx}-${aidx}-${qidx}`,
             agendaId,
+            agendaTitle,
             supports: "Action",
             targetId: `action-${ridx}-${aidx}`,
+            targetLabel: safeText(action.item, `액션 ${aidx + 1}`),
             quote: safeText(reason.quote, "근거 발언 없음"),
             timestamp: safeText(reason.timestamp, "--:--"),
             speaker: safeText(reason.speaker, "화자"),
@@ -725,7 +764,7 @@ export default function Home() {
       });
     });
     return out;
-  }, [outcomeRows, agendas]);
+  }, [sortedOutcomeRows, agendas]);
 
   const participantRoster = useMemo<Participant[]>(() => {
     const counts = new Map<string, number>();
@@ -817,6 +856,23 @@ export default function Home() {
   const bottomDecisions = decisions;
   const bottomActions = actionItems;
   const bottomEvidence = evidenceLog;
+  const groupedBottomEvidence = useMemo(() => {
+    if (bottomEvidence.length === 0) return [];
+    const agendaOrder = new Map(agendas.map((agenda, idx) => [agenda.id, idx]));
+    const groups = new Map<string, { agendaId: string; agendaTitle: string; items: EvidenceItem[] }>();
+    for (const item of bottomEvidence) {
+      const agendaTitle = item.agendaTitle || agendas.find((a) => a.id === item.agendaId)?.title || item.agendaId;
+      const existing = groups.get(item.agendaId);
+      if (!existing) {
+        groups.set(item.agendaId, { agendaId: item.agendaId, agendaTitle, items: [item] });
+      } else {
+        existing.items.push(item);
+      }
+    }
+    const rows = Array.from(groups.values());
+    rows.sort((a, b) => (agendaOrder.get(a.agendaId) ?? 9999) - (agendaOrder.get(b.agendaId) ?? 9999));
+    return rows;
+  }, [bottomEvidence, agendas]);
 
   const onSelectAgenda = (agendaId: string) => {
     if (analysisUiDisabled) return;
@@ -840,6 +896,26 @@ export default function Home() {
     const ts = extractTimestamp(summaryText);
     if (!ts) return;
     jumpToTranscript(agendaId, ts);
+  };
+
+  const focusTargetCard = (agendaId: string, targetId: string) => {
+    if (analysisUiDisabled) return;
+    const cleanTarget = safeText(targetId);
+    if (!cleanTarget) return;
+
+    setSelectedAgendaId(agendaId);
+    setSummaryScope("current");
+
+    const domId = `evi-target-${cleanTarget}`;
+    window.setTimeout(() => {
+      const el = document.getElementById(domId);
+      if (!el) return;
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      setFocusedTargetDomId(domId);
+      window.setTimeout(() => {
+        setFocusedTargetDomId((current) => (current === domId ? "" : current));
+      }, 1400);
+    }, 90);
   };
 
   const copySnippet = async (item: EvidenceItem) => {
@@ -979,7 +1055,11 @@ export default function Home() {
               <section key={agenda.id} className="decisionGroup">
                 <h4>{agendaLabel(agenda)}</h4>
                 {scopedDecisions.map((decision) => (
-                  <article key={decision.id} className="decisionItem">
+                  <article
+                    key={decision.id}
+                    id={`evi-target-${decision.id}`}
+                    className={`decisionItem ${focusedTargetDomId === `evi-target-${decision.id}` ? "focusFlash" : ""}`}
+                  >
                     <div className="decisionRow">
                       <p className="decisionIssue">{decision.issue}</p>
                       <span className={decisionStatusClass(decision.finalStatus)}>{decisionStatusLabel[decision.finalStatus]}</span>
@@ -1038,7 +1118,7 @@ export default function Home() {
             </thead>
             <tbody>
               {bottomActions.map((item) => (
-                <tr key={item.id}>
+                <tr id={`evi-target-${item.id}`} className={focusedTargetDomId === `evi-target-${item.id}` ? "focusFlash" : ""} key={item.id}>
                   <td>{item.action}</td>
                   <td>{item.owner}</td>
                   <td>{item.due}</td>
@@ -1076,24 +1156,39 @@ export default function Home() {
       {bottomEvidence.length === 0 ? (
         <p className="emptyState">연결된 액션 또는 의사결정이 생기면 근거 스니펫이 표시됩니다.</p>
       ) : (
-        <div className="evidenceList">
-          {bottomEvidence.map((item) => (
-            <article key={item.id} className="evidenceItem">
-              <div className="evidenceMeta">
-                <span className="chip chipSoft">{evidenceSupportLabel[item.supports]}</span>
-                <span className="timestamp">{item.timestamp}</span>
-                <span className="chip chipSpeaker">{item.speaker}</span>
+        <div className="decisionGroups">
+          {groupedBottomEvidence.map((group) => (
+            <section key={`ev-group-${group.agendaId}`} className="decisionGroup">
+              <h4>{group.agendaTitle}</h4>
+              <div className="evidenceList">
+                {group.items.map((item) => (
+                  <article key={item.id} className="evidenceItem">
+                    <div className="evidenceMeta">
+                      <span className="chip chipSoft">{evidenceSupportLabel[item.supports]}</span>
+                      <span className="timestamp">{item.timestamp}</span>
+                      <span className="chip chipSpeaker">{item.speaker}</span>
+                    </div>
+                    <button
+                      className="targetLink"
+                      type="button"
+                      onClick={() => focusTargetCard(item.agendaId, item.targetId)}
+                      disabled={analysisUiDisabled}
+                    >
+                      대상: {item.targetLabel || item.targetId}
+                    </button>
+                    <p className="quote">&quot;{item.quote}&quot;</p>
+                    <div className="evidenceActions">
+                      <button className="ghostButton" type="button" onClick={() => jumpToTranscript(item.agendaId, item.timestamp)} disabled={analysisUiDisabled}>
+                        전사문으로 이동
+                      </button>
+                      <button className="ghostButton" type="button" onClick={() => copySnippet(item)} disabled={analysisUiDisabled}>
+                        복사
+                      </button>
+                    </div>
+                  </article>
+                ))}
               </div>
-              <p className="quote">&quot;{item.quote}&quot;</p>
-              <div className="evidenceActions">
-                <button className="ghostButton" type="button" onClick={() => jumpToTranscript(item.agendaId, item.timestamp)} disabled={analysisUiDisabled}>
-                  전사문으로 이동
-                </button>
-                <button className="ghostButton" type="button" onClick={() => copySnippet(item)} disabled={analysisUiDisabled}>
-                  복사
-                </button>
-              </div>
-            </article>
+            </section>
           ))}
         </div>
       )}
@@ -1442,18 +1537,23 @@ export default function Home() {
                       <div className="summaryGrid">
                         <div>
                           <p className="mutedLabel">핵심 포인트</p>
-                          {agenda.keyPoints.length === 0 ? <p className="emptyState compact">아직 핵심 포인트가 없습니다.</p> : <ul className="bulletList">{agenda.keyPoints.map((point) => (
-                            <li key={point}>
-                              <button
-                                className="ghostButton"
-                                type="button"
-                                onClick={() => jumpBySummary(agenda.id, point)}
-                                disabled={analysisUiDisabled || !extractTimestamp(point)}
-                              >
-                                {point}
-                              </button>
-                            </li>
-                          ))}</ul>}
+                          {agenda.keyPoints.length === 0 ? <p className="emptyState compact">아직 핵심 포인트가 없습니다.</p> : <ul className="bulletList">{agenda.keyPoints.map((point, pointIdx) => {
+                            const targetId = agenda.summaryPointIds?.[pointIdx] || `summary-${agenda.id}-${pointIdx}`;
+                            const domId = `evi-target-${targetId}`;
+                            return (
+                              <li key={point}>
+                                <button
+                                  id={domId}
+                                  className={`ghostButton ${focusedTargetDomId === domId ? "focusFlash" : ""}`}
+                                  type="button"
+                                  onClick={() => jumpBySummary(agenda.id, point)}
+                                  disabled={analysisUiDisabled || !extractTimestamp(point)}
+                                >
+                                  {point}
+                                </button>
+                              </li>
+                            );
+                          })}</ul>}
                         </div>
                         <div>
                           <p className="mutedLabel">리스크</p>
