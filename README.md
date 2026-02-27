@@ -1,13 +1,32 @@
-# Meeting Rhythm AI (React + FastAPI)
+# Meeting STT + Agenda MVP
 
-Streamlit을 제거하고 아래 구조로 전환한 프로젝트입니다.
+실시간 회의 STT 전사 + Gemini 기반 안건/요약/의사결정/액션아이템 추출 MVP입니다.  
+UI는 `front-ref/parche` 레이아웃을 기준으로 유지하고, 기능만 연결했습니다.
 
-- `frontend/`: React + TypeScript + Vite UI
-- `backend/api.py`: FastAPI 서버 (회의 상태, 분석, STT API)
-- `llm_client.py`, `schemas.py`, `mock_data.py`: 기존 분석/스키마 로직 재사용
+## 핵심 기능
+- 시스템 오디오(화면 공유) 기반 실시간 STT
+- 로컬 Whisper(`openai-whisper`) 전사
+- Gemini LLM 연결/해제/핑
+- 4개 발화마다 자동 요약 갱신(LLM 연결 시)
+- 현재 소주제(안건) 추적 및 주제 전환 시 이전 안건 `완료(CLOSED)` 처리
+- 안건별 요약 클릭 시 전사 위치 점프(타임스탬프 기반)
+- 의사결정 결과(확정된 항목만) 정리
+- 액션아이템(무엇/누가/기한/근거) 정리
+- JSON 사전 업로드(테스트용) + `metadata.topic` 자동 회의 목표 반영
 
-## 1) 설치
+## 프로젝트 구조
+- `backend/api.py`: FastAPI 서버 (상태/분석/STT/업로드 API)
+- `frontend/`: Next.js UI
+- `llm_client.py`: Gemini REST 클라이언트
+- `run_dev.py`: 백엔드+프론트 동시 실행 스크립트
 
+## 요구사항
+- Python 3.10+
+- Node.js 20+
+- `ffmpeg` 설치 및 PATH 등록 (Whisper 오디오 디코딩 필수)
+- (선택) CUDA 환경: Whisper 추론 가속
+
+## 설치
 ### Python
 ```bash
 python -m pip install -r requirements.txt
@@ -19,117 +38,91 @@ cd frontend
 npm install
 ```
 
-## 2) 환경 변수
-
-루트 `.env`:
+## 환경 변수
+루트 `.env` 예시:
 ```env
-GOOGLE_API_KEY=your_key_here
-GOOGLE_BASE_URL=https://generativelanguage.googleapis.com/v1beta
-MODEL=gemini-2.0-flash
+# Gemini
+GEMINI_API_KEY=your_key_here
+# 또는 GOOGLE_API_KEY 사용 가능
+GEMINI_MODEL=gemini-2.0-flash
+GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta
+
+# Whisper
+WHISPER_MODEL=large
+
+# Optional ports
+BACKEND_PORT=8000
+FRONTEND_PORT=5173
 ```
 
-- `GOOGLE_API_KEY` 없으면 분석은 mock fallback으로 동작합니다.
-- STT는 `openai-whisper` 로컬 모델을 사용합니다.
+참고:
+- LLM 분석은 `LLM 연결` 버튼을 눌러야 활성화됩니다.
+- API 키가 없으면 LLM 연결 실패가 정상입니다(STT/업로드는 사용 가능).
 
-## 3) 실행
-
-### 한 번에 실행 (권장)
+## 실행
 루트에서:
 ```bash
 python run_dev.py
 ```
 
-PowerShell 스크립트로도 실행 가능:
+PowerShell:
 ```powershell
 .\run-dev.ps1
 ```
 
-- `Ctrl+C`를 누르면 backend/frontend 관련 자식 프로세스까지 함께 종료됩니다.
+기본 접속 주소:
+- Frontend: `http://127.0.0.1:5173` (포트 충돌 시 자동 변경)
+- Backend: `http://127.0.0.1:8000` (포트 충돌 시 자동 변경)
 
-### Backend
-```bash
-uvicorn backend.api:app --reload --host 127.0.0.1 --port 8000
-```
+`Ctrl+C`로 종료하면 백엔드/프론트 자식 프로세스를 함께 정리합니다.
 
-### Frontend
-```bash
-cd frontend
-npm run dev
-```
+## 사용 순서 (권장)
+1. 앱 실행 후 `LLM 연결` 클릭
+2. 회의 목표 입력 후 `설정 저장` (선택)
+3. 실시간 STT: `Start STT` 클릭 -> 브라우저 화면 공유에서 **탭 오디오 공유 허용**
+4. 테스트 데이터: JSON 파일 업로드 또는 JSON 폴더 로드
+5. `분석 실행` 또는 4개 발화 단위 자동 분석 결과 확인
 
-기본 주소:
-- Frontend: `http://127.0.0.1:5173`
-- Backend API: `http://127.0.0.1:8000`
+## JSON 업로드 포맷
+다음 포맷을 지원합니다(예: `dataset/DGBBA21000001.json`):
+- `metadata.topic`: 회의 목표로 자동 반영
+- `speaker[]`: `id`, `age`, `occupation`, `role`
+- `utterance[]`: `speaker_id`, `start`, `original_form`
 
-## 4) 기능 요약
+전사 매핑 규칙:
+- 화자 라벨: `age + occupation + role` (예: `40대 기자 토론자`)
+- 전사 텍스트: `original_form` 우선
+- 타임스탬프: `start` 초 -> `HH:MM:SS`
 
-- 회의 설정/전사/아젠다/분석/산출물 생성
-- `틱 / 업데이트` 단일 분석 호출
-- Keyword Engine (K1~K6):
-  - Candidates: Top 40 후보 추출
-  - Classification: K1 OBJECT / K2 OPTION / K3 CONSTRAINT / K4 CRITERION / K5 EVIDENCE / K6 ACTION
-  - Scoring: `DecisionValue + EvidenceBoost`
-  - Final Selection: Slot Filling (`K_core` 3~5, `K_facet` 3~8, Diversity Boost)
-  - 출력: `k_core`, `k_facet`, `items(타입/점수/출현시점)`, `pipeline`
-- Agenda Tracker:
-  - 목적: 토픽이 아닌 "Closing 가능한 아젠다 단위" 추적
-  - Candidate Generation: 2-of-3 규칙(Topic shift sustained / Collective intent / Decision slots)
-  - Sub-issue Promotion: pricing/schedule/policy/owner 이슈 분리 승격
-  - 출력: `agenda_candidates(PROPOSED pool)`, `agenda_vectors(agenda별 top terms)`
-- Agenda FSM:
-  - 상태: `PROPOSED -> ACTIVE -> CLOSING -> CLOSED`
-  - 전이:
-    - `PROPOSED -> ACTIVE`: 2-of-3 규칙 충족 후보 승격
-    - `ACTIVE -> CLOSING`: Decision Lock triggered
-    - `CLOSING -> CLOSED`: vote/agreement/final confirmation 감지
-  - 출력: `agenda_state_map`, `active_agenda_id`, `agenda_events(active_agenda_id 변경 포함)`
-- Drift Dampener:
-  - 지표: `S45 = mean(sim(u_t, A_j))` over last 45s
-  - 임계값:
-    - Green `>= 0.72`: no action
-    - Yellow `0.62~0.72` sustained >30s: K_core subtle glow
-    - Red `< 0.62` sustained >30s: K_core focus 고정 + facet 축소
-    - Re-orient `< 0.62` sustained >120s: 3초 재정렬 배너
-  - 예외: 회의 시작 180초 이내 Red/Re-orient 억제(safe zone)
-  - 출력: `drift_state`, `drift_ui_cues`, `drift_debug`
-- DPS (Decision Progress Score, 0~1.0):
-  - 가중치 공식:
-    - Option coverage `0.25`
-    - Constraint coverage `0.20`
-    - Evidence coverage `0.20`
-    - Trade-off coverage `0.20`
-    - Closing readiness `0.15`
-  - 입력: Keyword Engine(K2/K3/K4/K5), 현재 agenda/FSM 상태
-  - 출력: `DPS_t`(매 tick 갱신), `dps_breakdown`, Decision Cockpit 퍼센트 바
-- Flow Pulse (Loop/Stagnation Detection):
-  - Circular stagnation 조건(AND):
-    - A) Surface repetition(3min): `NoveltyRate < 0.15`
-    - B) Content repetition: `ArgNovelty < 0.20`
-    - C) No progress: `ΔDPS < 0.05`
-  - Anchoring 예외: `K_core(OBJECT/CONSTRAINT/CRITERION)` 반복은 유효 앵커링으로 처리
-  - 출력: `stagnation_flag`, `loop_state(Normal/Watching/Looping/Anchoring)`, `flow_pulse_debug`
-  - 연동: `stagnation_flag=true` 시 Decision Lock trigger #2를 활성화
-- Decision Lock (Closing Detection):
-  - OR 트리거:
-    - Stance convergence `>= 0.70`
-    - Circular repetition(Flow Pulse stagnation condition)
-    - Time-box breach `>= 15분`
-  - 시스템 반응:
-    - 3초 shared banner
-    - Vote/Summary/Closing UI 활성화(no gating)
-    - ACTIVE -> CLOSING 전이 이벤트 생성, closing action으로 CLOSED 유도
-  - 출력: `intervention.decision_lock`, `decision_lock_debug`
-- Live STT:
-  - 마이크 입력 (`getUserMedia`)
-  - 시스템 오디오 (`getDisplayMedia` 오디오 공유)
-  - 프론트에서 2초 청크 업로드 -> 백엔드 STT -> 전사 피드 반영
+## 안건/요약 동작 규칙
+- LLM은 최근 발화를 받아 현재 소주제를 추론합니다.
+- 진행 중 안건이 있을 때는, 기존 안건과 충분히 벗어난 경우에만 안건 전환합니다.
+- 안건 전환 시 기존 안건은 `CLOSED` 처리됩니다.
+- 요약은 4개 발화마다 갱신됩니다.
+- 의사결정은 **확정된 내용만** 수집합니다.
+- 액션아이템은 `task / owner / due / evidence`를 수집합니다.
 
-## 5) 주요 API
-
+## 주요 API
+- `GET /api/health`
 - `GET /api/state`
+- `GET /api/llm/status`
+- `POST /api/llm/connect`
+- `POST /api/llm/disconnect`
+- `POST /api/llm/ping`
 - `POST /api/config`
 - `POST /api/transcript/manual`
+- `POST /api/transcript/import-json-dir`
+- `POST /api/transcript/import-json-files`
 - `POST /api/analysis/tick`
-- `POST /api/artifacts/{kind}`
 - `POST /api/reset`
 - `POST /api/stt/chunk`
+
+## 트러블슈팅
+- `오디오 트랙이 없습니다`
+  - 화면 공유 시작 시 반드시 탭 오디오 공유를 켜야 합니다.
+- `Failed to load audio` / ffmpeg 관련 에러
+  - `ffmpeg` 설치/환경변수(PATH) 확인
+- `LLM이 연결되지 않았습니다`
+  - `GEMINI_API_KEY` 설정 후 `LLM 연결` 버튼 클릭
+- `Next.js dev lock` 에러
+  - 남아있는 `next dev` 프로세스를 종료 후 재실행

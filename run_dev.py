@@ -14,6 +14,51 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 FRONTEND_DIR = ROOT / "frontend"
 HOST = "127.0.0.1"
+RUN_LOCK = ROOT / ".run_dev.lock"
+
+
+def _is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_run_lock() -> None:
+    if RUN_LOCK.exists():
+        try:
+            existing_pid = int(RUN_LOCK.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            existing_pid = 0
+
+        if _is_pid_running(existing_pid):
+            raise RuntimeError(
+                f"run_dev.py가 이미 실행 중입니다 (pid={existing_pid}). "
+                "기존 프로세스를 종료한 뒤 다시 실행하세요."
+            )
+        try:
+            RUN_LOCK.unlink()
+        except OSError:
+            pass
+
+    RUN_LOCK.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def _release_run_lock() -> None:
+    try:
+        if not RUN_LOCK.exists():
+            return
+        try:
+            lock_pid = int(RUN_LOCK.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            lock_pid = os.getpid()
+        if lock_pid == os.getpid():
+            RUN_LOCK.unlink()
+    except OSError:
+        pass
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -124,75 +169,93 @@ def _start_backend_with_retry(python_exe: str, root: Path, host: str, preferred_
 
 
 def main() -> int:
-    npm_exe = _find_npm_executable()
-    if npm_exe is None:
-        print("npm을 찾지 못했습니다. Node.js/npm 설치 후 다시 실행하세요.", file=sys.stderr)
+    try:
+        _acquire_run_lock()
+    except RuntimeError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
         return 1
-
-    if not FRONTEND_DIR.exists():
-        print(f"frontend 디렉터리가 없습니다: {FRONTEND_DIR}", file=sys.stderr)
-        return 1
-
-    node_modules = FRONTEND_DIR / "node_modules"
-    if not node_modules.exists():
-        print("[setup] frontend 의존성 설치 중 (npm install)...")
-        _run_checked([npm_exe, "install"], FRONTEND_DIR)
-
-    preferred_backend = int(os.environ.get("BACKEND_PORT", "8000"))
-    preferred_frontend = int(os.environ.get("FRONTEND_PORT", "5173"))
 
     try:
-        backend_proc, backend_port = _start_backend_with_retry(
-            sys.executable,
-            ROOT,
+        npm_exe = _find_npm_executable()
+        if npm_exe is None:
+            print("npm을 찾지 못했습니다. Node.js/npm 설치 후 다시 실행하세요.", file=sys.stderr)
+            return 1
+
+        if not FRONTEND_DIR.exists():
+            print(f"frontend 디렉터리가 없습니다: {FRONTEND_DIR}", file=sys.stderr)
+            return 1
+
+        next_dev_lock = FRONTEND_DIR / ".next" / "dev" / "lock"
+        if next_dev_lock.exists():
+            print(
+                f"[error] Next.js dev lock 파일이 남아 있습니다: {next_dev_lock}\n"
+                "다른 `next dev`/`run_dev.py` 프로세스를 먼저 종료하거나 lock 파일을 삭제 후 다시 실행하세요.",
+                file=sys.stderr,
+            )
+            return 1
+
+        node_modules = FRONTEND_DIR / "node_modules"
+        next_module = node_modules / "next"
+        if not node_modules.exists() or not next_module.exists():
+            print("[setup] frontend 의존성 설치 중 (npm install)...")
+            _run_checked([npm_exe, "install"], FRONTEND_DIR)
+
+        preferred_backend = int(os.environ.get("BACKEND_PORT", "8000"))
+        preferred_frontend = int(os.environ.get("FRONTEND_PORT", "5173"))
+
+        try:
+            backend_proc, backend_port = _start_backend_with_retry(
+                sys.executable,
+                ROOT,
+                HOST,
+                preferred_backend,
+            )
+        except Exception as exc:
+            print(f"[error] backend 시작 실패: {exc}", file=sys.stderr)
+            return 1
+
+        frontend_port = _pick_port(HOST, preferred_frontend, avoid={backend_port})
+        frontend_cmd = [
+            npm_exe,
+            "run",
+            "dev",
+            "--",
+            "--hostname",
             HOST,
-            preferred_backend,
-        )
-    except Exception as exc:
-        print(f"[error] backend 시작 실패: {exc}", file=sys.stderr)
-        return 1
+            "--port",
+            str(frontend_port),
+        ]
+        frontend_env = os.environ.copy()
+        frontend_env["NEXT_PUBLIC_API_BASE_URL"] = f"http://{HOST}:{backend_port}"
 
-    frontend_port = _pick_port(HOST, preferred_frontend, avoid={backend_port})
-    frontend_cmd = [
-        npm_exe,
-        "run",
-        "dev",
-        "--",
-        "--host",
-        HOST,
-        "--port",
-        str(frontend_port),
-        "--strictPort",
-    ]
-    frontend_env = os.environ.copy()
-    frontend_env["VITE_API_PROXY_TARGET"] = f"http://{HOST}:{backend_port}"
+        print(f"[run] backend  : http://{HOST}:{backend_port}")
+        print(f"[run] frontend : http://{HOST}:{frontend_port}")
+        print("[run] 종료는 Ctrl+C")
 
-    print(f"[run] backend  : http://{HOST}:{backend_port}")
-    print(f"[run] frontend : http://{HOST}:{frontend_port}")
-    print("[run] 종료는 Ctrl+C")
+        try:
+            frontend_proc = _spawn(frontend_cmd, FRONTEND_DIR, env=frontend_env)
+        except Exception:
+            _terminate(backend_proc)
+            raise
 
-    try:
-        frontend_proc = _spawn(frontend_cmd, FRONTEND_DIR, env=frontend_env)
-    except Exception:
-        _terminate(backend_proc)
-        raise
-
-    try:
-        while True:
-            b_code = backend_proc.poll()
-            f_code = frontend_proc.poll()
-            if b_code is not None or f_code is not None:
-                if b_code is None:
-                    _terminate(backend_proc)
-                if f_code is None:
-                    _terminate(frontend_proc)
-                return b_code or f_code or 0
-            time.sleep(0.3)
-    except KeyboardInterrupt:
-        print("\n[stop] 종료 신호 수신. 프로세스를 정리합니다...")
-        _terminate(backend_proc)
-        _terminate(frontend_proc)
-        return 0
+        try:
+            while True:
+                b_code = backend_proc.poll()
+                f_code = frontend_proc.poll()
+                if b_code is not None or f_code is not None:
+                    if b_code is None:
+                        _terminate(backend_proc)
+                    if f_code is None:
+                        _terminate(frontend_proc)
+                    return b_code or f_code or 0
+                time.sleep(0.3)
+        except KeyboardInterrupt:
+            print("\n[stop] 종료 신호 수신. 프로세스를 정리합니다...")
+            _terminate(backend_proc)
+            _terminate(frontend_proc)
+            return 0
+    finally:
+        _release_run_lock()
 
 
 if __name__ == "__main__":
