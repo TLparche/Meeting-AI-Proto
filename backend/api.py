@@ -22,6 +22,7 @@ from llm_client import get_client
 ROOT = Path(__file__).resolve().parent.parent
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "large")
 SUMMARY_INTERVAL = 4
+SUMMARY_POINT_TARGET_LEN = 72
 
 STOPWORDS = {
     "그냥",
@@ -375,42 +376,177 @@ def _is_low_quality_title(title: str, meeting_goal: str) -> bool:
     toks = [_normalize_keyword_token(t) for t in re.findall(r"[A-Za-z0-9가-힣]{2,}", txt.lower())]
     toks = [t for t in toks if t]
     meaningful = [t for t in toks if not _is_title_keyword_noise(t) and t not in _tokens(goal)]
-    if meaningful:
-        if len(meaningful) == 1 and len(toks) >= 3:
-            return True
-        return False
-    # 의미 토큰이 없으면 품질이 낮다고 판단
-    return True
+    if not meaningful:
+        return True
+    ratio = len(meaningful) / max(1, len(toks))
+    if ratio < 0.35:
+        return True
+    if len(txt) < 6:
+        return True
+    if "·" in txt or "|" in txt:
+        return True
+    if re.search(r"^안건\s*\d+", txt):
+        return True
+    if re.search(r"(관련\s*\S*\s*논의|핵심\s*쟁점|중심\s*논의|세부\s*쟁점)", txt):
+        return True
+    if re.search(r"\b(논의|이슈|쟁점)\s*$", txt) and len(meaningful) < 2:
+        return True
+    return False
 
 
 def _clean_agenda_title(raw_title: Any, meeting_goal: str = "", keywords: list[str] | None = None) -> str:
     title = _safe_text(raw_title)
     title = re.sub(r"^[0-9]+[.)]\s*", "", title).strip(" -:|")
     title = re.sub(r"\s+", " ", title)
-
-    goal = _safe_text(meeting_goal)
-    usable = _usable_title_keywords([_safe_text(k) for k in (keywords or [])], meeting_goal)
-
-    raw_title_tokens = _usable_title_keywords(re.findall(r"[A-Za-z0-9가-힣]{2,}", title), meeting_goal)
-    basis = usable if len(usable) >= 2 else raw_title_tokens
-
     if (not title) or _is_low_quality_title(title, meeting_goal):
-        if len(basis) >= 2:
-            title = f"{basis[0]} · {basis[1]} 논의"
-        elif len(basis) == 1:
-            title = f"{basis[0]} 핵심 쟁점"
-        else:
-            title = "세부 쟁점 논의"
+        return ""
+    return _safe_text(title[:80], "")
 
-    if goal and title == goal:
-        if len(usable) >= 2:
-            title = f"{usable[0]} · {usable[1]} 논의"
-        elif len(usable) == 1:
-            title = f"{usable[0]} 중심 논의"
-        else:
-            title = f"{goal} 세부 쟁점"
 
-    return _safe_text(title[:80], "세부 쟁점 논의")
+def _split_ts_prefix(line: str) -> tuple[str, str]:
+    txt = _safe_text(line)
+    m = re.match(r"^\[(\d{2}:\d{2}(?::\d{2})?)\]\s*(.*)$", txt)
+    if m:
+        return _safe_text(m.group(1)), _safe_text(m.group(2))
+    return "", txt
+
+
+def _to_summary_point(text: str, max_len: int | None = SUMMARY_POINT_TARGET_LEN) -> str:
+    s = _safe_text(text)
+    s = re.sub(r"^\[[0-9:]+\]\s*", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"^(음|어|네|예|일단|그리고|근데|그니까|그러니까)\s+", "", s)
+    s = re.sub(r"^(저는|제가|저희는|저희가)\s+", "", s)
+    s = re.sub(r"(입니다|합니다|했어요|했습니다|같아요|같습니다)\s*$", "", s)
+    s = s.strip(" .,!?:;")
+    if max_len and max_len > 0 and len(s) > max_len:
+        # 사용자 요청: 길이 초과 시 말줄임표(...)를 붙이지 않는다.
+        s = s[:max_len].rstrip()
+    return _safe_text(s)
+
+
+def _normalize_summary_item_lines(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    for raw in lines:
+        ts, body = _split_ts_prefix(raw)
+        summary = _to_summary_point(body)
+        if not summary:
+            continue
+        out.append(f"[{ts}] {summary}" if ts else summary)
+    return _dedup_preserve(out, limit=20)
+
+
+def _extractive_title_from_candidates(candidates: list[str], meeting_goal: str) -> str:
+    cleaned = [_to_summary_point(_safe_text(c), max_len=None) for c in candidates if _safe_text(c).strip()]
+    cleaned = [_safe_text(c).strip(" ,;:/") for c in cleaned if _safe_text(c).strip(" ,;:/")]
+    if not cleaned:
+        return ""
+    cleaned = _dedup_preserve(cleaned, limit=40)
+
+    goal_tokens = _tokens(meeting_goal)
+    doc_freq: Counter[str] = Counter()
+    sent_tokens: list[list[str]] = []
+    for sent in cleaned:
+        toks = [t for t in _keyword_tokens(sent) if t not in goal_tokens and not _is_title_keyword_noise(t)]
+        uniq = list(dict.fromkeys(toks))
+        sent_tokens.append(uniq)
+        for tok in uniq:
+            doc_freq[tok] += 1
+
+    if not doc_freq:
+        return cleaned[0]
+
+    top_tokens = {tok for tok, _ in doc_freq.most_common(4)}
+    ranked: list[tuple[float, str, list[str]]] = []
+    for sent, toks in zip(cleaned, sent_tokens):
+        if not toks:
+            score = min(len(sent), 60) / 120.0
+        else:
+            coverage = sum(doc_freq[t] for t in toks)
+            density = coverage / max(1, len(toks))
+            top_hits = sum(1 for t in toks if t in top_tokens)
+            score = density + (top_hits * 0.9) + (min(len(sent), 60) / 120.0)
+        if _is_low_quality_title(sent, meeting_goal):
+            score -= 1.5
+        ranked.append((score, sent, toks))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    primary = ranked[0][1] if ranked else cleaned[0]
+    primary_tokens = set(ranked[0][2]) if ranked else set()
+
+    secondary = ""
+    for _, sent, toks in ranked[1:]:
+        if not sent:
+            continue
+        sim = _text_similarity(primary, sent)
+        overlap = len(primary_tokens & set(toks))
+        # 동일 문장 반복을 피하고, 다른 포인트를 한 줄에 결합하기 위한 보조 문장 선택
+        if sim < 0.82 and overlap < max(2, len(primary_tokens)):
+            secondary = sent
+            break
+
+    def _compact_clause(text: str, max_len: int = 36) -> str:
+        s = _safe_text(text)
+        s = re.sub(r"^\[[0-9:]+\]\s*", "", s)
+        s = re.sub(r"\s+", " ", s).strip(" ,;:/")
+        s = re.sub(r"^(그리고|또|또한|다만|하지만|근데|그래서)\s+", "", s)
+        s = re.split(r"\s*(?:;|/|·)\s*", s)[0]
+        s = re.split(r"\s+(?:그리고|근데|하지만|다만)\s+", s)[0]
+        if len(s) > max_len:
+            s = s[:max_len].rstrip()
+        return _safe_text(s)
+
+    p = _compact_clause(primary)
+    s = _compact_clause(secondary) if secondary else ""
+
+    if p and s and p != s:
+        merged = f"{p}, {s}"
+    else:
+        merged = p or s or primary
+
+    merged = _safe_text(merged).strip(" ,;:/")
+    if _is_low_quality_title(merged, meeting_goal):
+        # 최후 폴백: 빈약한 한 문장 대신 상위 핵심어를 추출해 문장형으로 보정
+        top_list = [tok for tok, _ in doc_freq.most_common(3)]
+        if top_list:
+            merged = f"{' '.join(top_list)}에 대한 논의"
+    return _safe_text(merged)
+
+
+def _finalize_agenda_title(
+    raw_title: Any,
+    meeting_goal: str,
+    keywords: list[str],
+    summary_items: list[str],
+    key_utterances: list[str] | None = None,
+) -> str:
+    # 요구사항: 안건 구간 전체를 관통하는 상위 논지를 한 문장으로 요약해 제목으로 사용한다.
+    candidates: list[str] = []
+
+    for item in summary_items or []:
+        _, body = _split_ts_prefix(item)
+        sentence = _to_summary_point(body, max_len=None)
+        if sentence:
+            candidates.append(sentence)
+
+    for item in key_utterances or []:
+        _, body = _split_ts_prefix(item)
+        sentence = _to_summary_point(body, max_len=None)
+        if sentence:
+            candidates.append(sentence)
+
+    raw_clean = _to_summary_point(_safe_text(raw_title), max_len=None)
+    if raw_clean and not _is_low_quality_title(raw_clean, meeting_goal):
+        return _safe_text(raw_clean[:80], "주요 논의 요약")
+
+    if raw_clean:
+        candidates.append(raw_clean)
+
+    best = _extractive_title_from_candidates(candidates, meeting_goal)
+    if not best:
+        best = raw_clean
+
+    return _safe_text(best.strip(), "")
 
 
 def _extract_json(raw: str) -> dict[str, Any]:
@@ -522,6 +658,10 @@ class RuntimeStore:
     used_local_fallback: bool = False
     last_analysis_warning: str = ""
     last_tick_mode: str = "windowed"
+    last_title_refine_attempts: int = 0
+    last_title_refine_success: int = 0
+    last_llm_parsed_json: dict[str, Any] = field(default_factory=dict)
+    last_llm_parsed_at: str = ""
 
     def reset(self) -> None:
         self.meeting_goal = ""
@@ -534,6 +674,10 @@ class RuntimeStore:
         self.used_local_fallback = False
         self.last_analysis_warning = ""
         self.last_tick_mode = "windowed"
+        self.last_title_refine_attempts = 0
+        self.last_title_refine_success = 0
+        self.last_llm_parsed_json = {}
+        self.last_llm_parsed_at = ""
 
 
 RT = RuntimeStore()
@@ -621,6 +765,10 @@ def _state_response(rt: RuntimeStore) -> dict[str, Any]:
             "control_plane_source": "gemini",
             "control_plane_reason": rt.last_analysis_warning or ("full_document_once" if rt.last_tick_mode == "full_document" else "summary_every_4_turns"),
             "used_local_fallback": bool(rt.used_local_fallback),
+            "title_refine_attempts": int(rt.last_title_refine_attempts),
+            "title_refine_success": int(rt.last_title_refine_success),
+            "last_llm_json_available": bool(rt.last_llm_parsed_json),
+            "last_llm_json_at": _safe_text(rt.last_llm_parsed_at),
         },
         "analysis": analysis,
     }
@@ -657,7 +805,7 @@ def _ensure_active_agenda(rt: RuntimeStore, title: str) -> dict[str, Any]:
 def _ensure_minimum_agenda(rt: RuntimeStore) -> None:
     if rt.agenda_outcomes or not rt.transcript:
         return
-    title = _clean_agenda_title("", rt.meeting_goal, [])
+    title = _clean_agenda_title("", rt.meeting_goal, []) or "안건 제목 미정"
     row = _create_agenda(rt, title, "ACTIVE")
     row["start_turn_id"] = 1
     row["end_turn_id"] = len(rt.transcript)
@@ -963,6 +1111,151 @@ def _slice_turns_by_id_range(turns: list[dict[str, Any]], start_id: int, end_id:
     return out
 
 
+def _sample_turns_for_title(seg_turns: list[dict[str, Any]], max_items: int = 140) -> list[dict[str, Any]]:
+    if len(seg_turns) <= max_items:
+        return list(seg_turns)
+    if max_items <= 0:
+        return []
+
+    head = min(20, max_items // 4)
+    tail = min(20, max_items // 4)
+    mid = max(0, max_items - head - tail)
+    n = len(seg_turns)
+
+    idxs: set[int] = set()
+    for i in range(head):
+        idxs.add(i)
+    for i in range(n - tail, n):
+        if i >= 0:
+            idxs.add(i)
+
+    if mid > 0:
+        span_start = head
+        span_end = max(span_start, n - tail)
+        span = max(1, span_end - span_start)
+        for i in range(mid):
+            pos = span_start + int((i / max(1, mid - 1)) * (span - 1))
+            idxs.add(pos)
+
+    ordered = sorted(idxs)
+    return [seg_turns[i] for i in ordered if 0 <= i < n]
+
+
+def _request_agenda_title_with_llm(
+    client: Any,
+    meeting_goal: str,
+    turns: list[dict[str, Any]],
+    start_turn_id: int,
+    end_turn_id: int,
+    summary_items: list[str],
+    key_utterances: list[str],
+    keywords: list[str],
+) -> str:
+    seg_turns = _slice_turns_by_id_range(turns, start_turn_id, end_turn_id)
+    if not seg_turns:
+        seg_turns = list(turns)
+    if not seg_turns:
+        return ""
+
+    sampled = _sample_turns_for_title(seg_turns, max_items=140)
+    lines: list[str] = []
+    for t in sampled:
+        tid = int(t.get("turn_id") or 0)
+        ts = _safe_text(t.get("timestamp"), _now_ts())
+        speaker = _safe_text(t.get("speaker"), "화자")
+        text = _safe_text(t.get("text"))
+        if not text:
+            continue
+        lines.append(f"- turn_id={tid} | {ts} | {speaker} | {text}")
+    if not lines:
+        return ""
+
+    summary_ctx: list[str] = []
+    for item in summary_items[:8]:
+        _, body = _split_ts_prefix(item)
+        point = _to_summary_point(body, max_len=None)
+        if point:
+            summary_ctx.append(f"- {point}")
+
+    key_ctx: list[str] = []
+    for item in key_utterances[:8]:
+        _, body = _split_ts_prefix(item)
+        point = _to_summary_point(body, max_len=None)
+        if point:
+            key_ctx.append(f"- {point}")
+
+    prompt = f"""
+너는 회의 안건 제목 생성기다. 출력은 JSON 객체 하나만 반환한다.
+
+[입력]
+- 회의 목표: {_safe_text(meeting_goal, "미정")}
+- 안건 구간: turn_id {start_turn_id}~{end_turn_id}
+- 안건 키워드: {", ".join([_safe_text(k) for k in keywords[:6]]) or "없음"}
+- 안건 요약 포인트:
+{chr(10).join(summary_ctx) if summary_ctx else "- 없음"}
+- 안건 핵심 발언:
+{chr(10).join(key_ctx) if key_ctx else "- 없음"}
+- 안건 구간 발화(시간순):
+{chr(10).join(lines)}
+
+[규칙]
+1) 위 안건 구간 전체를 관통하는 상위 논지를 한국어 한 문장으로 요약한다.
+2) 발화 한 줄을 그대로 복사하지 않는다.
+3) 단어 나열, "A · B 논의", "안건 N" 같은 형식 문구를 금지한다.
+4) 자연스러운 한 문장 제목으로 작성한다.
+
+[출력 JSON]
+{{
+  "agenda_title": "string"
+}}
+""".strip()
+
+    try:
+        parsed = client.generate_json(prompt, temperature=0.05, max_tokens=220)
+    except Exception:
+        return ""
+
+    candidate = _safe_text(parsed.get("agenda_title") or parsed.get("title"))
+    candidate = _to_summary_point(candidate, max_len=None)
+    candidate = _safe_text(candidate).strip(" .,!?:;/|")
+    if not candidate:
+        return ""
+    if _is_low_quality_title(candidate, meeting_goal):
+        return ""
+    return _safe_text(candidate[:80], "")
+
+
+def _refresh_low_quality_titles_with_llm(
+    client: Any,
+    rt: RuntimeStore,
+    turns: list[dict[str, Any]],
+    outcomes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    refreshed: list[dict[str, Any]] = []
+    attempts = 0
+    success = 0
+    for row in outcomes:
+        item = dict(row)
+        title = _safe_text(item.get("agenda_title"))
+        if (not title) or _is_low_quality_title(title, rt.meeting_goal):
+            attempts += 1
+            regenerated = _request_agenda_title_with_llm(
+                client=client,
+                meeting_goal=rt.meeting_goal,
+                turns=turns,
+                start_turn_id=int(item.get("_start_turn_id") or item.get("start_turn_id") or 0),
+                end_turn_id=int(item.get("_end_turn_id") or item.get("end_turn_id") or 0),
+                summary_items=[_safe_text(x) for x in (item.get("_summary_items") or [])],
+                key_utterances=[_safe_text(x) for x in (item.get("key_utterances") or [])],
+                keywords=[_safe_text(x) for x in (item.get("agenda_keywords") or [])],
+            )
+            if regenerated:
+                item["agenda_title"] = regenerated
+                success += 1
+        refreshed.append(item)
+    return refreshed, attempts, success
+
+
 def _compact_summary_line(text: str, max_len: int = 90) -> str:
     s = _safe_text(text)
     s = re.sub(r"\s+", " ", s).strip()
@@ -998,7 +1291,7 @@ def _enrich_outcome_summary(
         key_utterances = _dedup_preserve(key_utterances + auto_key, limit=20)
     out["key_utterances"] = key_utterances
 
-    summary_items = _dedup_preserve([_safe_text(x) for x in out.get("_summary_items") or []], limit=20)
+    summary_items = _normalize_summary_item_lines([_safe_text(x) for x in out.get("_summary_items") or []])
     summary_refs = [dict(x) for x in (out.get("summary_references") or []) if isinstance(x, dict)]
 
     has_min_summary = len(summary_items) >= 2
@@ -1007,7 +1300,7 @@ def _enrich_outcome_summary(
         auto_items: list[str] = []
         auto_refs: list[dict[str, Any]] = []
         for idx, ref in enumerate(refs[:12]):
-            quote = _compact_summary_line(_safe_text(ref.get("quote")))
+            quote = _to_summary_point(_safe_text(ref.get("quote")))
             if not quote:
                 continue
             ts = _safe_text(ref.get("timestamp"), _now_ts())
@@ -1031,10 +1324,17 @@ def _enrich_outcome_summary(
 
     if not summary_refs:
         summary_refs = [_ref_from_turn(seg_turns[-1], why="요약 근거")]
-    out["_summary_items"] = _dedup_preserve(summary_items, limit=20)
+    out["_summary_items"] = _normalize_summary_item_lines(summary_items)
     out["summary_references"] = summary_refs[:24]
     if not _safe_text(out.get("summary")):
         out["summary"] = " • ".join(x.split("] ", 1)[-1] for x in out["_summary_items"][:10])
+    out["agenda_title"] = _finalize_agenda_title(
+        out.get("agenda_title"),
+        rt.meeting_goal,
+        [_safe_text(k) for k in out.get("agenda_keywords") or []],
+        out.get("_summary_items") or [],
+        out.get("key_utterances") or [],
+    )
     return out
 
 
@@ -1059,15 +1359,22 @@ def _build_local_outcomes(rt: RuntimeStore, turns: list[dict[str, Any]]) -> list
             global_doc_freq=global_df,
             global_turn_count=global_turn_count,
         )
-        title = _clean_agenda_title("", rt.meeting_goal, keywords)
-        if title in used_titles:
-            title = f"{title} #{seg_idx + 1}"
-        used_titles.add(title)
 
         key_refs = _pick_key_refs(seg_turns, keywords, max_items=8)
         key_utterances = [f"[{_safe_text(r.get('timestamp'))}] {_safe_text(r.get('quote'))}" for r in key_refs]
         summary_refs = key_refs[:10] if key_refs else [_ref_from_turn(seg_turns[-1])]
-        summary_items = [f"[{_safe_text(r.get('timestamp'))}] {_safe_text(r.get('quote'))}" for r in summary_refs]
+        summary_items = [f"[{_safe_text(r.get('timestamp'))}] {_to_summary_point(_safe_text(r.get('quote')))}" for r in summary_refs]
+        summary_items = _normalize_summary_item_lines(summary_items)
+
+        seed_candidates = [t.get("text") for t in seg_turns[:6]] + [t.get("text") for t in seg_turns[-6:]]
+        seed_title = _extractive_title_from_candidates([_safe_text(x) for x in seed_candidates], rt.meeting_goal)
+        title = _finalize_agenda_title(seed_title, rt.meeting_goal, keywords, summary_items, key_utterances)
+        if not _safe_text(title):
+            title = f"안건 {seg_idx + 1}"
+        if title in used_titles:
+            title = f"{title} #{seg_idx + 1}"
+        used_titles.add(title)
+
         summary = " • ".join(item.split("] ", 1)[-1] for item in summary_items[:10])
         decisions = _extract_decisions_from_turns(seg_turns, max_items=4)
         actions = _extract_actions_from_turns(seg_turns, max_items=6)
@@ -1271,7 +1578,7 @@ def _apply_outcomes(rt: RuntimeStore, outcomes: list[dict[str, Any]]) -> None:
     rt.agenda_outcomes = []
     rt.agenda_seq = 0
     for row in cleaned:
-        created = _create_agenda(rt, _safe_text(row.get("agenda_title"), "세부 쟁점 논의"), _normalize_agenda_state(row.get("agenda_state")))
+        created = _create_agenda(rt, _safe_text(row.get("agenda_title"), "안건 제목 미정"), _normalize_agenda_state(row.get("agenda_state")))
         created["flow_type"] = _safe_text(row.get("flow_type"))
         created["key_utterances"] = _dedup_preserve(list(row.get("key_utterances") or []), limit=20)
         created["_summary_items"] = _dedup_preserve(list(row.get("_summary_items") or []), limit=20)
@@ -1318,7 +1625,7 @@ def _build_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], current_agenda_
 
 [중요 규칙]
 1) 안건은 "흐름 전환 시점" 기준으로 순서대로 나눈다. 즉, 주제가 전환될 때마다 새 안건을 만든다.
-2) 안건 제목은 "회의 목표 문자열 그대로"를 쓰지 말고 세부 쟁점으로 작성한다.
+2) 안건 제목은 해당 안건 구간의 모든 발언을 관통하는 "상위 논지"를 한국어 한 문장으로 요약해 작성한다. 단어 나열/문장 복사는 금지한다.
 3) 각 안건에 키워드 3~6개를 반드시 넣는다(명사/핵심 용어 중심).
 4) 의사결정은 "확정된 내용"만 decision_results에 넣는다.
 5) 액션아이템은 누가/무엇/기한(없으면 빈문자열)과 근거 turn_id를 넣는다.
@@ -1394,6 +1701,8 @@ def _run_local_fallback(rt: RuntimeStore, force: bool = False, reason: str = "",
     rt.used_local_fallback = True
     rt.last_analysis_warning = reason or "LLM 비활성/실패로 로컬 폴백 분석 사용"
     rt.last_tick_mode = "full_document" if mode == "full_document" else "windowed"
+    rt.last_title_refine_attempts = 0
+    rt.last_title_refine_success = 0
     return True
 
 
@@ -1402,6 +1711,8 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
         rt.used_local_fallback = True
         rt.last_analysis_warning = "전사 데이터가 없어 분석할 수 없습니다."
         rt.last_tick_mode = "full_document" if mode == "full_document" else "windowed"
+        rt.last_title_refine_attempts = 0
+        rt.last_title_refine_success = 0
         return False
     if mode != "full_document" and (not force) and (len(rt.transcript) - rt.last_analyzed_count) < SUMMARY_INTERVAL:
         return False
@@ -1433,6 +1744,8 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
         parsed = client.generate_json(prompt, temperature=0.1, max_tokens=7000)
     except Exception as exc:
         return _run_local_fallback(rt, force=force, reason=f"LLM 오류: {exc}", mode=mode)
+    rt.last_llm_parsed_json = parsed if isinstance(parsed, dict) else {}
+    rt.last_llm_parsed_at = _now_ts()
 
     raw_agendas = parsed.get("agendas") or []
     if not isinstance(raw_agendas, list) or not raw_agendas:
@@ -1441,16 +1754,18 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
     active_title = _safe_text(parsed.get("active_agenda_title"))
     normalized_active = _clean_agenda_title(active_title, rt.meeting_goal, []) if active_title else ""
     outcomes: list[dict[str, Any]] = []
+    title_refine_attempts = 0
+    title_refine_success = 0
 
     for idx, agenda in enumerate(raw_agendas):
         if not isinstance(agenda, dict):
             continue
 
         keywords = _dedup_preserve([_safe_text(x) for x in (agenda.get("agenda_keywords") or []) if _safe_text(x)], limit=8)
-        title = _clean_agenda_title(agenda.get("agenda_title"), rt.meeting_goal, keywords)
+        raw_title = _safe_text(agenda.get("agenda_title"))
 
         state = _normalize_agenda_state(agenda.get("agenda_state"))
-        if normalized_active and title == normalized_active:
+        if normalized_active and raw_title and _clean_agenda_title(raw_title, rt.meeting_goal, keywords) == normalized_active:
             state = "ACTIVE"
 
         key_refs = _extract_refs(rt, _to_ids(agenda.get("key_utterance_turn_ids")), turns)
@@ -1461,7 +1776,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
         for it in agenda.get("agenda_summary_items") or []:
             if not isinstance(it, dict):
                 continue
-            txt = _safe_text(it.get("summary"))
+            txt = _to_summary_point(_safe_text(it.get("summary")))
             if not txt:
                 continue
             refs = _extract_refs(rt, _to_ids(it.get("evidence_turn_ids")), turns)
@@ -1480,7 +1795,15 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
             else:
                 summary_items.append(txt)
         if not summary_items:
-            summary_items = key_utterances[:10]
+            from_keys: list[str] = []
+            for line in key_utterances[:10]:
+                ts, body = _split_ts_prefix(line)
+                point = _to_summary_point(body)
+                if not point:
+                    continue
+                from_keys.append(f"[{ts}] {point}" if ts else point)
+            summary_items = from_keys
+        summary_items = _normalize_summary_item_lines(summary_items)
         if not summary_references:
             for ref in key_refs[:10]:
                 summary_references.append(
@@ -1536,7 +1859,6 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
             pick_idx = min(len(turns) - 1, idx * max(1, len(turns) // max(1, len(raw_agendas))))
             key_utterances = [_format_line_from_turn(turns[pick_idx])]
 
-        summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:10])
         all_ids = _to_ids(agenda.get("key_utterance_turn_ids"))
         for s_item in agenda.get("agenda_summary_items") or []:
             if isinstance(s_item, dict):
@@ -1547,6 +1869,45 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
             start_turn_id = min(all_ids) if all_ids else (idx + 1) * 1000
         if end_turn_id < start_turn_id:
             end_turn_id = max(all_ids) if all_ids else start_turn_id
+
+        need_title_refine = (not _safe_text(raw_title)) or _is_low_quality_title(raw_title, rt.meeting_goal)
+        if need_title_refine:
+            title_refine_attempts += 1
+            regenerated = _request_agenda_title_with_llm(
+                client=client,
+                meeting_goal=rt.meeting_goal,
+                turns=turns,
+                start_turn_id=start_turn_id,
+                end_turn_id=end_turn_id,
+                summary_items=summary_items,
+                key_utterances=key_utterances,
+                keywords=keywords,
+            )
+            if regenerated:
+                raw_title = regenerated
+                title_refine_success += 1
+
+        title = _finalize_agenda_title(raw_title, rt.meeting_goal, keywords, summary_items, key_utterances)
+        if (not _safe_text(title)) or _is_low_quality_title(title, rt.meeting_goal):
+            title_refine_attempts += 1
+            regenerated = _request_agenda_title_with_llm(
+                client=client,
+                meeting_goal=rt.meeting_goal,
+                turns=turns,
+                start_turn_id=start_turn_id,
+                end_turn_id=end_turn_id,
+                summary_items=summary_items,
+                key_utterances=key_utterances,
+                keywords=keywords,
+            )
+            if regenerated:
+                title = regenerated
+                title_refine_success += 1
+
+        if normalized_active and title == normalized_active:
+            state = "ACTIVE"
+
+        summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:10])
 
         outcomes.append(
             {
@@ -1576,13 +1937,22 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
     for row in outcomes:
         enriched.append(_enrich_outcome_summary(rt, row, turns))
     outcomes = enriched
+    outcomes, post_attempts, post_success = _refresh_low_quality_titles_with_llm(client, rt, turns, outcomes)
+    title_refine_attempts += post_attempts
+    title_refine_success += post_success
 
     _apply_outcomes(rt, outcomes)
 
     rt.last_analyzed_count = len(rt.transcript)
     rt.used_local_fallback = False
-    rt.last_analysis_warning = _safe_text(refine_note)
+    notes: list[str] = []
+    if _safe_text(refine_note):
+        notes.append(_safe_text(refine_note))
+    notes.append(f"안건 제목 재요청 {title_refine_success}/{title_refine_attempts} 성공")
+    rt.last_analysis_warning = " | ".join(notes)
     rt.last_tick_mode = "full_document" if mode == "full_document" else "windowed"
+    rt.last_title_refine_attempts = int(title_refine_attempts)
+    rt.last_title_refine_success = int(title_refine_success)
     return True
 
 
@@ -1931,6 +2301,17 @@ def post_analysis_tick():
     with RT.lock:
         _run_analysis(RT, force=True, mode="full_document")
         return _state_response(RT)
+
+
+@app.get("/api/analysis/last-llm-json")
+def get_last_llm_json():
+    with RT.lock:
+        return {
+            "ok": True,
+            "received_at": _safe_text(RT.last_llm_parsed_at),
+            "has_json": bool(RT.last_llm_parsed_json),
+            "json": RT.last_llm_parsed_json if isinstance(RT.last_llm_parsed_json, dict) else {},
+        }
 
 
 @app.post("/api/reset")
