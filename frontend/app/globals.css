@@ -12,6 +12,7 @@
   --radius-card: 16px;
   --radius-pill: 999px;
   --shadow-soft: 0 10px 28px rgba(15, 23, 42, 0.05);
+  --section-gap: 12px;
 }
 
 * {
@@ -314,7 +315,8 @@ select {
   display: flex;
   flex-direction: column;
   margin-left: 0;
-  padding-left: 0;
+  padding: 12px;
+  gap: var(--section-gap);
   border-left: 1px solid #e4e8f1;
   overflow-x: hidden;
   overflow-y: auto;
@@ -323,7 +325,7 @@ select {
 
 .rightSection > * + * {
   margin-top: 0;
-  border-top: 1px solid #e4e8f1;
+  border-top: none;
 }
 
 .card {
@@ -335,6 +337,121 @@ select {
 
 .panelCard {
   padding: 20px;
+}
+
+.panelFold {
+  padding: 0;
+  overflow: hidden;
+}
+
+.panelFoldHeader {
+  list-style: none;
+  cursor: pointer;
+  margin: 0;
+  padding: 14px 18px;
+  align-items: center;
+}
+
+.panelFoldHeader::-webkit-details-marker {
+  display: none;
+}
+
+.panelFoldHeader::after {
+  content: "▾";
+  margin-left: auto;
+  color: #6a7488;
+  font-size: 0.85rem;
+  transform: rotate(0deg);
+  transition: transform 180ms ease;
+}
+
+.panelFold:not([open]) .panelFoldHeader::after {
+  transform: rotate(-90deg);
+}
+
+.panelFold[open] .panelFoldHeader {
+  border-bottom: 1px solid #e4e8f1;
+}
+
+.panelFoldBody {
+  padding: 14px 18px 18px;
+  gap: 12px;
+}
+
+.panelFold[open] .panelFoldBody {
+  display: grid;
+}
+
+.panelFold[open] .panelFoldBody {
+  animation: foldReveal 180ms ease-out;
+}
+
+.panelFold:not([open]) .panelFoldBody {
+  display: none;
+}
+
+.rightSection .panelCard {
+  animation: panelEnter 260ms ease-out both;
+}
+
+.rightSection .panelCard:nth-child(1) {
+  animation-delay: 20ms;
+}
+
+.rightSection .panelCard:nth-child(2) {
+  animation-delay: 50ms;
+}
+
+.rightSection .panelCard:nth-child(3) {
+  animation-delay: 80ms;
+}
+
+.rightSection .panelCard:nth-child(4) {
+  animation-delay: 110ms;
+}
+
+@keyframes panelEnter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes foldReveal {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes summaryFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes summaryItemIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .pageHeader {
@@ -628,21 +745,21 @@ h4 {
 .topGrid {
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: var(--section-gap);
 }
 
 .contentSignalGrid {
   display: grid;
-  gap: 0;
+  gap: var(--section-gap);
   grid-template-columns: 1fr;
 }
 
 .contentSignalGrid > * + * {
-  border-top: 1px solid #e4e8f1;
+  border-top: none;
 }
 
 .topGrid > * + * {
-  border-top: 1px solid #e4e8f1;
+  border-top: none;
 }
 
 .panelHeader {
@@ -947,10 +1064,22 @@ h4 {
   gap: 12px;
 }
 
+.summaryCard.panelFold[open] .summarySections {
+  animation: summaryFadeIn 220ms ease-out both;
+}
+
 .summaryCard {
   min-height: 560px;
   display: flex;
   flex-direction: column;
+}
+
+.summaryCard.panelFold {
+  min-height: 0;
+}
+
+.summaryCard.panelFold[open] {
+  min-height: 560px;
 }
 
 .summarySignals {
@@ -958,6 +1087,10 @@ h4 {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.summaryCard.panelFold[open] .summarySignals {
+  animation: summaryFadeIn 200ms ease-out both;
 }
 
 .summarySignals article {
@@ -977,6 +1110,22 @@ h4 {
   border: 1px solid #edf0f7;
   border-radius: 12px;
   padding: 12px;
+}
+
+.summaryCard.panelFold[open] .summaryBlock {
+  animation: summaryItemIn 240ms ease-out both;
+}
+
+.summaryCard.panelFold[open] .summaryBlock:nth-child(1) {
+  animation-delay: 30ms;
+}
+
+.summaryCard.panelFold[open] .summaryBlock:nth-child(2) {
+  animation-delay: 80ms;
+}
+
+.summaryCard.panelFold[open] .summaryBlock:nth-child(3) {
+  animation-delay: 130ms;
 }
 
 .summaryGrid {
@@ -1125,17 +1274,17 @@ h4 {
 .bottomDesktop {
   display: grid;
   grid-template-columns: 1fr;
-  gap: 0;
+  gap: var(--section-gap);
 }
 
 .stackColumn {
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: var(--section-gap);
 }
 
 .stackColumn > * + * {
-  border-top: 1px solid #e4e8f1;
+  border-top: none;
 }
 
 .accordionList {
@@ -1274,6 +1423,11 @@ th {
   padding-top: 12px;
 }
 
+.summaryCard.panelFold[open] .summaryEvidence {
+  animation: summaryFadeIn 260ms ease-out both;
+  animation-delay: 110ms;
+}
+
 .miniEvidenceList {
   display: flex;
   flex-direction: column;
@@ -1374,7 +1528,7 @@ th {
 
   .mainInner > * + * {
     margin-top: 0;
-    border-top: 1px solid #e4e8f1;
+    border-top: none;
   }
 
   .leftSection,
@@ -1387,12 +1541,17 @@ th {
     overflow: visible;
   }
 
+  .rightSection {
+    padding: 10px 0 0;
+    gap: 10px;
+  }
+
   .leftSection .pageHeader {
     position: static;
   }
 
   .topGrid {
-    gap: 0;
+    gap: 10px;
   }
 
   .contentSignalGrid {
@@ -1411,12 +1570,20 @@ th {
 @media (max-width: 900px) {
   .mainInner {
     padding: 16px;
-    gap: 0;
+    gap: 10px;
   }
 
   .pageHeader,
   .panelCard {
     padding: 16px;
+  }
+
+  .panelFold {
+    padding: 0;
+  }
+
+  .panelFoldBody {
+    gap: 10px;
   }
 
   .headerMain {
@@ -1453,5 +1620,22 @@ th {
   th,
   td {
     min-width: 120px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rightSection .panelCard,
+  .panelFold[open] .panelFoldBody,
+  .summaryCard.panelFold[open] .summarySignals,
+  .summaryCard.panelFold[open] .summarySections,
+  .summaryCard.panelFold[open] .summaryBlock,
+  .summaryCard.panelFold[open] .summaryEvidence,
+  .runDot,
+  .focusFlash {
+    animation: none !important;
+  }
+
+  .panelFoldHeader::after {
+    transition: none;
   }
 }

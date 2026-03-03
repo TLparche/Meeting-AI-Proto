@@ -1624,11 +1624,12 @@ export default function Home() {
   };
 
   const renderSummaryCard = () => (
-    <article className="card panelCard">
-      <div className="panelHeader">
+    <details className="card panelCard panelFold" open={false}>
+      <summary className="panelHeader panelFoldHeader">
         <h3>회의 요약 (안건별, 완료 안건)</h3>
         <span className="chip chipSoft">{bottomAgendas.length}개 안건 보기</span>
-      </div>
+      </summary>
+      <div className="panelFoldBody">
       {bottomAgendas.length === 0 ? (
         <p className="emptyState">완료된 안건이 생기면 여기에 정리됩니다.</p>
       ) : (
@@ -1694,15 +1695,17 @@ export default function Home() {
           ))}
         </div>
       )}
-    </article>
+      </div>
+    </details>
   );
 
   const renderDecisionCard = () => (
-    <article className="card panelCard">
-      <div className="panelHeader">
+    <details className="card panelCard panelFold" open={false}>
+      <summary className="panelHeader panelFoldHeader">
         <h3>의사결정 결과</h3>
         <span className="chip chipSoft">{bottomDecisions.length}건 기록됨</span>
-      </div>
+      </summary>
+      <div className="panelFoldBody">
       {bottomDecisions.length === 0 ? (
         <p className="emptyState">이 안건에는 아직 기록된 의사결정이 없어요.</p>
       ) : (
@@ -1752,15 +1755,17 @@ export default function Home() {
           })}
         </div>
       )}
-    </article>
+      </div>
+    </details>
   );
 
   const renderActionCard = () => (
-    <article className="card panelCard">
-      <div className="panelHeader">
+    <details className="card panelCard panelFold" open={false}>
+      <summary className="panelHeader panelFoldHeader">
         <h3>액션 아이템</h3>
         <span className="chip chipSoft">{bottomActions.length}건</span>
-      </div>
+      </summary>
+      <div className="panelFoldBody">
       {bottomActions.length === 0 ? (
         <p className="emptyState">이 안건에 연결된 액션 아이템이 아직 없어요.</p>
       ) : (
@@ -1803,15 +1808,17 @@ export default function Home() {
           </table>
         </div>
       )}
-    </article>
+      </div>
+    </details>
   );
 
   const renderEvidenceCard = () => (
-    <article className="card panelCard">
-      <div className="panelHeader">
+    <details className="card panelCard panelFold" open={false}>
+      <summary className="panelHeader panelFoldHeader">
         <h3>근거 로그</h3>
         <span className="chip chipSoft">{bottomEvidence.length}개 스니펫</span>
-      </div>
+      </summary>
+      <div className="panelFoldBody">
       {bottomEvidence.length === 0 ? (
         <p className="emptyState">연결된 액션 또는 의사결정이 생기면 근거 스니펫이 표시됩니다.</p>
       ) : (
@@ -1851,7 +1858,8 @@ export default function Home() {
           ))}
         </div>
       )}
-    </article>
+      </div>
+    </details>
   );
 
   return (
@@ -2119,11 +2127,12 @@ export default function Home() {
 
           <section className="rightSection">
           <section className="contentSignalGrid">
-            <article className="card panelCard sidebarSection">
-              <div className="panelHeader tight">
+            <details className="card panelCard sidebarSection panelFold" open={false}>
+              <summary className="panelHeader tight panelFoldHeader">
                 <h3>실시간 참여자</h3>
                 <span className="chip chipSoft">{participantRoster.length}명 참여 중</span>
-              </div>
+              </summary>
+              <div className="panelFoldBody">
               <div className="participantList">
                 {participantRoster.map((member) => (
                   <div key={member.name} className="participantItem">
@@ -2136,13 +2145,15 @@ export default function Home() {
                   </div>
                 ))}
               </div>
-            </article>
+              </div>
+            </details>
 
-            <article className="card panelCard sidebarSection">
-              <div className="panelHeader tight">
+            <details className="card panelCard sidebarSection panelFold" open={false}>
+              <summary className="panelHeader tight panelFoldHeader">
                 <h3>STT 스트림</h3>
                 <span className="chip chipSoft">{sttStatusText}</span>
-              </div>
+              </summary>
+              <div className="panelFoldBody">
               <div className="panelActions">
                 <select value={sttSource} disabled>
                   <option value="system">시스템 오디오</option>
@@ -2162,12 +2173,14 @@ export default function Home() {
                   </div>
                 ))}
               </div>
-            </article>
+              </div>
+            </details>
           </section>
 
           <section className="topGrid">
-            <article className="card panelCard">
-              <div className="panelHeader"><h2>안건</h2></div>
+            <details className="card panelCard panelFold" open>
+              <summary className="panelHeader panelFoldHeader"><h2>안건</h2></summary>
+              <div className="panelFoldBody">
               {selectedAgenda ? (
                 <section className="currentAgenda">
                   <p className="mutedLabel">현재 안건</p>
@@ -2210,11 +2223,16 @@ export default function Home() {
                 <button type="button" onClick={() => void apply(() => tickAnalysis(), "안건 추출 재실행 중", true)} disabled={loading || analysisUiDisabled}>추출 다시 실행</button>
                 <button type="button" onClick={() => setQuery("")}>전사문으로 이동</button>
               </div>
-            </article>
+              </div>
+            </details>
 
-            <article className="card panelCard summaryCard">
-              <div className="panelHeader">
+            <details className="card panelCard summaryCard panelFold" open={false}>
+              <summary className="panelHeader panelFoldHeader">
                 <h2>안건 요약</h2>
+                <span className="chip chipSoft">{summaryAgendas.length}개</span>
+              </summary>
+              <div className="panelFoldBody">
+              <div className="panelHeader tight">
                 <div className="segmented">
                   <button className={summaryScope === "current" ? "active" : ""} type="button" onClick={() => setSummaryScope("current")} disabled={analysisUiDisabled}>현재 안건</button>
                   <button className={summaryScope === "all" ? "active" : ""} type="button" onClick={() => setSummaryScope("all")} disabled={analysisUiDisabled}>전체</button>
@@ -2329,7 +2347,8 @@ export default function Home() {
                   </div>
                 )}
               </section>
-            </article>
+              </div>
+            </details>
           </section>
 
           <div className="bottomFilter">
