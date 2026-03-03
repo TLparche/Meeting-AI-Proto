@@ -49,6 +49,12 @@ type AgendaOutcomeDecision = {
   conclusion?: string;
 };
 
+type AgendaOutcomeOpinionGroup = {
+  type?: string;
+  summary?: string;
+  evidence_turn_ids?: number[];
+};
+
 type AgendaOutcome = {
   agenda_id?: string;
   agenda_title?: string;
@@ -59,6 +65,7 @@ type AgendaOutcome = {
   summary?: string;
   summary_references?: AgendaOutcomeReason[];
   agenda_keywords?: string[];
+  opinion_groups?: AgendaOutcomeOpinionGroup[];
   decision_results?: AgendaOutcomeDecision[];
   action_items?: AgendaOutcomeAction[];
   start_turn_id?: number;
@@ -80,7 +87,6 @@ type SummaryFocusState = SummaryPointMeta & {
 };
 
 type OpinionType = "proposal" | "concern" | "question" | "agree" | "disagree" | "info";
-const OPINION_SUMMARY_TARGET_LEN = 30;
 
 type OpinionGroup = {
   id: string;
@@ -348,7 +354,7 @@ function opinionKeywords(lines: string[], limit = 2): string[] {
 }
 
 function normalizeOpinionLineForSummary(line: string): string {
-  let s = compactLine(line, 140);
+  let s = safeText(line).replace(/\s+/g, " ").trim();
   s = s.replace(/^(저는|제가|저희는|저희가)\s+/g, "");
   s = s.replace(/^(일단|그리고|근데|그니까|그러니까|음|어|네|예)\s+/g, "");
   s = s.replace(/\s+/g, " ").trim();
@@ -391,7 +397,7 @@ function pickOpinionSummaryLines(lines: string[]): string[] {
 
 function summarizeOpinionGroup(type: OpinionType, lines: string[]): { summary: string; detail: string } {
   if (lines.length === 0) return { summary: "의견 요약 없음", detail: "" };
-  const compactLines = lines.map((l) => compactLine(l, 92)).filter(Boolean);
+  const compactLines = lines.map((l) => normalizeOpinionLineForSummary(l)).filter(Boolean);
   const picked = pickOpinionSummaryLines(compactLines);
   let summary = "";
   if (picked.length === 0) {
@@ -403,8 +409,8 @@ function summarizeOpinionGroup(type: OpinionType, lines: string[]): { summary: s
   }
 
   const sample = compactLines.slice(0, 2).join(" / ");
-  const detail = compactLine(sample, 110);
-  return { summary: compactLine(summary, OPINION_SUMMARY_TARGET_LEN), detail };
+  const detail = safeText(sample);
+  return { summary: safeText(summary), detail };
 }
 
 function isOpinionLike(text: string): boolean {
@@ -435,6 +441,23 @@ function classifyOpinionType(text: string): { type: OpinionType; label: string }
   if (proposalPat.test(line)) return { type: "proposal", label: "제안" };
   if (agreePat.test(line)) return { type: "agree", label: "동의" };
   return { type: "info", label: "의견/정보" };
+}
+
+function normalizeOpinionType(raw: string): OpinionType {
+  const t = safeText(raw).toLowerCase();
+  if (t === "proposal" || t === "concern" || t === "question" || t === "agree" || t === "disagree" || t === "info") {
+    return t;
+  }
+  return "info";
+}
+
+function opinionTypeLabel(type: OpinionType): string {
+  if (type === "proposal") return "제안";
+  if (type === "concern") return "우려/리스크";
+  if (type === "question") return "질문/확인";
+  if (type === "agree") return "동의";
+  if (type === "disagree") return "반대/보류";
+  return "의견/정보";
 }
 
 function buildOpinionGroups(
@@ -1041,6 +1064,7 @@ export default function Home() {
       const summaryPoints = (row.agenda_summary_items || []).map((s) => safeText(s)).filter(Boolean);
       const keyPoints = (summaryPoints.length > 0 ? summaryPoints : (row.key_utterances || [])).filter(Boolean);
       const allRefs = (row.summary_references || []).filter(Boolean);
+      const llmOpinionGroups = (row.opinion_groups || []).filter(Boolean);
 
       keyPoints.forEach((pointText, pointIdx) => {
         const pointId = `summary-${ridx}-${pointIdx}`;
@@ -1097,6 +1121,51 @@ export default function Home() {
         }
 
         const rangeLabel = buildTimeRangeLabel(timeCandidates, pointText);
+        const pointTurnSet = new Set<number>();
+        turnIds.forEach((id) => pointTurnSet.add(id));
+        refs.forEach((reason) => {
+          const id = Number(reason.turn_id || 0);
+          if (!Number.isNaN(id) && id > 0) pointTurnSet.add(id);
+        });
+
+        const llmGroups: OpinionGroup[] = [];
+        if (llmOpinionGroups.length > 0) {
+          let selectedGroups = llmOpinionGroups.filter((g) => {
+            const ids = Array.isArray(g.evidence_turn_ids)
+              ? g.evidence_turn_ids.map((v) => Number(v)).filter((v) => !Number.isNaN(v) && v > 0)
+              : [];
+            if (ids.length === 0) return false;
+            return ids.some((id) => pointTurnSet.has(id));
+          });
+          if (selectedGroups.length === 0 && keyPoints.length === 1) {
+            selectedGroups = llmOpinionGroups;
+          }
+
+          selectedGroups.forEach((g, gidx) => {
+            const typ = normalizeOpinionType(safeText(g.type, "info"));
+            const summary = safeText(g.summary);
+            if (!summary) return;
+            const ids = Array.isArray(g.evidence_turn_ids)
+              ? g.evidence_turn_ids.map((v) => Number(v)).filter((v) => !Number.isNaN(v) && v > 0)
+              : [];
+            const utterances = ids
+              .map((id) => transcriptByTurn.get(id))
+              .filter((u): u is TranscriptUtterance => Boolean(u))
+              .sort((a, b) => Number(a.id.replace("utt-", "")) - Number(b.id.replace("utt-", "")));
+            const llmRange = buildTimeRangeLabel(utterances.map((u) => u.timestamp), pointText);
+            llmGroups.push({
+              id: `${pointId}-llm-op-${gidx + 1}`,
+              type: typ,
+              typeLabel: opinionTypeLabel(typ),
+              summary,
+              detail: "",
+              rangeLabel: llmRange,
+              utterances,
+            });
+          });
+        }
+
+        const fallbackGroups = buildOpinionGroups(agendaId, pointId, matchedUtterances, refs);
         out.set(`${agendaId}|${pointId}`, {
           agendaId,
           pointId,
@@ -1104,7 +1173,7 @@ export default function Home() {
           rangeLabel,
           turnIds,
           references: refs,
-          opinionGroups: buildOpinionGroups(agendaId, pointId, matchedUtterances, refs),
+          opinionGroups: llmGroups.length > 0 ? llmGroups : fallbackGroups,
         });
       });
     });

@@ -22,7 +22,7 @@ from llm_client import get_client
 ROOT = Path(__file__).resolve().parent.parent
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "large")
 SUMMARY_INTERVAL = 4
-SUMMARY_POINT_TARGET_LEN = 72
+SUMMARY_POINT_TARGET_LEN = None
 
 STOPWORDS = {
     "그냥",
@@ -420,7 +420,6 @@ def _to_summary_point(text: str, max_len: int | None = SUMMARY_POINT_TARGET_LEN)
     s = re.sub(r"(입니다|합니다|했어요|했습니다|같아요|같습니다)\s*$", "", s)
     s = s.strip(" .,!?:;")
     if max_len and max_len > 0 and len(s) > max_len:
-        # 사용자 요청: 길이 초과 시 말줄임표(...)를 붙이지 않는다.
         s = s[:max_len].rstrip()
     return _safe_text(s)
 
@@ -719,6 +718,7 @@ def _refresh_analysis(rt: RuntimeStore) -> dict[str, Any]:
                 "summary": summary,
                 "summary_references": list(row.get("summary_references") or []),
                 "agenda_keywords": list(row.get("agenda_keywords") or []),
+                "opinion_groups": list(row.get("opinion_groups") or []),
                 "decision_results": list(row.get("decision_results") or []),
                 "action_items": list(row.get("action_items") or []),
                 "start_turn_id": int(row.get("start_turn_id") or row.get("_start_turn_id") or 0),
@@ -786,6 +786,7 @@ def _create_agenda(rt: RuntimeStore, title: str, state: str = "ACTIVE") -> dict[
         "_summary_items": [],
         "summary_references": [],
         "agenda_keywords": [],
+        "opinion_groups": [],
         "decision_results": [],
         "action_items": [],
         "start_turn_id": 0,
@@ -1395,6 +1396,7 @@ def _build_local_outcomes(rt: RuntimeStore, turns: list[dict[str, Any]]) -> list
                 "summary_references": summary_refs,
                 "summary": _safe_text(summary),
                 "agenda_keywords": _dedup_preserve(keywords, limit=6),
+                "opinion_groups": [],
                 "decision_results": decisions,
                 "action_items": actions,
                 "_start_turn_id": int(seg_turns[0].get("turn_id", 1) or 1),
@@ -1585,6 +1587,7 @@ def _apply_outcomes(rt: RuntimeStore, outcomes: list[dict[str, Any]]) -> None:
         created["summary_references"] = list(row.get("summary_references") or [])
         created["summary"] = _safe_text(row.get("summary"))
         created["agenda_keywords"] = _dedup_preserve(list(row.get("agenda_keywords") or []), limit=6)
+        created["opinion_groups"] = list(row.get("opinion_groups") or [])
         created["decision_results"] = list(row.get("decision_results") or [])
         created["action_items"] = list(row.get("action_items") or [])
         created["start_turn_id"] = int(row.get("_start_turn_id") or 0)
@@ -1687,6 +1690,9 @@ def _build_agenda_detail_prompt(
 7) decision_results는 확정된 결론만 포함한다. 없으면 빈 배열.
 8) action_items는 누가/무엇/기한/근거를 포함한다. 없으면 빈 배열.
 9) 원문 장문 인용은 금지하고, 요약 문장으로 작성한다.
+10) opinion_groups를 반드시 작성한다. 안건 내 유사 의견을 묶어 2~8개 그룹으로 정리한다.
+11) 각 opinion_groups 항목은 type, summary, evidence_turn_ids를 포함해야 한다.
+12) type은 proposal|concern|question|agree|disagree|info 중 하나만 사용한다.
 
 [출력 JSON 스키마]
 {{
@@ -1696,6 +1702,13 @@ def _build_agenda_detail_prompt(
     {{"summary": "string", "evidence_turn_ids": [1,2]}}
   ],
   "summary": "string",
+  "opinion_groups": [
+    {{
+      "type": "proposal|concern|question|agree|disagree|info",
+      "summary": "string",
+      "evidence_turn_ids": [1,2]
+    }}
+  ],
   "decision_results": [
     {{
       "conclusion": "string",
@@ -1919,6 +1932,30 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
                     }
                 )
 
+        opinion_groups: list[dict[str, Any]] = []
+        for it in detail_parsed.get("opinion_groups") or []:
+            if not isinstance(it, dict):
+                continue
+            typ = _safe_text(it.get("type"), "info").lower()
+            if typ not in {"proposal", "concern", "question", "agree", "disagree", "info"}:
+                typ = "info"
+            summary_txt = _to_summary_point(_safe_text(it.get("summary")), max_len=None)
+            if not summary_txt:
+                continue
+            ids = _to_ids(it.get("evidence_turn_ids"))
+            refs = _extract_refs(rt, ids, seg_turns)
+            turn_ids = _dedup_preserve([str(int(r.get("turn_id") or 0)) for r in refs if int(r.get("turn_id") or 0) > 0], limit=12)
+            evidence_ids = [int(x) for x in turn_ids if str(x).isdigit()]
+            if not evidence_ids:
+                evidence_ids = [tid for tid in ids if tid > 0][:12]
+            opinion_groups.append(
+                {
+                    "type": typ,
+                    "summary": summary_txt,
+                    "evidence_turn_ids": evidence_ids,
+                }
+            )
+
         decisions: list[dict[str, Any]] = []
         for it in detail_parsed.get("decision_results") or []:
             if not isinstance(it, dict):
@@ -2009,7 +2046,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
         if direct_match or sim_match:
             state = "ACTIVE"
 
-        summary = _to_summary_point(_safe_text(detail_parsed.get("summary")), max_len=300)
+        summary = _to_summary_point(_safe_text(detail_parsed.get("summary")), max_len=None)
         if not summary:
             summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:10])
 
@@ -2023,6 +2060,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
                 "summary_references": summary_references[:24],
                 "summary": _safe_text(summary),
                 "agenda_keywords": _dedup_preserve(keywords, limit=6),
+                "opinion_groups": opinion_groups[:12],
                 "decision_results": decisions,
                 "action_items": actions,
                 "_start_turn_id": start_turn_id,
