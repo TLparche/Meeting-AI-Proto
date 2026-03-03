@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -49,6 +50,28 @@ def _extract_json(text: str) -> dict[str, Any]:
     return {}
 
 
+def _extract_json_loose(text: str) -> dict[str, Any]:
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+
+    l = raw.find("{")
+    r = raw.rfind("}")
+    if l >= 0 and r > l:
+        raw = raw[l : r + 1]
+
+    raw = raw.replace("\u0000", "")
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+    raw = re.sub(r"//.*?$", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
 @dataclass
 class GeminiClient:
     model: str
@@ -63,6 +86,7 @@ class GeminiClient:
     last_success_at: str = ""
     last_error: str = ""
     last_error_at: str = ""
+    last_raw_preview: str = ""
 
     def status(self) -> dict[str, Any]:
         return {
@@ -81,6 +105,7 @@ class GeminiClient:
             "last_success_at": self.last_success_at,
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
+            "last_raw_preview": self.last_raw_preview,
         }
 
     def _call(self, prompt: str, temperature: float = 0.2, max_tokens: int = 1024) -> str:
@@ -139,6 +164,7 @@ class GeminiClient:
         self.last_success_at = _now_iso()
         self.last_error = ""
         self.last_error_at = ""
+        self.last_raw_preview = (text or "")[:1000]
         return text
 
     def ping(self) -> dict[str, Any]:
@@ -173,6 +199,21 @@ class GeminiClient:
             raise RuntimeError("LLM이 연결되지 않았습니다. 먼저 연결 버튼을 눌러주세요.")
         raw = self._call(prompt, temperature=temperature, max_tokens=max_tokens)
         parsed = _extract_json(raw)
+        if not parsed:
+            parsed = _extract_json_loose(raw)
+        if parsed:
+            return parsed
+
+        repair_input = (raw or "")[:12000]
+        repair_prompt = (
+            "다음 텍스트를 유효한 JSON 객체 하나로만 정규화해서 반환하세요. "
+            "설명/마크다운/코드펜스 없이 JSON만 출력하세요.\n\n"
+            f"{repair_input}"
+        )
+        repair_raw = self._call(repair_prompt, temperature=0.0, max_tokens=max_tokens)
+        parsed = _extract_json(repair_raw)
+        if not parsed:
+            parsed = _extract_json_loose(repair_raw)
         if not parsed:
             raise RuntimeError("LLM JSON 파싱 실패")
         return parsed

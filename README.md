@@ -32,6 +32,15 @@ UI는 `front-ref/parche` 레이아웃을 기준으로 유지하고, 기능만 �
 python -m pip install -r requirements.txt
 ```
 
+macOS 권장:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+brew install ffmpeg
+```
+
 ### Frontend
 ```bash
 cd frontend
@@ -118,6 +127,10 @@ PowerShell:
 - `POST /api/stt/chunk`
 
 ## 트러블슈팅
+- `lib` 오류 / JSON 업로드 파싱 실패(특히 새 환경)
+  - 먼저 `http://127.0.0.1:8000/api/health` 확인
+  - `deps.python_multipart`, `deps.fastapi`가 `true`인지 확인
+  - 업로드 실패 시 UI 디버그 패널에 `JSON 파싱 오류: <file> -> <reason>`가 표시됩니다.
 - `오디오 트랙이 없습니다`
   - 화면 공유 시작 시 반드시 탭 오디오 공유를 켜야 합니다.
 - `Failed to load audio` / ffmpeg 관련 에러

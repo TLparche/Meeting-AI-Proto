@@ -341,6 +341,13 @@ export default function Home() {
       setDatasetImportInfo(
         `loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}`,
       );
+      const firstParseError = d.parse_errors?.[0];
+      if (firstParseError) {
+        setDebugEvents((rows) => [
+          `${formatNowTime()} | JSON 파싱 오류: ${firstParseError.file} -> ${firstParseError.error}`,
+          ...rows,
+        ].slice(0, 80));
+      }
       if (d.warning) setError(d.warning);
     } catch (err) {
       setError((err as Error).message);
@@ -368,6 +375,13 @@ export default function Home() {
       setDatasetImportInfo(
         `uploaded=${datasetFiles.length}, loaded=${d.added}, files=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}, ticked=${d.ticked ? "yes" : "no"}`,
       );
+      const firstParseError = d.parse_errors?.[0];
+      if (firstParseError) {
+        setDebugEvents((rows) => [
+          `${formatNowTime()} | JSON 파싱 오류: ${firstParseError.file} -> ${firstParseError.error}`,
+          ...rows,
+        ].slice(0, 80));
+      }
       if (d.warning) setError(d.warning);
     } catch (err) {
       setError((err as Error).message);
@@ -1322,6 +1336,12 @@ export default function Home() {
             {llmPingMessage ? <p className="mutedLabel">Ping: {llmPingMessage}</p> : null}
             {llmPingOk === false ? <p className="mutedLabel">LLM 연결 오류를 확인하세요.</p> : null}
             {state.llm_status?.last_error ? <p className="mutedLabel">LLM 오류: {state.llm_status.last_error}</p> : null}
+            {state.llm_status?.last_raw_preview ? (
+              <details>
+                <summary>LLM 원문 미리보기</summary>
+                <pre className="emptyState compact">{String(state.llm_status.last_raw_preview)}</pre>
+              </details>
+            ) : null}
             {state.analysis_runtime?.control_plane_reason ? <p className="mutedLabel">분석 상태: {state.analysis_runtime.control_plane_reason}</p> : null}
             {state.analysis_runtime?.used_local_fallback ? <p className="mutedLabel">현재 로컬 폴백 분석 모드</p> : null}
             {error ? <p className="emptyState compact">{error}</p> : null}

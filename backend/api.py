@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import tempfile
 import threading
 import time
+import importlib.util
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -281,6 +283,19 @@ def _extract_json(raw: str) -> dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _looks_like_meeting_payload(payload: dict[str, Any]) -> tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "JSON 최상위가 객체(dict)가 아닙니다."
+    if "utterance" not in payload:
+        return False, "필수 키 `utterance`가 없습니다."
+    utterance = payload.get("utterance")
+    if not isinstance(utterance, list):
+        return False, "`utterance`는 배열(list)이어야 합니다."
+    if len(utterance) == 0:
+        return False, "`utterance`가 비어 있습니다."
+    return True, ""
 
 
 def _speaker_profile_label(age: Any, occupation: Any, role: Any, fallback_id: str) -> str:
@@ -1254,7 +1269,19 @@ app.add_middleware(
 
 @app.get("/api/health")
 def get_health():
-    return {"ok": True, "whisper_model": WHISPER_MODEL_NAME}
+    return {
+        "ok": True,
+        "whisper_model": WHISPER_MODEL_NAME,
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "deps": {
+            "fastapi": importlib.util.find_spec("fastapi") is not None,
+            "python_multipart": importlib.util.find_spec("multipart") is not None,
+            "whisper": importlib.util.find_spec("whisper") is not None,
+            "dotenv": importlib.util.find_spec("dotenv") is not None,
+            "numpy": importlib.util.find_spec("numpy") is not None,
+        },
+    }
 
 
 @app.get("/api/state")
@@ -1345,6 +1372,7 @@ def post_import_json_dir(payload: ImportDirInput):
         files_skipped = 0
         rows_loaded = 0
         file_stats = []
+        parse_errors: list[dict[str, str]] = []
         applied_goal = None
 
         for path in files:
@@ -1352,15 +1380,31 @@ def post_import_json_dir(payload: ImportDirInput):
             try:
                 raw = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
-                raw = path.read_text(encoding="utf-8-sig")
+                try:
+                    raw = path.read_text(encoding="utf-8-sig")
+                except Exception as exc:
+                    files_skipped += 1
+                    parse_errors.append({"file": str(path), "error": f"decode failed: {exc}"})
+                    continue
             except Exception:
                 files_skipped += 1
+                parse_errors.append({"file": str(path), "error": "read failed"})
                 continue
             data = _extract_json(raw)
             if not data:
                 files_skipped += 1
+                parse_errors.append({"file": str(path), "error": "json parse failed"})
+                continue
+            ok_payload, payload_reason = _looks_like_meeting_payload(data)
+            if not ok_payload:
+                files_skipped += 1
+                parse_errors.append({"file": str(path), "error": payload_reason})
                 continue
             goal, rows = _parse_meeting_json_payload(data)
+            if not rows:
+                files_skipped += 1
+                parse_errors.append({"file": str(path), "error": "utterance rows extracted = 0"})
+                continue
             if goal and not applied_goal:
                 applied_goal = goal
             added = _append_many_turns(RT, rows)
@@ -1393,8 +1437,9 @@ def post_import_json_dir(payload: ImportDirInput):
                 "ticked": bool(ticked),
                 "analysis_mode": "none" if not RT.llm_enabled else "full_document_once",
                 "meeting_goal_applied": bool(applied_goal),
-                "warning": "" if files_parsed > 0 else "파싱된 JSON 파일이 없습니다.",
+                "warning": "" if files_parsed > 0 else ("파싱된 JSON 파일이 없습니다." + (f" 예: {parse_errors[0]['error']}" if parse_errors else "")),
                 "file_stats": file_stats,
+                "parse_errors": parse_errors[:20],
             },
         }
 
@@ -1416,6 +1461,7 @@ async def post_import_json_files(
         files_skipped = 0
         rows_loaded = 0
         file_stats = []
+        parse_errors: list[dict[str, str]] = []
         applied_goal = None
 
         for upload in files:
@@ -1428,16 +1474,28 @@ async def post_import_json_files(
                     raw = blob.decode("utf-8-sig")
                 except Exception:
                     files_skipped += 1
+                    parse_errors.append({"file": upload.filename or "upload.json", "error": "decode failed"})
                     continue
             except Exception:
                 files_skipped += 1
+                parse_errors.append({"file": upload.filename or "upload.json", "error": "read failed"})
                 continue
 
             data = _extract_json(raw)
             if not data:
                 files_skipped += 1
+                parse_errors.append({"file": upload.filename or "upload.json", "error": "json parse failed"})
+                continue
+            ok_payload, payload_reason = _looks_like_meeting_payload(data)
+            if not ok_payload:
+                files_skipped += 1
+                parse_errors.append({"file": upload.filename or "upload.json", "error": payload_reason})
                 continue
             goal, rows = _parse_meeting_json_payload(data)
+            if not rows:
+                files_skipped += 1
+                parse_errors.append({"file": upload.filename or "upload.json", "error": "utterance rows extracted = 0"})
+                continue
             if goal and not applied_goal:
                 applied_goal = goal
             added = _append_many_turns(RT, rows)
@@ -1470,8 +1528,9 @@ async def post_import_json_files(
                 "ticked": bool(ticked),
                 "analysis_mode": "none" if not RT.llm_enabled else "full_document_once",
                 "meeting_goal_applied": bool(applied_goal),
-                "warning": "" if files_parsed > 0 else "파싱된 JSON 파일이 없습니다.",
+                "warning": "" if files_parsed > 0 else ("파싱된 JSON 파일이 없습니다." + (f" 예: {parse_errors[0]['error']}" if parse_errors else "")),
                 "file_stats": file_stats,
+                "parse_errors": parse_errors[:20],
             },
         }
 
