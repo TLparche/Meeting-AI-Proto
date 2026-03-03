@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   connectLlm,
   disconnectLlm,
+  getLastLlmJson,
   getLlmStatus,
   getState,
   importJsonDir,
@@ -79,6 +80,7 @@ type SummaryFocusState = SummaryPointMeta & {
 };
 
 type OpinionType = "proposal" | "concern" | "question" | "agree" | "disagree" | "info";
+const OPINION_SUMMARY_TARGET_LEN = 30;
 
 type OpinionGroup = {
   id: string;
@@ -402,7 +404,7 @@ function summarizeOpinionGroup(type: OpinionType, lines: string[]): { summary: s
 
   const sample = compactLines.slice(0, 2).join(" / ");
   const detail = compactLine(sample, 110);
-  return { summary: compactLine(summary, 64), detail };
+  return { summary: compactLine(summary, OPINION_SUMMARY_TARGET_LEN), detail };
 }
 
 function isOpinionLike(text: string): boolean {
@@ -542,6 +544,9 @@ export default function Home() {
   const [llmChecking, setLlmChecking] = useState(false);
   const [llmPingMessage, setLlmPingMessage] = useState("");
   const [llmPingOk, setLlmPingOk] = useState<boolean | null>(null);
+  const [llmJsonLoading, setLlmJsonLoading] = useState(false);
+  const [lastLlmJson, setLastLlmJson] = useState<Record<string, unknown> | null>(null);
+  const [lastLlmJsonAt, setLastLlmJsonAt] = useState("");
 
   const [sttSpeaker, setSttSpeaker] = useState("시스템오디오");
   const [sttSource, setSttSource] = useState<"system">("system");
@@ -1511,6 +1516,8 @@ export default function Home() {
       active_agenda: safeText(state.analysis?.agenda?.active?.title),
       used_local_fallback: Boolean(state.analysis_runtime?.used_local_fallback),
       analysis_reason: safeText(state.analysis_runtime?.control_plane_reason),
+      llm_json_available: Boolean(state.analysis_runtime?.last_llm_json_available),
+      llm_json_at: safeText(state.analysis_runtime?.last_llm_json_at),
       llm_connected: Boolean(state.llm_status?.connected),
       llm_last_error: safeText(state.llm_status?.last_error),
       decision_count: decisions.length,
@@ -1523,6 +1530,28 @@ export default function Home() {
   const onDebugRefresh = async () => {
     await Promise.all([loadState(), refreshLlmStatus()]);
     setDebugEvents((rows) => [`${formatNowTime()} | 수동 새로고침 실행`, ...rows].slice(0, 80));
+  };
+
+  const onLoadLastLlmJson = async () => {
+    setLlmJsonLoading(true);
+    try {
+      const res = await getLastLlmJson();
+      setLastLlmJson(res.has_json ? (res.json || {}) : null);
+      setLastLlmJsonAt(safeText(res.received_at));
+      setDebugEvents((rows) => [
+        `${formatNowTime()} | LLM 수신 JSON 조회: ${res.has_json ? "성공" : "데이터 없음"}`,
+        ...rows,
+      ].slice(0, 80));
+      if (!res.has_json) {
+        setError("아직 저장된 LLM 수신 JSON이 없습니다. 분석 실행 후 다시 확인하세요.");
+      } else {
+        setError("");
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLlmJsonLoading(false);
+    }
   };
 
   const renderSummaryCard = () => (
@@ -1891,6 +1920,12 @@ export default function Home() {
               </details>
             ) : null}
             {state.analysis_runtime?.control_plane_reason ? <p className="mutedLabel">분석 상태: {state.analysis_runtime.control_plane_reason}</p> : null}
+            <p className="mutedLabel">
+              안건 제목 재요청: {Number(state.analysis_runtime?.title_refine_success ?? 0)}/{Number(state.analysis_runtime?.title_refine_attempts ?? 0)}
+            </p>
+            <p className="mutedLabel">
+              수신 JSON: {state.analysis_runtime?.last_llm_json_available ? "있음" : "없음"} {state.analysis_runtime?.last_llm_json_at ? `(${state.analysis_runtime.last_llm_json_at})` : ""}
+            </p>
             {state.analysis_runtime?.used_local_fallback ? <p className="mutedLabel">현재 로컬 폴백 분석 모드</p> : null}
             {error ? <p className="emptyState compact">{error}</p> : null}
 
@@ -1904,6 +1939,9 @@ export default function Home() {
               </div>
               <div className="panelActions">
                 <button type="button" onClick={() => void onDebugRefresh()} disabled={loading || llmChecking}>상태 강제 새로고침</button>
+                <button type="button" onClick={() => void onLoadLastLlmJson()} disabled={loading || llmChecking || llmJsonLoading}>
+                  {llmJsonLoading ? "조회 중" : "LLM 수신 JSON 보기"}
+                </button>
                 <button type="button" onClick={() => setDebugEvents([])}>디버그 로그 지우기</button>
               </div>
               <div className="signalTimeline">
@@ -1916,6 +1954,17 @@ export default function Home() {
               <details>
                 <summary>Raw State 요약(JSON)</summary>
                 <pre className="emptyState compact">{JSON.stringify(debugSnapshot, null, 2)}</pre>
+              </details>
+              <details open={Boolean(lastLlmJson)}>
+                <summary>LLM 수신 JSON</summary>
+                {lastLlmJson ? (
+                  <>
+                    <p className="mutedLabel">수신 시각: {lastLlmJsonAt || "-"}</p>
+                    <pre className="emptyState compact">{JSON.stringify(lastLlmJson, null, 2)}</pre>
+                  </>
+                ) : (
+                  <p className="emptyState compact">버튼을 눌러 최근 수신 JSON을 조회하세요.</p>
+                )}
               </details>
             </details>
           </article>
