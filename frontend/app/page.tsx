@@ -64,6 +64,19 @@ type AgendaOutcome = {
   end_turn_id?: number;
 };
 
+type SummaryPointMeta = {
+  agendaId: string;
+  pointId: string;
+  pointText: string;
+  rangeLabel: string;
+  turnIds: number[];
+  references: AgendaOutcomeReason[];
+};
+
+type SummaryFocusState = SummaryPointMeta & {
+  utterances: TranscriptUtterance[];
+};
+
 const EMPTY_STATE: MeetingState = {
   meeting_goal: "",
   initial_context: "",
@@ -169,6 +182,58 @@ function tokenize(text: string): string[] {
   return (text.match(/[A-Za-z0-9가-힣]{2,}/g) || []).map((t) => t.toLowerCase());
 }
 
+function extractTimestampToken(text: string): string {
+  const m = safeText(text).match(/(\d{2}:\d{2}(?::\d{2})?)/);
+  return m ? m[1] : "";
+}
+
+function stripLeadingTimestamp(text: string): string {
+  return safeText(text).replace(/^\[\d{2}:\d{2}(?::\d{2})?\]\s*/, "").trim();
+}
+
+function normalizeSummaryKey(text: string): string {
+  return stripLeadingTimestamp(text)
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function timeToSeconds(ts: string): number {
+  const token = extractTimestampToken(ts);
+  if (!token) return -1;
+  const parts = token.split(":").map((v) => Number(v));
+  if (parts.some((v) => Number.isNaN(v))) return -1;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return -1;
+}
+
+function buildTimeRangeLabel(timestamps: string[], fallbackTimestamp = ""): string {
+  const seen = new Set<string>();
+  const normalized = timestamps.map((ts) => extractTimestampToken(ts)).filter(Boolean);
+  if (fallbackTimestamp) normalized.push(extractTimestampToken(fallbackTimestamp));
+  const unique = normalized.filter((ts) => {
+    if (seen.has(ts)) return false;
+    seen.add(ts);
+    return true;
+  });
+  if (unique.length === 0) return "-";
+  const ordered = unique.slice().sort((a, b) => timeToSeconds(a) - timeToSeconds(b));
+  if (ordered.length === 1) return ordered[0];
+  return `${ordered[0]} ~ ${ordered[ordered.length - 1]}`;
+}
+
+function quoteSimilar(a: string, b: string): boolean {
+  const left = safeText(a).toLowerCase();
+  const right = safeText(b).toLowerCase();
+  if (!left || !right) return false;
+  if (left.includes(right) || right.includes(left)) return true;
+  const tokens = tokenize(left);
+  if (tokens.length === 0) return false;
+  const hitCount = tokens.filter((token) => right.includes(token)).length;
+  return hitCount >= Math.min(3, Math.ceil(tokens.length * 0.6));
+}
+
 export default function Home() {
   const [state, setState] = useState<MeetingState>(EMPTY_STATE);
   const [loading, setLoading] = useState(false);
@@ -177,6 +242,7 @@ export default function Home() {
   const [taskElapsedSec, setTaskElapsedSec] = useState(0);
   const [analysisPending, setAnalysisPending] = useState(false);
   const [focusedTargetDomId, setFocusedTargetDomId] = useState("");
+  const [selectedSummaryFocus, setSelectedSummaryFocus] = useState<SummaryFocusState | null>(null);
   const [error, setError] = useState("");
 
   const [query, setQuery] = useState("");
@@ -621,6 +687,7 @@ export default function Home() {
   useEffect(() => {
     if (agendas.length === 0) {
       setSelectedAgendaId("");
+      setSelectedSummaryFocus(null);
       return;
     }
     if (!selectedAgendaId || !agendas.some((agenda) => agenda.id === selectedAgendaId)) {
@@ -667,6 +734,100 @@ export default function Home() {
       };
     });
   }, [state.transcript, agendas, selectedAgenda?.id, sortedOutcomeRows]);
+
+  const summaryPointMetaMap = useMemo(() => {
+    const out = new Map<string, SummaryPointMeta>();
+    if (sortedOutcomeRows.length === 0 || transcript.length === 0) return out;
+
+    const transcriptByTurn = new Map<number, TranscriptUtterance>();
+    transcript.forEach((utterance) => {
+      const turnId = Number(utterance.id.replace("utt-", ""));
+      if (!Number.isNaN(turnId) && turnId > 0) transcriptByTurn.set(turnId, utterance);
+    });
+
+    sortedOutcomeRows.forEach((row, ridx) => {
+      const agendaId = safeText(row.agenda_id, agendas[ridx]?.id || agendas[0]?.id || `agenda-${ridx + 1}`);
+      const summaryPoints = (row.agenda_summary_items || []).map((s) => safeText(s)).filter(Boolean);
+      const keyPoints = (summaryPoints.length > 0 ? summaryPoints : (row.key_utterances || [])).filter(Boolean);
+      const allRefs = (row.summary_references || []).filter(Boolean);
+
+      keyPoints.forEach((pointText, pointIdx) => {
+        const pointId = `summary-${ridx}-${pointIdx}`;
+        const pointKey = normalizeSummaryKey(pointText);
+        let refs = allRefs.filter((reason) => normalizeSummaryKey(safeText(reason.why)) === pointKey);
+
+        if (refs.length === 0 && allRefs.length > 0) {
+          refs = allRefs.slice(pointIdx * 3, pointIdx * 3 + 3);
+        }
+        if (refs.length === 0) {
+          const fallbackTs = extractTimestampToken(pointText);
+          if (fallbackTs) {
+            refs = allRefs.filter((reason) => extractTimestampToken(safeText(reason.timestamp)) === fallbackTs);
+          }
+        }
+
+        const hitMap = new Map<string, TranscriptUtterance>();
+        refs.forEach((reason) => {
+          const turnId = Number(reason.turn_id || 0);
+          if (turnId > 0) {
+            const turnUtterance = transcriptByTurn.get(turnId);
+            if (turnUtterance) {
+              hitMap.set(turnUtterance.id, turnUtterance);
+              return;
+            }
+          }
+
+          const reasonTs = extractTimestampToken(safeText(reason.timestamp));
+          const reasonSpeaker = safeText(reason.speaker);
+          const reasonQuote = safeText(reason.quote);
+          for (const utterance of transcript) {
+            const tsMatch = !reasonTs || extractTimestampToken(utterance.timestamp) === reasonTs;
+            const speakerMatch = !reasonSpeaker || utterance.speaker === reasonSpeaker;
+            const quoteMatch = !reasonQuote || quoteSimilar(reasonQuote, utterance.text);
+            if (tsMatch && speakerMatch && quoteMatch) {
+              hitMap.set(utterance.id, utterance);
+            }
+          }
+        });
+
+        const turnIds = Array.from(hitMap.values())
+          .map((utterance) => Number(utterance.id.replace("utt-", "")))
+          .filter((num) => !Number.isNaN(num) && num > 0)
+          .sort((a, b) => a - b);
+        const timeCandidates = refs.map((reason) => safeText(reason.timestamp)).filter(Boolean);
+        if (turnIds.length > 0) {
+          turnIds.forEach((turnId) => {
+            const utt = transcriptByTurn.get(turnId);
+            if (utt) timeCandidates.push(utt.timestamp);
+          });
+        }
+
+        const rangeLabel = buildTimeRangeLabel(timeCandidates, pointText);
+        out.set(`${agendaId}|${pointId}`, {
+          agendaId,
+          pointId,
+          pointText,
+          rangeLabel,
+          turnIds,
+          references: refs,
+        });
+      });
+    });
+
+    return out;
+  }, [sortedOutcomeRows, agendas, transcript]);
+
+  useEffect(() => {
+    if (!selectedSummaryFocus) return;
+    const key = `${selectedSummaryFocus.agendaId}|${selectedSummaryFocus.pointId}`;
+    if (!summaryPointMetaMap.has(key)) {
+      setSelectedSummaryFocus(null);
+      return;
+    }
+    if (!agendas.some((agenda) => agenda.id === selectedSummaryFocus.agendaId)) {
+      setSelectedSummaryFocus(null);
+    }
+  }, [selectedSummaryFocus, summaryPointMetaMap, agendas]);
 
   const decisions = useMemo<DecisionItem[]>(() => {
     if (sortedOutcomeRows.length === 0) return [];
@@ -837,7 +998,8 @@ export default function Home() {
 
   const filteredTranscript = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    return transcript.filter((utterance) => {
+    const baseTranscript = selectedSummaryFocus ? selectedSummaryFocus.utterances : transcript;
+    return baseTranscript.filter((utterance) => {
       const speakerMatch = speakerFilter === "전체" || utterance.speaker === speakerFilter;
       const queryMatch =
         normalizedQuery.length === 0 ||
@@ -846,7 +1008,7 @@ export default function Home() {
         utterance.timestamp.includes(normalizedQuery);
       return speakerMatch && queryMatch;
     });
-  }, [query, speakerFilter, transcript]);
+  }, [query, speakerFilter, transcript, selectedSummaryFocus]);
 
   const summaryAgendas = useMemo(() => {
     if (!selectedAgenda) return [];
@@ -892,24 +1054,64 @@ export default function Home() {
     if (analysisUiDisabled) return;
     setSelectedAgendaId(agendaId);
     setSummaryScope("current");
+    setSelectedSummaryFocus(null);
   };
 
   const jumpToTranscript = (agendaId: string, timestamp: string) => {
     if (analysisUiDisabled) return;
+    setSelectedSummaryFocus(null);
     setSelectedAgendaId(agendaId);
     setQuery(timestamp);
   };
 
-  const extractTimestamp = (text: string): string => {
-    const m = text.match(/\[(\d{2}:\d{2}(?::\d{2})?)\]/);
-    return m ? m[1] : "";
-  };
+  const resolveSummaryFocusUtterances = useCallback((meta: SummaryPointMeta): TranscriptUtterance[] => {
+    const hitMap = new Map<string, TranscriptUtterance>();
+    for (const turnId of meta.turnIds) {
+      if (turnId <= 0 || turnId > transcript.length) continue;
+      const utterance = transcript[turnId - 1];
+      if (utterance) hitMap.set(utterance.id, utterance);
+    }
+    if (hitMap.size === 0) {
+      for (const reason of meta.references) {
+        const reasonTs = extractTimestampToken(safeText(reason.timestamp));
+        const reasonSpeaker = safeText(reason.speaker);
+        const reasonQuote = safeText(reason.quote);
+        for (const utterance of transcript) {
+          const tsMatch = !reasonTs || extractTimestampToken(utterance.timestamp) === reasonTs;
+          const speakerMatch = !reasonSpeaker || utterance.speaker === reasonSpeaker;
+          const quoteMatch = !reasonQuote || quoteSimilar(reasonQuote, utterance.text);
+          if (tsMatch && speakerMatch && quoteMatch) {
+            hitMap.set(utterance.id, utterance);
+          }
+        }
+      }
+    }
+    const ordered = Array.from(hitMap.values());
+    ordered.sort((a, b) => Number(a.id.replace("utt-", "")) - Number(b.id.replace("utt-", "")));
+    return ordered;
+  }, [transcript]);
 
-  const jumpBySummary = (agendaId: string, summaryText: string) => {
+  const jumpBySummary = (agendaId: string, summaryText: string, pointId: string) => {
     if (analysisUiDisabled) return;
-    const ts = extractTimestamp(summaryText);
-    if (!ts) return;
-    jumpToTranscript(agendaId, ts);
+    setSelectedAgendaId(agendaId);
+    setSummaryScope("current");
+    setQuery("");
+    setSpeakerFilter("전체");
+
+    const meta = summaryPointMetaMap.get(`${agendaId}|${pointId}`);
+    if (meta) {
+      const utterances = resolveSummaryFocusUtterances(meta);
+      setSelectedSummaryFocus({
+        ...meta,
+        pointText: stripLeadingTimestamp(summaryText) || stripLeadingTimestamp(meta.pointText),
+        utterances,
+      });
+      return;
+    }
+
+    setSelectedSummaryFocus(null);
+    const ts = extractTimestampToken(summaryText);
+    if (ts) setQuery(ts);
   };
 
   const focusTargetCard = (agendaId: string, targetId: string) => {
@@ -1027,18 +1229,25 @@ export default function Home() {
                 <p className="emptyState compact">이 안건 논의가 시작되면 요약이 보여요.</p>
               ) : (
                 <ul className="bulletList">
-                  {agenda.summaryBullets.map((point) => (
-                    <li key={point}>
-                      <button
-                        className="ghostButton"
-                        type="button"
-                        onClick={() => jumpBySummary(agenda.id, point)}
-                        disabled={analysisUiDisabled || !extractTimestamp(point)}
-                      >
-                        {point}
-                      </button>
-                    </li>
-                  ))}
+                  {agenda.summaryBullets.map((point, pointIdx) => {
+                    const pointId = agenda.summaryPointIds?.[pointIdx] || `summary-${agenda.id}-${pointIdx}`;
+                    const meta = summaryPointMetaMap.get(`${agenda.id}|${pointId}`);
+                    const rangeLabel = meta?.rangeLabel || buildTimeRangeLabel([point]);
+                    const clickable = Boolean(meta || extractTimestampToken(point));
+                    return (
+                      <li key={`${point}-${pointIdx}`}>
+                        <button
+                          className="ghostButton"
+                          type="button"
+                          onClick={() => jumpBySummary(agenda.id, point, pointId)}
+                          disabled={analysisUiDisabled || !clickable}
+                        >
+                          <span>{stripLeadingTimestamp(point)}</span>
+                          {rangeLabel !== "-" ? <span className="summaryPointRange">{rangeLabel}</span> : null}
+                        </button>
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
               <div className="callout">
@@ -1336,6 +1545,7 @@ export default function Home() {
             {llmPingMessage ? <p className="mutedLabel">Ping: {llmPingMessage}</p> : null}
             {llmPingOk === false ? <p className="mutedLabel">LLM 연결 오류를 확인하세요.</p> : null}
             {state.llm_status?.last_error ? <p className="mutedLabel">LLM 오류: {state.llm_status.last_error}</p> : null}
+            {state.llm_status?.last_finish_reason ? <p className="mutedLabel">LLM finish_reason: {state.llm_status.last_finish_reason}</p> : null}
             {state.llm_status?.last_raw_preview ? (
               <details>
                 <summary>LLM 원문 미리보기</summary>
@@ -1377,6 +1587,23 @@ export default function Home() {
               <h2>전사문 (전체)</h2>
               <span className="chip chipSoft">{filteredTranscript.length}개 표시</span>
             </div>
+            {selectedSummaryFocus ? (
+              <div className="summaryFocusBar">
+                <span className="chip chipInteractive">요약 포커스</span>
+                <p>{stripLeadingTimestamp(selectedSummaryFocus.pointText)}</p>
+                <span className="mutedLabel">
+                  범위 {selectedSummaryFocus.rangeLabel} . 원문 {selectedSummaryFocus.utterances.length}문장
+                </span>
+                <button
+                  className="ghostButton"
+                  type="button"
+                  onClick={() => setSelectedSummaryFocus(null)}
+                  disabled={analysisUiDisabled}
+                >
+                  포커스 해제
+                </button>
+              </div>
+            ) : null}
             <div className="transcriptControls transcriptControlsCompact">
               <input
                 aria-label="전사문 검색"
@@ -1401,7 +1628,11 @@ export default function Home() {
             </div>
             <div className="transcriptList">
               {filteredTranscript.length === 0 ? (
-                <p className="emptyState">현재 필터와 일치하는 발화가 없습니다. 검색어나 화자 필터를 조정해 주세요.</p>
+                <p className="emptyState">
+                  {selectedSummaryFocus
+                    ? "선택한 핵심 포인트의 원문 발화를 찾지 못했습니다. 포커스를 해제하거나 다른 포인트를 선택해 주세요."
+                    : "현재 필터와 일치하는 발화가 없습니다. 검색어나 화자 필터를 조정해 주세요."}
+                </p>
               ) : (
                 filteredTranscript.map((utterance) => {
                   const isRelated = selectedAgenda ? utterance.agendaId === selectedAgenda.id : false;
@@ -1560,16 +1791,20 @@ export default function Home() {
                           {agenda.keyPoints.length === 0 ? <p className="emptyState compact">아직 핵심 포인트가 없습니다.</p> : <ul className="bulletList">{agenda.keyPoints.map((point, pointIdx) => {
                             const targetId = agenda.summaryPointIds?.[pointIdx] || `summary-${agenda.id}-${pointIdx}`;
                             const domId = `evi-target-${targetId}`;
+                            const meta = summaryPointMetaMap.get(`${agenda.id}|${targetId}`);
+                            const rangeLabel = meta?.rangeLabel || buildTimeRangeLabel([point]);
+                            const clickable = Boolean(meta || extractTimestampToken(point));
                             return (
-                              <li key={point}>
+                              <li key={`${point}-${pointIdx}`}>
                                 <button
                                   id={domId}
                                   className={`ghostButton ${focusedTargetDomId === domId ? "focusFlash" : ""}`}
                                   type="button"
-                                  onClick={() => jumpBySummary(agenda.id, point)}
-                                  disabled={analysisUiDisabled || !extractTimestamp(point)}
+                                  onClick={() => jumpBySummary(agenda.id, point, targetId)}
+                                  disabled={analysisUiDisabled || !clickable}
                                 >
-                                  {point}
+                                  <span>{stripLeadingTimestamp(point)}</span>
+                                  {rangeLabel !== "-" ? <span className="summaryPointRange">{rangeLabel}</span> : null}
                                 </button>
                               </li>
                             );

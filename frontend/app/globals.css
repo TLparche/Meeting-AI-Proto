@@ -864,6 +864,24 @@ h4 {
   gap: 6px;
 }
 
+.summaryFocusBar {
+  margin-bottom: 10px;
+  border: 1px solid #d9e5ff;
+  background: #f6f9ff;
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.summaryFocusBar p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #223055;
+}
+
 .utterance {
   position: relative;
   border: 1px solid #edf1f8;
@@ -976,6 +994,18 @@ h4 {
 .bulletList li {
   margin: 4px 0;
   font-size: 0.9rem;
+}
+
+.bulletList .ghostButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.summaryPointRange {
+  font-size: 0.76rem;
+  color: #5d6d8e;
+  white-space: nowrap;
 }
 
 .mutedLabel {

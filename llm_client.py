@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ast
 import threading
 import time
 import urllib.error
@@ -69,7 +70,62 @@ def _extract_json_loose(text: str) -> dict[str, Any]:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
+        pass
+
+    try:
+        parsed = ast.literal_eval(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
         return {}
+
+
+def _extract_balanced_json(text: str) -> dict[str, Any]:
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    start = raw.find("{")
+    if start < 0:
+        return {}
+
+    depth = 0
+    in_str = False
+    escape = False
+    quote = ""
+    end = -1
+
+    for idx, ch in enumerate(raw[start:], start=start):
+        if in_str:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == quote:
+                in_str = False
+            continue
+
+        if ch in {'"', "'"}:
+            in_str = True
+            quote = ch
+            continue
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx
+                break
+
+    if end <= start:
+        return {}
+
+    chunk = raw[start : end + 1]
+    parsed = _extract_json(chunk)
+    if parsed:
+        return parsed
+    return _extract_json_loose(chunk)
 
 
 @dataclass
@@ -87,6 +143,7 @@ class GeminiClient:
     last_error: str = ""
     last_error_at: str = ""
     last_raw_preview: str = ""
+    last_finish_reason: str = ""
 
     def status(self) -> dict[str, Any]:
         return {
@@ -106,6 +163,7 @@ class GeminiClient:
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
             "last_raw_preview": self.last_raw_preview,
+            "last_finish_reason": self.last_finish_reason,
         }
 
     def _call(self, prompt: str, temperature: float = 0.2, max_tokens: int = 1024) -> str:
@@ -145,9 +203,11 @@ class GeminiClient:
             raise
 
         text = ""
+        finish_reason = ""
         try:
             candidates = data.get("candidates") or []
             if candidates:
+                finish_reason = str((candidates[0] or {}).get("finishReason") or "")
                 parts = (((candidates[0] or {}).get("content") or {}).get("parts") or [])
                 if parts:
                     text = str((parts[0] or {}).get("text") or "")
@@ -165,6 +225,7 @@ class GeminiClient:
         self.last_error = ""
         self.last_error_at = ""
         self.last_raw_preview = (text or "")[:1000]
+        self.last_finish_reason = finish_reason
         return text
 
     def ping(self) -> dict[str, Any]:
@@ -201,6 +262,8 @@ class GeminiClient:
         parsed = _extract_json(raw)
         if not parsed:
             parsed = _extract_json_loose(raw)
+        if not parsed:
+            parsed = _extract_balanced_json(raw)
         if parsed:
             return parsed
 
@@ -215,7 +278,25 @@ class GeminiClient:
         if not parsed:
             parsed = _extract_json_loose(repair_raw)
         if not parsed:
-            raise RuntimeError("LLM JSON 파싱 실패")
+            parsed = _extract_balanced_json(repair_raw)
+        if parsed:
+            return parsed
+
+        # 마지막 재시도: 원 프롬프트를 더 강한 JSON 제약으로 재호출
+        strict_prompt = (
+            "반드시 유효한 JSON 객체 하나만 반환하세요. "
+            "설명/주석/코드펜스/추가 텍스트 금지.\n\n"
+            + prompt
+        )
+        strict_raw = self._call(strict_prompt, temperature=0.0, max_tokens=max_tokens)
+        parsed = _extract_json(strict_raw)
+        if not parsed:
+            parsed = _extract_json_loose(strict_raw)
+        if not parsed:
+            parsed = _extract_balanced_json(strict_raw)
+        if not parsed:
+            finish_reason = self.last_finish_reason or "-"
+            raise RuntimeError(f"LLM JSON 파싱 실패 (finish_reason={finish_reason})")
         return parsed
 
 

@@ -791,6 +791,103 @@ def _dedup_preserve(items: list[str], limit: int = 10) -> list[str]:
     return out
 
 
+def _slice_turns_by_id_range(turns: list[dict[str, Any]], start_id: int, end_id: int) -> list[dict[str, Any]]:
+    if not turns:
+        return []
+    s = int(start_id or 0)
+    e = int(end_id or 0)
+    if s <= 0 and e <= 0:
+        return list(turns)
+    if e > 0 and e < s:
+        e = s
+    out: list[dict[str, Any]] = []
+    for t in turns:
+        tid = int(t.get("turn_id") or 0)
+        if tid <= 0:
+            continue
+        if s > 0 and tid < s:
+            continue
+        if e > 0 and tid > e:
+            continue
+        out.append(t)
+    return out
+
+
+def _compact_summary_line(text: str, max_len: int = 90) -> str:
+    s = _safe_text(text)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"^(음|어|네|예|일단|그러면|그럼|근데|그러니까)\s+", "", s)
+    if len(s) > max_len:
+        s = s[: max_len - 1].rstrip() + "…"
+    return _safe_text(s)
+
+
+def _enrich_outcome_summary(
+    rt: RuntimeStore,
+    row: dict[str, Any],
+    turns: list[dict[str, Any]],
+) -> dict[str, Any]:
+    out = dict(row)
+    start_id = int(out.get("_start_turn_id") or out.get("start_turn_id") or 0)
+    end_id = int(out.get("_end_turn_id") or out.get("end_turn_id") or 0)
+    seg_turns = _slice_turns_by_id_range(turns, start_id, end_id)
+    if not seg_turns:
+        return out
+
+    keywords = _dedup_preserve([_safe_text(k) for k in out.get("agenda_keywords") or []], limit=6)
+    if len(keywords) < 3:
+        extra = _top_keywords_from_rows(seg_turns, rt.meeting_goal, limit=6)
+        keywords = _dedup_preserve(keywords + extra, limit=6)
+    out["agenda_keywords"] = keywords
+
+    refs = _pick_key_refs(seg_turns, keywords, max_items=8)
+
+    key_utterances = _dedup_preserve([_safe_text(x) for x in out.get("key_utterances") or []], limit=8)
+    if len(key_utterances) < 3:
+        auto_key = [f"[{_safe_text(r.get('timestamp'))}] {_safe_text(r.get('quote'))}" for r in refs[:6]]
+        key_utterances = _dedup_preserve(key_utterances + auto_key, limit=8)
+    out["key_utterances"] = key_utterances
+
+    summary_items = _dedup_preserve([_safe_text(x) for x in out.get("_summary_items") or []], limit=6)
+    summary_refs = [dict(x) for x in (out.get("summary_references") or []) if isinstance(x, dict)]
+
+    has_min_summary = len(summary_items) >= 2
+    has_min_refs = len(summary_refs) >= 2
+    if (not has_min_summary) or (not has_min_refs):
+        auto_items: list[str] = []
+        auto_refs: list[dict[str, Any]] = []
+        for idx, ref in enumerate(refs[:6]):
+            quote = _compact_summary_line(_safe_text(ref.get("quote")))
+            if not quote:
+                continue
+            ts = _safe_text(ref.get("timestamp"), _now_ts())
+            auto_items.append(f"[{ts}] {quote}")
+            auto_refs.append(
+                {
+                    "turn_id": int(ref.get("turn_id") or 0),
+                    "speaker": _safe_text(ref.get("speaker"), "화자"),
+                    "timestamp": ts,
+                    "quote": _safe_text(ref.get("quote")),
+                    "why": quote,
+                }
+            )
+            if idx >= 3:
+                break
+
+        if not has_min_summary:
+            summary_items = _dedup_preserve(summary_items + auto_items, limit=6)
+        if not has_min_refs:
+            summary_refs = summary_refs + auto_refs
+
+    if not summary_refs:
+        summary_refs = [_ref_from_turn(seg_turns[-1], why="요약 근거")]
+    out["_summary_items"] = _dedup_preserve(summary_items, limit=6)
+    out["summary_references"] = summary_refs[:10]
+    if not _safe_text(out.get("summary")):
+        out["summary"] = " • ".join(x.split("] ", 1)[-1] for x in out["_summary_items"][:3])
+    return out
+
+
 def _build_local_outcomes(rt: RuntimeStore, turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     segments = _segment_turns(turns)
     if not segments and turns:
@@ -849,6 +946,133 @@ def _build_local_outcomes(rt: RuntimeStore, turns: list[dict[str, Any]]) -> list
         )
 
     return outcomes
+
+
+def _normalize_outcome_ranges(
+    outcomes: list[dict[str, Any]],
+    min_turn_id: int,
+    max_turn_id: int,
+) -> list[dict[str, Any]]:
+    cleaned = [dict(row) for row in outcomes if isinstance(row, dict)]
+    if not cleaned:
+        return []
+    cleaned.sort(key=lambda x: int(x.get("_start_turn_id") or x.get("start_turn_id") or 10**9))
+
+    lo = int(min_turn_id or 1)
+    hi = int(max(max_turn_id, lo))
+    prev_end = lo - 1
+
+    for idx, row in enumerate(cleaned):
+        start_id = int(row.get("_start_turn_id") or row.get("start_turn_id") or 0)
+        end_id = int(row.get("_end_turn_id") or row.get("end_turn_id") or 0)
+
+        if start_id <= 0:
+            start_id = prev_end + 1 if prev_end >= lo else lo
+        start_id = max(start_id, prev_end + 1, lo)
+        start_id = min(start_id, hi)
+
+        if end_id < start_id:
+            end_id = start_id
+        end_id = max(start_id, min(end_id, hi))
+
+        row["_start_turn_id"] = start_id
+        row["_end_turn_id"] = end_id
+        prev_end = end_id
+
+    for idx, row in enumerate(cleaned[:-1]):
+        next_start = int(cleaned[idx + 1].get("_start_turn_id") or 0)
+        start_id = int(row.get("_start_turn_id") or 0)
+        end_id = int(row.get("_end_turn_id") or 0)
+        if next_start > 0 and end_id >= next_start:
+            row["_end_turn_id"] = max(start_id, next_start - 1)
+
+    if cleaned:
+        cleaned[0]["_start_turn_id"] = lo
+        last_start = int(cleaned[-1].get("_start_turn_id") or lo)
+        cleaned[-1]["_end_turn_id"] = max(last_start, hi)
+
+    return cleaned
+
+
+def _refine_outcomes_by_density(
+    rt: RuntimeStore,
+    outcomes: list[dict[str, Any]],
+    turns: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    if not outcomes or not turns:
+        return outcomes, ""
+
+    turn_ids = [int(t.get("turn_id") or 0) for t in turns if int(t.get("turn_id") or 0) > 0]
+    if not turn_ids:
+        return outcomes, ""
+
+    min_turn = min(turn_ids)
+    max_turn = max(turn_ids)
+    total_turns = max_turn - min_turn + 1
+    if total_turns <= 0:
+        return outcomes, ""
+
+    normalized = _normalize_outcome_ranges(outcomes, min_turn, max_turn)
+    if not normalized:
+        return outcomes, ""
+
+    # 대화 길이에 맞춰 최소 안건 수와 최대 안건 폭을 동적으로 조정한다.
+    expected_min = 1 if total_turns < 90 else max(2, min(10, round(total_turns / 90)))
+    max_span = 120 if total_turns < 220 else max(130, min(240, int(total_turns * 0.33)))
+    split_min_span = 75 if total_turns < 220 else max(85, int(total_turns * 0.14))
+
+    turn_map = {int(t.get("turn_id") or 0): t for t in turns}
+    adjusted: list[dict[str, Any]] = []
+    split_rows = 0
+
+    for row in normalized:
+        start_id = int(row.get("_start_turn_id") or 0)
+        end_id = int(row.get("_end_turn_id") or 0)
+        span = end_id - start_id + 1
+        need_more = len(normalized) < expected_min
+        should_split = span > max_span or (need_more and span >= split_min_span)
+
+        if not should_split:
+            adjusted.append(row)
+            continue
+
+        seg_turns = [turn_map[i] for i in range(start_id, end_id + 1) if i in turn_map]
+        if len(seg_turns) < 40:
+            adjusted.append(row)
+            continue
+
+        local_rows = _build_local_outcomes(rt, seg_turns)
+        local_rows = _normalize_outcome_ranges(local_rows, start_id, end_id)
+        if len(local_rows) <= 1:
+            adjusted.append(row)
+            continue
+
+        base_state = _normalize_agenda_state(row.get("agenda_state"))
+        for idx, local in enumerate(local_rows):
+            merged = dict(local)
+            if base_state in {"ACTIVE", "CLOSING"}:
+                merged["agenda_state"] = "ACTIVE" if idx == len(local_rows) - 1 else "CLOSED"
+            elif base_state == "CLOSED":
+                merged["agenda_state"] = "CLOSED"
+            else:
+                merged["agenda_state"] = base_state
+            adjusted.append(merged)
+        split_rows += len(local_rows) - 1
+
+    adjusted = _normalize_outcome_ranges(adjusted, min_turn, max_turn)
+    if not adjusted:
+        return normalized, ""
+
+    if len(adjusted) < expected_min and total_turns >= 160:
+        local_all = _build_local_outcomes(rt, turns)
+        local_all = _normalize_outcome_ranges(local_all, min_turn, max_turn)
+        if len(local_all) > len(adjusted):
+            return local_all, f"LLM 안건 수가 적어 로컬 경계 보정 적용({len(local_all)}개)"
+
+    if split_rows > 0:
+        return adjusted, f"과대 안건 범위 자동 분할 적용(+{split_rows})"
+
+    return adjusted, ""
 
 
 def _apply_outcomes(rt: RuntimeStore, outcomes: list[dict[str, Any]]) -> None:
@@ -922,6 +1146,9 @@ def _to_ids(raw_ids: Any) -> list[int]:
 
 def _build_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], current_agenda_title: str, mode: str = "windowed") -> str:
     meeting_goal = _safe_text(rt.meeting_goal, "미정")
+    turn_count = len(turns)
+    agenda_hint_min = 1 if turn_count < 90 else max(2, min(10, round(turn_count / 100)))
+    agenda_hint_max = max(agenda_hint_min, min(12, agenda_hint_min + 3))
     lines = []
     for turn in turns:
         lines.append(
@@ -950,6 +1177,11 @@ def _build_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], current_agenda_
 8) 각 안건은 start_turn_id/end_turn_id를 반드시 포함하고, 안건 간 구간은 시간순/비중첩으로 작성한다.
 9) agenda_summary_items는 해당 안건 구간(end_turn_id 이전)에서만 요약하고, 각 요약문마다 evidence_turn_ids를 넣는다.
 10) 분석 모드가 full_document이면, 발화 전체를 끝까지 보고 안건을 한 번에 완성한다. 중간 단계 안건 생성은 금지한다.
+11) full_document에서는 총 발화 수({turn_count})를 고려해 안건 수를 동적으로 잡아라. 권장 안건 수는 {agenda_hint_min}~{agenda_hint_max}개이며, 마지막 안건만 과도하게 길어지지 않게 분할한다.
+12) 출력 길이 제한을 위해 항목 수를 지켜라: key_utterance_turn_ids 최대 6, agenda_summary_items 최대 4, 각 evidence_turn_ids 최대 3, decision_results 최대 3, action_items 최대 4.
+13) 요약/의견/결론 문장은 짧게 작성하고, 원문 장문 인용은 금지한다.
+14) 각 안건은 agenda_summary_items를 최소 2개(가능하면 3~4개) 채워라. 후반 안건도 동일하게 작성한다.
+15) 각 summary item의 evidence_turn_ids는 반드시 해당 안건의 start_turn_id~end_turn_id 범위 안에서만 선택한다.
 
 [출력 JSON 스키마]
 {{
@@ -1048,7 +1280,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
     prompt = _build_prompt(rt, turns, current_title, mode=mode)
 
     try:
-        parsed = client.generate_json(prompt, temperature=0.1, max_tokens=6000)
+        parsed = client.generate_json(prompt, temperature=0.1, max_tokens=7000)
     except Exception as exc:
         return _run_local_fallback(rt, force=force, reason=f"LLM 오류: {exc}", mode=mode)
 
@@ -1186,11 +1418,20 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
     if not outcomes:
         return _run_local_fallback(rt, force=force, reason="LLM agendas 파싱 실패", mode=mode)
 
+    outcomes, refine_note = _refine_outcomes_by_density(rt, outcomes, turns)
+    if not outcomes:
+        return _run_local_fallback(rt, force=force, reason="안건 보정 실패", mode=mode)
+
+    enriched: list[dict[str, Any]] = []
+    for row in outcomes:
+        enriched.append(_enrich_outcome_summary(rt, row, turns))
+    outcomes = enriched
+
     _apply_outcomes(rt, outcomes)
 
     rt.last_analyzed_count = len(rt.transcript)
     rt.used_local_fallback = False
-    rt.last_analysis_warning = ""
+    rt.last_analysis_warning = _safe_text(refine_note)
     rt.last_tick_mode = "full_document" if mode == "full_document" else "windowed"
     return True
 
