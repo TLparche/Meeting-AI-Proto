@@ -118,6 +118,48 @@ STOPWORDS = {
     "틀에서",
     "party",
     "name",
+    "있는",
+    "되는",
+    "번째",
+    "우리가",
+    "굉장히",
+    "아마",
+    "거",
+    "것",
+    "수",
+    "등",
+    "이런식",
+    "그런식",
+    "해당",
+    "관련된",
+    "통해",
+    "기반",
+    "위해",
+    "정리",
+    "내용",
+    "사항",
+    "부분은",
+    "부분이",
+    "부분을",
+    "정도는",
+    "다음으로",
+    "그리고요",
+    "그러고",
+    "아니면",
+    "진행",
+    "완료",
+    "중인",
+    "그니까",
+    "보면",
+    "어떻게",
+    "좋은",
+    "바로",
+    "그러니",
+    "그런데",
+    "company",
+    "companies",
+    "thing",
+    "things",
 }
 
 DECISION_PAT = re.compile(r"(결정|확정|합의|채택|의결|하기로|정리하면|정하자)")
@@ -175,7 +217,8 @@ def _topic_far_enough(current_title: str, new_title: str) -> bool:
 
 def _keyword_tokens(text: str) -> list[str]:
     out: list[str] = []
-    for tok in re.findall(r"[A-Za-z0-9가-힣]{2,}", _safe_text(text).lower()):
+    for raw_tok in re.findall(r"[A-Za-z0-9가-힣]{2,}", _safe_text(text).lower()):
+        tok = _normalize_keyword_token(raw_tok)
         if tok.isdigit():
             continue
         if tok in STOPWORDS:
@@ -234,21 +277,128 @@ def _top_keywords_from_rows(
     return [k for k, _ in cnt.most_common(limit)]
 
 
+TITLE_NOISE_TOKENS = {
+    "있는",
+    "되는",
+    "번째",
+    "우리가",
+    "굉장히",
+    "아마",
+    "내용",
+    "부분",
+    "정리",
+    "사항",
+    "진행",
+    "완료",
+    "중인",
+    "관련",
+    "논의",
+    "이슈",
+    "그니까",
+    "보면",
+    "어떻게",
+    "좋은",
+    "바로",
+    "company",
+    "companies",
+    "thing",
+    "things",
+}
+
+TITLE_TOKEN_MAP = {
+    "company": "기업",
+    "companies": "기업",
+    "investment": "투자",
+    "investments": "투자",
+    "market": "시장",
+    "economy": "경제",
+    "policy": "정책",
+    "startup": "스타트업",
+    "startups": "스타트업",
+}
+
+
+def _normalize_keyword_token(raw_tok: str) -> str:
+    tok = _safe_text(raw_tok).lower()
+    if not tok:
+        return ""
+    tok = TITLE_TOKEN_MAP.get(tok, tok)
+    # 조사/어미로 인한 파편화를 줄인다.
+    for suf in ("으로", "에서", "에게", "처럼", "까지", "부터", "하고", "랑", "와", "과", "을", "를", "은", "는", "이", "가", "도", "로", "에"):
+        if len(tok) > 2 and tok.endswith(suf):
+            tok = tok[: -len(suf)]
+            break
+    return tok
+
+
+def _is_title_keyword_noise(tok: str) -> bool:
+    t = _normalize_keyword_token(tok)
+    if not t:
+        return True
+    if t in STOPWORDS or t in TITLE_NOISE_TOKENS:
+        return True
+    if len(t) < 2:
+        return True
+    if re.fullmatch(r".*(하는|되는|있는|같은|보는|보면|좋은)$", t):
+        return True
+    if re.fullmatch(r"\d+", t):
+        return True
+    if re.fullmatch(r"(name|party)\d*", t):
+        return True
+    return False
+
+
+def _usable_title_keywords(keywords: list[str] | None, meeting_goal: str) -> list[str]:
+    goal_tokens = _tokens(meeting_goal)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in keywords or []:
+        tok = _normalize_keyword_token(raw)
+        if not tok or tok in seen:
+            continue
+        if tok in goal_tokens:
+            continue
+        if _is_title_keyword_noise(tok):
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def _is_low_quality_title(title: str, meeting_goal: str) -> bool:
+    txt = _safe_text(title)
+    if not txt:
+        return True
+    goal = _safe_text(meeting_goal)
+    if goal and txt == goal:
+        return True
+    toks = [_normalize_keyword_token(t) for t in re.findall(r"[A-Za-z0-9가-힣]{2,}", txt.lower())]
+    toks = [t for t in toks if t]
+    meaningful = [t for t in toks if not _is_title_keyword_noise(t) and t not in _tokens(goal)]
+    if meaningful:
+        if len(meaningful) == 1 and len(toks) >= 3:
+            return True
+        return False
+    # 의미 토큰이 없으면 품질이 낮다고 판단
+    return True
+
+
 def _clean_agenda_title(raw_title: Any, meeting_goal: str = "", keywords: list[str] | None = None) -> str:
     title = _safe_text(raw_title)
     title = re.sub(r"^[0-9]+[.)]\s*", "", title).strip(" -:|")
     title = re.sub(r"\s+", " ", title)
 
-    kws = [k for k in (keywords or []) if _safe_text(k)]
     goal = _safe_text(meeting_goal)
-    goal_tokens = _tokens(goal)
-    usable = [k for k in kws if k not in goal_tokens]
+    usable = _usable_title_keywords([_safe_text(k) for k in (keywords or [])], meeting_goal)
 
-    if not title:
-        if len(usable) >= 2:
-            title = f"{usable[0]} · {usable[1]} 논의"
-        elif len(usable) == 1:
-            title = f"{usable[0]} 중심 논의"
+    raw_title_tokens = _usable_title_keywords(re.findall(r"[A-Za-z0-9가-힣]{2,}", title), meeting_goal)
+    basis = usable if len(usable) >= 2 else raw_title_tokens
+
+    if (not title) or _is_low_quality_title(title, meeting_goal):
+        if len(basis) >= 2:
+            title = f"{basis[0]} · {basis[1]} 논의"
+        elif len(basis) == 1:
+            title = f"{basis[0]} 핵심 쟁점"
         else:
             title = "세부 쟁점 논의"
 
@@ -420,8 +570,8 @@ def _refresh_analysis(rt: RuntimeStore) -> dict[str, Any]:
                 "agenda_title": _safe_text(row.get("agenda_title"), "아젠다 미정"),
                 "agenda_state": _safe_text(row.get("agenda_state"), "PROPOSED"),
                 "flow_type": _safe_text(row.get("flow_type")),
-                "key_utterances": key_utterances[-8:],
-                "agenda_summary_items": summary_items[-8:],
+                "key_utterances": key_utterances,
+                "agenda_summary_items": summary_items,
                 "summary": summary,
                 "summary_references": list(row.get("summary_references") or []),
                 "agenda_keywords": list(row.get("agenda_keywords") or []),
@@ -691,7 +841,7 @@ def _segment_turns(turns: list[dict[str, Any]]) -> list[tuple[int, int]]:
     return segments
 
 
-def _pick_key_utterances(turns: list[dict[str, Any]], keywords: list[str], max_items: int = 6) -> list[str]:
+def _pick_key_utterances(turns: list[dict[str, Any]], keywords: list[str], max_items: int = 20) -> list[str]:
     scored: list[tuple[float, int, str]] = []
     kw = [k.lower() for k in keywords[:8]]
     for idx, t in enumerate(turns):
@@ -842,13 +992,13 @@ def _enrich_outcome_summary(
 
     refs = _pick_key_refs(seg_turns, keywords, max_items=8)
 
-    key_utterances = _dedup_preserve([_safe_text(x) for x in out.get("key_utterances") or []], limit=8)
+    key_utterances = _dedup_preserve([_safe_text(x) for x in out.get("key_utterances") or []], limit=20)
     if len(key_utterances) < 3:
-        auto_key = [f"[{_safe_text(r.get('timestamp'))}] {_safe_text(r.get('quote'))}" for r in refs[:6]]
-        key_utterances = _dedup_preserve(key_utterances + auto_key, limit=8)
+        auto_key = [f"[{_safe_text(r.get('timestamp'))}] {_safe_text(r.get('quote'))}" for r in refs[:12]]
+        key_utterances = _dedup_preserve(key_utterances + auto_key, limit=20)
     out["key_utterances"] = key_utterances
 
-    summary_items = _dedup_preserve([_safe_text(x) for x in out.get("_summary_items") or []], limit=6)
+    summary_items = _dedup_preserve([_safe_text(x) for x in out.get("_summary_items") or []], limit=20)
     summary_refs = [dict(x) for x in (out.get("summary_references") or []) if isinstance(x, dict)]
 
     has_min_summary = len(summary_items) >= 2
@@ -856,7 +1006,7 @@ def _enrich_outcome_summary(
     if (not has_min_summary) or (not has_min_refs):
         auto_items: list[str] = []
         auto_refs: list[dict[str, Any]] = []
-        for idx, ref in enumerate(refs[:6]):
+        for idx, ref in enumerate(refs[:12]):
             quote = _compact_summary_line(_safe_text(ref.get("quote")))
             if not quote:
                 continue
@@ -871,20 +1021,20 @@ def _enrich_outcome_summary(
                     "why": quote,
                 }
             )
-            if idx >= 3:
+            if idx >= 9:
                 break
 
         if not has_min_summary:
-            summary_items = _dedup_preserve(summary_items + auto_items, limit=6)
+            summary_items = _dedup_preserve(summary_items + auto_items, limit=20)
         if not has_min_refs:
             summary_refs = summary_refs + auto_refs
 
     if not summary_refs:
         summary_refs = [_ref_from_turn(seg_turns[-1], why="요약 근거")]
-    out["_summary_items"] = _dedup_preserve(summary_items, limit=6)
-    out["summary_references"] = summary_refs[:10]
+    out["_summary_items"] = _dedup_preserve(summary_items, limit=20)
+    out["summary_references"] = summary_refs[:24]
     if not _safe_text(out.get("summary")):
-        out["summary"] = " • ".join(x.split("] ", 1)[-1] for x in out["_summary_items"][:3])
+        out["summary"] = " • ".join(x.split("] ", 1)[-1] for x in out["_summary_items"][:10])
     return out
 
 
@@ -916,9 +1066,9 @@ def _build_local_outcomes(rt: RuntimeStore, turns: list[dict[str, Any]]) -> list
 
         key_refs = _pick_key_refs(seg_turns, keywords, max_items=8)
         key_utterances = [f"[{_safe_text(r.get('timestamp'))}] {_safe_text(r.get('quote'))}" for r in key_refs]
-        summary_refs = key_refs[:4] if key_refs else [_ref_from_turn(seg_turns[-1])]
+        summary_refs = key_refs[:10] if key_refs else [_ref_from_turn(seg_turns[-1])]
         summary_items = [f"[{_safe_text(r.get('timestamp'))}] {_safe_text(r.get('quote'))}" for r in summary_refs]
-        summary = " • ".join(item.split("] ", 1)[-1] for item in summary_items[:3])
+        summary = " • ".join(item.split("] ", 1)[-1] for item in summary_items[:10])
         decisions = _extract_decisions_from_turns(seg_turns, max_items=4)
         actions = _extract_actions_from_turns(seg_turns, max_items=6)
 
@@ -933,8 +1083,8 @@ def _build_local_outcomes(rt: RuntimeStore, turns: list[dict[str, Any]]) -> list
                 "agenda_title": title,
                 "agenda_state": "ACTIVE" if seg_idx == len(segments) - 1 else "CLOSED",
                 "flow_type": flow_type,
-                "key_utterances": _dedup_preserve(key_utterances, limit=8),
-                "_summary_items": _dedup_preserve(summary_items, limit=6),
+                "key_utterances": _dedup_preserve(key_utterances, limit=20),
+                "_summary_items": _dedup_preserve(summary_items, limit=20),
                 "summary_references": summary_refs,
                 "summary": _safe_text(summary),
                 "agenda_keywords": _dedup_preserve(keywords, limit=6),
@@ -1123,8 +1273,8 @@ def _apply_outcomes(rt: RuntimeStore, outcomes: list[dict[str, Any]]) -> None:
     for row in cleaned:
         created = _create_agenda(rt, _safe_text(row.get("agenda_title"), "세부 쟁점 논의"), _normalize_agenda_state(row.get("agenda_state")))
         created["flow_type"] = _safe_text(row.get("flow_type"))
-        created["key_utterances"] = _dedup_preserve(list(row.get("key_utterances") or []), limit=8)
-        created["_summary_items"] = _dedup_preserve(list(row.get("_summary_items") or []), limit=6)
+        created["key_utterances"] = _dedup_preserve(list(row.get("key_utterances") or []), limit=20)
+        created["_summary_items"] = _dedup_preserve(list(row.get("_summary_items") or []), limit=20)
         created["summary_references"] = list(row.get("summary_references") or [])
         created["summary"] = _safe_text(row.get("summary"))
         created["agenda_keywords"] = _dedup_preserve(list(row.get("agenda_keywords") or []), limit=6)
@@ -1178,9 +1328,9 @@ def _build_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], current_agenda_
 9) agenda_summary_items는 해당 안건 구간(end_turn_id 이전)에서만 요약하고, 각 요약문마다 evidence_turn_ids를 넣는다.
 10) 분석 모드가 full_document이면, 발화 전체를 끝까지 보고 안건을 한 번에 완성한다. 중간 단계 안건 생성은 금지한다.
 11) full_document에서는 총 발화 수({turn_count})를 고려해 안건 수를 동적으로 잡아라. 권장 안건 수는 {agenda_hint_min}~{agenda_hint_max}개이며, 마지막 안건만 과도하게 길어지지 않게 분할한다.
-12) 출력 길이 제한을 위해 항목 수를 지켜라: key_utterance_turn_ids 최대 6, agenda_summary_items 최대 4, 각 evidence_turn_ids 최대 3, decision_results 최대 3, action_items 최대 4.
+12) key_utterance_turn_ids, agenda_summary_items는 고정 개수로 제한하지 말고, 안건에 의미 있는 내용이 있으면 가능한 만큼 반영하라.
 13) 요약/의견/결론 문장은 짧게 작성하고, 원문 장문 인용은 금지한다.
-14) 각 안건은 agenda_summary_items를 최소 2개(가능하면 3~4개) 채워라. 후반 안건도 동일하게 작성한다.
+14) 각 안건은 agenda_summary_items를 최소 2개 이상 작성하되, 핵심 내용이 더 많으면 그만큼 추가하라.
 15) 각 summary item의 evidence_turn_ids는 반드시 해당 안건의 start_turn_id~end_turn_id 범위 안에서만 선택한다.
 
 [출력 JSON 스키마]
@@ -1317,7 +1467,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
             refs = _extract_refs(rt, _to_ids(it.get("evidence_turn_ids")), turns)
             if refs:
                 summary_items.append(f"[{refs[0]['timestamp']}] {txt}")
-                for ref in refs[:3]:
+                for ref in refs[:6]:
                     summary_references.append(
                         {
                             "turn_id": int(ref.get("turn_id") or 0),
@@ -1330,9 +1480,9 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
             else:
                 summary_items.append(txt)
         if not summary_items:
-            summary_items = key_utterances[:4]
+            summary_items = key_utterances[:10]
         if not summary_references:
-            for ref in key_refs[:4]:
+            for ref in key_refs[:10]:
                 summary_references.append(
                     {
                         "turn_id": 0,
@@ -1380,13 +1530,13 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
             actions.append({"item": item, "owner": owner, "due": due, "reasons": reasons})
 
         if not keywords:
-            synthetic_rows = [{"text": x.split("] ", 1)[-1]} for x in summary_items[:4]]
+            synthetic_rows = [{"text": x.split("] ", 1)[-1]} for x in summary_items[:10]]
             keywords = _top_keywords_from_rows(synthetic_rows, rt.meeting_goal, limit=6)
         if not key_utterances and turns:
             pick_idx = min(len(turns) - 1, idx * max(1, len(turns) // max(1, len(raw_agendas))))
             key_utterances = [_format_line_from_turn(turns[pick_idx])]
 
-        summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:3])
+        summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:10])
         all_ids = _to_ids(agenda.get("key_utterance_turn_ids"))
         for s_item in agenda.get("agenda_summary_items") or []:
             if isinstance(s_item, dict):
@@ -1403,9 +1553,9 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
                 "agenda_title": title,
                 "agenda_state": state,
                 "flow_type": _safe_text(agenda.get("flow_type"), "discussion"),
-                "key_utterances": _dedup_preserve(key_utterances, limit=8),
-                "_summary_items": _dedup_preserve(summary_items, limit=6),
-                "summary_references": summary_references[:8],
+                "key_utterances": _dedup_preserve(key_utterances, limit=20),
+                "_summary_items": _dedup_preserve(summary_items, limit=20),
+                "summary_references": summary_references[:24],
                 "summary": _safe_text(summary),
                 "agenda_keywords": _dedup_preserve(keywords, limit=6),
                 "decision_results": decisions,

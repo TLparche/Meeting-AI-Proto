@@ -1008,6 +1008,97 @@ h4 {
   white-space: nowrap;
 }
 
+.summaryOpinionBlock {
+  margin-top: 6px;
+  margin-left: 2px;
+  border-left: 2px solid #d8e2f8;
+  padding-left: 8px;
+}
+
+.summaryOpinionList {
+  margin: 4px 0 2px;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.summaryOpinionList li {
+  display: block;
+}
+
+.opinionSummaryButton {
+  width: 100%;
+  border: 1px solid #dce4f5;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 6px 8px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+  font-size: 0.82rem;
+  color: #344054;
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+.opinionSummaryButton:hover {
+  border-color: #c7d6f3;
+  background: #f8fbff;
+}
+
+.opinionDetail {
+  grid-column: 2 / 4;
+  font-size: 0.76rem;
+  color: #5d6d8e;
+}
+
+.opinionTypeChip {
+  border-color: #cfd8ee;
+  color: #2b3c63;
+  background: #f4f7ff;
+  white-space: nowrap;
+}
+
+.opinionType-proposal {
+  background: #e9f7ef;
+  border-color: #c8ead7;
+  color: #1f6a42;
+}
+
+.opinionType-concern {
+  background: #fff3e7;
+  border-color: #f3d7b7;
+  color: #8a4a12;
+}
+
+.opinionType-question {
+  background: #eef5ff;
+  border-color: #ccddff;
+  color: #224f94;
+}
+
+.opinionType-agree {
+  background: #eaf4ff;
+  border-color: #cfe2ff;
+  color: #1f4a86;
+}
+
+.opinionType-disagree {
+  background: #ffeef0;
+  border-color: #f5c7cf;
+  color: #97283b;
+}
+
+.opinionType-info {
+  background: #f3f4f7;
+  border-color: #dde0e8;
+  color: #4c5568;
+}
+
 .mutedLabel {
   margin: 0;
   font-size: 0.78rem;

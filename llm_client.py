@@ -4,6 +4,7 @@ import json
 import os
 import re
 import ast
+import random
 import threading
 import time
 import urllib.error
@@ -144,6 +145,7 @@ class GeminiClient:
     last_error_at: str = ""
     last_raw_preview: str = ""
     last_finish_reason: str = ""
+    last_http_status: int = 0
 
     def status(self) -> dict[str, Any]:
         return {
@@ -164,6 +166,7 @@ class GeminiClient:
             "last_error_at": self.last_error_at,
             "last_raw_preview": self.last_raw_preview,
             "last_finish_reason": self.last_finish_reason,
+            "last_http_status": self.last_http_status,
         }
 
     def _call(self, prompt: str, temperature: float = 0.2, max_tokens: int = 1024) -> str:
@@ -174,33 +177,80 @@ class GeminiClient:
         self.last_request_at = _now_iso()
         self.last_operation = "generate_content"
 
-        url = f"{self.base_url}/models/{self.model}:generateContent?key={urllib.parse.quote(self.api_key)}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
-                "responseMimeType": "application/json",
-            },
-        }
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
+        timeout_sec = max(20, int(os.environ.get("GEMINI_TIMEOUT_SEC", "60")))
+        max_retries = max(1, int(os.environ.get("GEMINI_MAX_RETRIES", "4")))
+        retry_base = max(0.2, float(os.environ.get("GEMINI_RETRY_BASE_SEC", "1.0")))
+        fallback_models = [
+            m.strip()
+            for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.0-flash-lite,gemini-1.5-flash").split(",")
+            if m.strip()
+        ]
+        model_candidates = [self.model] + [m for m in fallback_models if m != self.model]
 
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
+        last_error_msg = "알 수 없는 오류"
+        last_status = 0
+        data: dict[str, Any] | None = None
+
+        for model_name in model_candidates:
+            for attempt in range(1, max_retries + 1):
+                data = None
+                url = f"{self.base_url}/models/{model_name}:generateContent?key={urllib.parse.quote(self.api_key)}"
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": temperature,
+                        "maxOutputTokens": max_tokens,
+                        "responseMimeType": "application/json",
+                    },
+                }
+                body = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(url, data=body, method="POST")
+                req.add_header("Content-Type", "application/json")
+
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    # fallback 모델이 성공하면 이후 기본 모델로 승격
+                    if model_name != self.model:
+                        self.model = model_name
+                    self.last_http_status = 200
+                    break
+                except urllib.error.HTTPError as exc:
+                    detail = exc.read().decode("utf-8", errors="ignore")
+                    status = int(getattr(exc, "code", 0) or 0)
+                    last_status = status
+                    retryable = status in {429, 500, 502, 503, 504} or "UNAVAILABLE" in detail or "RESOURCE_EXHAUSTED" in detail
+                    last_error_msg = f"HTTP {status}: {detail[:500]}"
+
+                    if retryable and attempt < max_retries:
+                        sleep_sec = retry_base * (2 ** (attempt - 1)) + random.uniform(0.0, 0.35)
+                        self.last_error = f"{last_error_msg} (재시도 {attempt}/{max_retries}, {sleep_sec:.1f}s 대기)"
+                        self.last_error_at = _now_iso()
+                        time.sleep(sleep_sec)
+                        continue
+                    # 재시도 불가 에러는 현재 모델 시도 중단
+                    break
+                except Exception as exc:
+                    last_error_msg = str(exc)
+                    status = 0
+                    last_status = status
+                    if attempt < max_retries:
+                        sleep_sec = retry_base * (2 ** (attempt - 1)) + random.uniform(0.0, 0.35)
+                        self.last_error = f"{last_error_msg} (재시도 {attempt}/{max_retries}, {sleep_sec:.1f}s 대기)"
+                        self.last_error_at = _now_iso()
+                        time.sleep(sleep_sec)
+                        continue
+                    break
+
+            if data is not None:
+                break
+
+        if data is None:
             self.error_count += 1
-            self.last_error = f"HTTP {exc.code}: {detail[:500]}"
+            self.last_error = last_error_msg
             self.last_error_at = _now_iso()
-            raise RuntimeError(self.last_error) from exc
-        except Exception as exc:
-            self.error_count += 1
-            self.last_error = str(exc)
-            self.last_error_at = _now_iso()
-            raise
+            self.last_http_status = last_status
+            raise RuntimeError(self.last_error)
 
         text = ""
         finish_reason = ""

@@ -71,9 +71,22 @@ type SummaryPointMeta = {
   rangeLabel: string;
   turnIds: number[];
   references: AgendaOutcomeReason[];
+  opinionGroups: OpinionGroup[];
 };
 
 type SummaryFocusState = SummaryPointMeta & {
+  utterances: TranscriptUtterance[];
+};
+
+type OpinionType = "proposal" | "concern" | "question" | "agree" | "disagree" | "info";
+
+type OpinionGroup = {
+  id: string;
+  type: OpinionType;
+  typeLabel: string;
+  summary: string;
+  detail: string;
+  rangeLabel: string;
   utterances: TranscriptUtterance[];
 };
 
@@ -232,6 +245,275 @@ function quoteSimilar(a: string, b: string): boolean {
   if (tokens.length === 0) return false;
   const hitCount = tokens.filter((token) => right.includes(token)).length;
   return hitCount >= Math.min(3, Math.ceil(tokens.length * 0.6));
+}
+
+function compactLine(text: string, maxLen = 88): string {
+  const s = safeText(text).replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  if (s.length <= maxLen) return s;
+  return `${s.slice(0, maxLen - 1).trim()}…`;
+}
+
+const OPINION_SUMMARY_STOPWORDS = new Set([
+  "그냥",
+  "이제",
+  "근데",
+  "그러면",
+  "그니까",
+  "정도",
+  "부분",
+  "관련",
+  "대해서",
+  "있어요",
+  "있습니다",
+  "같아요",
+  "같습니다",
+  "좋아요",
+  "좋습니다",
+  "우리가",
+  "제가",
+  "저는",
+  "그거",
+  "이거",
+  "바로",
+  "어떻게",
+  "아마",
+  "씨",
+  "씨가",
+  "씨는",
+  "님",
+  "님이",
+  "님은",
+  "본인",
+  "본인의",
+  "관련된",
+  "의견",
+  "정보",
+  "공유",
+  "같은",
+  "보면",
+  "그러니까",
+  "company",
+  "companies",
+]);
+
+const OPINION_TOKEN_MAP: Record<string, string> = {
+  company: "기업",
+  companies: "기업",
+  investment: "투자",
+  investments: "투자",
+  market: "시장",
+  policy: "정책",
+};
+
+function normalizeOpinionToken(raw: string): string {
+  let tok = safeText(raw).toLowerCase();
+  if (!tok) return "";
+  tok = OPINION_TOKEN_MAP[tok] || tok;
+  for (const suf of ["으로", "에서", "에게", "처럼", "까지", "부터", "하고", "랑", "와", "과", "을", "를", "은", "는", "이", "가", "도", "로", "에"]) {
+    if (tok.length > 2 && tok.endsWith(suf)) {
+      tok = tok.slice(0, -suf.length);
+      break;
+    }
+  }
+  return tok;
+}
+
+function isOpinionNoiseToken(token: string): boolean {
+  const t = normalizeOpinionToken(token);
+  if (!t || t.length < 2) return true;
+  if (OPINION_SUMMARY_STOPWORDS.has(t)) return true;
+  if (/^(씨|님|본인|당사|우리|저희|제가|저는)$/.test(t)) return true;
+  if (/(같|보|되|하)$/.test(t) && t.length <= 3) return true;
+  if (/^\d+$/.test(t)) return true;
+  return false;
+}
+
+function opinionKeywords(lines: string[], limit = 2): string[] {
+  const freq = new Map<string, number>();
+  for (const line of lines) {
+    const tokens = tokenize(line);
+    for (const t of tokens) {
+      const tok = normalizeOpinionToken(t);
+      if (isOpinionNoiseToken(tok)) continue;
+      freq.set(tok, (freq.get(tok) || 0) + 1);
+    }
+  }
+  return Array.from(freq.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([k]) => k);
+}
+
+function normalizeOpinionLineForSummary(line: string): string {
+  let s = compactLine(line, 140);
+  s = s.replace(/^(저는|제가|저희는|저희가)\s+/g, "");
+  s = s.replace(/^(일단|그리고|근데|그니까|그러니까|음|어|네|예)\s+/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+function pickOpinionSummaryLines(lines: string[]): string[] {
+  const cleaned = lines.map((l) => normalizeOpinionLineForSummary(l)).filter(Boolean);
+  if (cleaned.length <= 1) return cleaned.slice(0, 1);
+
+  const freq = new Map<string, number>();
+  for (const line of cleaned) {
+    for (const tok of opinionKeywords([line], 20)) {
+      freq.set(tok, (freq.get(tok) || 0) + 1);
+    }
+  }
+
+  const scored = cleaned.map((line, idx) => {
+    const toks = opinionKeywords([line], 20);
+    const score = toks.reduce((acc, t) => acc + (freq.get(t) || 0), 0) + Math.min(line.length, 80) / 40;
+    return { idx, line, toks, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  const first = scored[0];
+  if (!first) return [];
+
+  let second: typeof first | null = null;
+  for (const cand of scored.slice(1)) {
+    const overlap = cand.toks.filter((t) => first.toks.includes(t)).length;
+    const novelty = cand.toks.length - overlap;
+    if (novelty >= 1) {
+      second = cand;
+      break;
+    }
+  }
+
+  if (!second) return [first.line];
+  return [first.line, second.line];
+}
+
+function summarizeOpinionGroup(type: OpinionType, lines: string[]): { summary: string; detail: string } {
+  if (lines.length === 0) return { summary: "의견 요약 없음", detail: "" };
+  const compactLines = lines.map((l) => compactLine(l, 92)).filter(Boolean);
+  const picked = pickOpinionSummaryLines(compactLines);
+  let summary = "";
+  if (picked.length === 0) {
+    summary = "의견 요약 없음";
+  } else if (picked.length === 1) {
+    summary = picked[0];
+  } else {
+    summary = `${picked[0]} ${picked[1]}`;
+  }
+
+  const sample = compactLines.slice(0, 2).join(" / ");
+  const detail = compactLine(sample, 110);
+  return { summary: compactLine(summary, 64), detail };
+}
+
+function isOpinionLike(text: string): boolean {
+  const line = safeText(text).toLowerCase();
+  if (!line || line.length < 8) return false;
+
+  const opinionHint = /(같아요|같습니다|생각|의견|우려|느낌|좋겠|필요|해야|하면|원해|제안|추천|선호|어떨까요|보여요|맞는 것|좋을 것|일 듯|가능할 것|추정)/;
+  const firstPersonHint = /(저는|제가|저희|우리는|개인적)/;
+  const factHint = /(\d+%|\d+명|\d+건|\d+월|\d+일|\d+시|지표|통계|매출|수치|보고서|근거|확인됨|발표|데이터)/;
+
+  if (opinionHint.test(line) || firstPersonHint.test(line)) return true;
+  if (factHint.test(line) && !opinionHint.test(line)) return false;
+  return /[?]|(하자|해요|합시다|보죠|볼까요)/.test(line);
+}
+
+function classifyOpinionType(text: string): { type: OpinionType; label: string } {
+  const line = safeText(text).toLowerCase();
+
+  const disagreePat = /(아니|반대|어렵|곤란|무리|힘들|불가|안 될|안될|하지 말|비추천)/;
+  const concernPat = /(우려|리스크|위험|문제|부담|걱정|불안|지연|이슈|한계|부족)/;
+  const questionPat = /(\?|어떨까요|가능할까요|맞나요|인가요|일까요|할까요|뭐가)/;
+  const proposalPat = /(제안|추천|좋겠|하면 좋|하자|합시다|해보|필요|우선|먼저|방안|대안)/;
+  const agreePat = /(동의|찬성|맞아요|맞습니다|좋아요|좋습니다|그대로 가|괜찮|맞는 것)/;
+
+  if (disagreePat.test(line)) return { type: "disagree", label: "반대/보류" };
+  if (concernPat.test(line)) return { type: "concern", label: "우려/리스크" };
+  if (questionPat.test(line)) return { type: "question", label: "질문/확인" };
+  if (proposalPat.test(line)) return { type: "proposal", label: "제안" };
+  if (agreePat.test(line)) return { type: "agree", label: "동의" };
+  return { type: "info", label: "의견/정보" };
+}
+
+function buildOpinionGroups(
+  agendaId: string,
+  pointId: string,
+  utterances: TranscriptUtterance[],
+  references: AgendaOutcomeReason[],
+): OpinionGroup[] {
+  const seed: TranscriptUtterance[] = [...utterances];
+  if (seed.length === 0) {
+    references.forEach((reason, idx) => {
+      const quote = safeText(reason.quote);
+      if (!quote) return;
+      const turnNum = Number(reason.turn_id || 0);
+      seed.push({
+        id: turnNum > 0 ? `utt-${turnNum}` : `ref-${pointId}-${idx + 1}`,
+        timestamp: safeText(reason.timestamp, "--:--"),
+        speaker: safeText(reason.speaker, "화자"),
+        text: quote,
+        agendaId,
+      });
+    });
+  }
+
+  const grouped = new Map<OpinionType, { typeLabel: string; items: TranscriptUtterance[] }>();
+  const seen = new Set<string>();
+  for (const u of seed) {
+    if (!isOpinionLike(u.text)) continue;
+    const compact = compactLine(u.text, 120);
+    const key = `${u.speaker}|${compact}`;
+    if (!compact || seen.has(key)) continue;
+    seen.add(key);
+    const cls = classifyOpinionType(compact);
+    const cur = grouped.get(cls.type);
+    if (!cur) {
+      grouped.set(cls.type, { typeLabel: cls.label, items: [u] });
+    } else {
+      cur.items.push(u);
+    }
+  }
+
+  const priority: Record<OpinionType, number> = {
+    proposal: 1,
+    concern: 2,
+    question: 3,
+    agree: 4,
+    disagree: 5,
+    info: 6,
+  };
+
+  const out: OpinionGroup[] = [];
+  for (const [type, payload] of grouped.entries()) {
+    const ordered = payload.items.slice().sort((a, b) => {
+      const ta = Number(a.id.replace("utt-", ""));
+      const tb = Number(b.id.replace("utt-", ""));
+      if (!Number.isNaN(ta) && !Number.isNaN(tb)) return ta - tb;
+      return a.timestamp.localeCompare(b.timestamp);
+    });
+    const summaryPack = summarizeOpinionGroup(type, ordered.map((u) => u.text));
+    if (!summaryPack.summary) continue;
+    const summary = summaryPack.summary;
+    const rangeLabel = buildTimeRangeLabel(ordered.map((u) => u.timestamp));
+    out.push({
+      id: `${pointId}-op-${type}`,
+      type,
+      typeLabel: payload.typeLabel,
+      summary,
+      detail: summaryPack.detail,
+      rangeLabel,
+      utterances: ordered,
+    });
+  }
+
+  out.sort((a, b) => {
+    const pa = priority[a.type] ?? 99;
+    const pb = priority[b.type] ?? 99;
+    if (pa !== pb) return pa - pb;
+    return b.utterances.length - a.utterances.length;
+  });
+
+  return out.slice(0, 5);
 }
 
 export default function Home() {
@@ -646,6 +928,10 @@ export default function Home() {
       });
     }
     const activeTitle = safeText(state.analysis?.agenda?.active?.title);
+    const rawActiveConfidence = Number(state.analysis?.agenda?.active?.confidence ?? 85);
+    const activeConfidence = Number.isFinite(rawActiveConfidence)
+      ? Math.max(55, Math.min(98, Math.round(rawActiveConfidence)))
+      : 85;
     const rows = sortedOutcomeRows;
     const items: Agenda[] = rows.map((row, idx) => {
       const title = safeText(row.agenda_title, `안건 ${idx + 1}`);
@@ -663,16 +949,16 @@ export default function Home() {
         label: `안건 ${idx + 1}`,
         title,
         status,
-        confidence: title === activeTitle ? Math.round(Number(state.analysis?.agenda?.active?.confidence || 85)) : 78,
+        confidence: title === activeTitle ? activeConfidence : 78,
         progress: statusProgress(status),
         nextUp: "다음 안건",
-        keyPoints: keyPoints.slice(0, 8),
+        keyPoints,
         risks: [],
         decisionSoFar: decisionConclusions.slice(0, 6),
         nextQuestions: [],
         keywords: Array.from(new Set(keywords)).slice(0, 8),
         summaryPointIds: keyPoints.map((_, pointIdx) => `summary-${idx}-${pointIdx}`),
-        summaryBullets: summaries.slice(0, 6),
+        summaryBullets: summaries,
         recommendation: actionNames[0] ? `우선 액션: ${actionNames[0]}` : "핵심 액션 정리가 필요합니다.",
         lastUpdated: formatNowTime(),
       };
@@ -794,6 +1080,9 @@ export default function Home() {
           .map((utterance) => Number(utterance.id.replace("utt-", "")))
           .filter((num) => !Number.isNaN(num) && num > 0)
           .sort((a, b) => a - b);
+        const matchedUtterances = Array.from(hitMap.values()).sort(
+          (a, b) => Number(a.id.replace("utt-", "")) - Number(b.id.replace("utt-", "")),
+        );
         const timeCandidates = refs.map((reason) => safeText(reason.timestamp)).filter(Boolean);
         if (turnIds.length > 0) {
           turnIds.forEach((turnId) => {
@@ -810,6 +1099,7 @@ export default function Home() {
           rangeLabel,
           turnIds,
           references: refs,
+          opinionGroups: buildOpinionGroups(agendaId, pointId, matchedUtterances, refs),
         });
       });
     });
@@ -1114,6 +1404,32 @@ export default function Home() {
     if (ts) setQuery(ts);
   };
 
+  const focusByOpinionGroup = (agendaId: string, pointId: string, groupId: string) => {
+    if (analysisUiDisabled) return;
+    setSelectedAgendaId(agendaId);
+    setSummaryScope("current");
+    setQuery("");
+    setSpeakerFilter("전체");
+
+    const meta = summaryPointMetaMap.get(`${agendaId}|${pointId}`);
+    if (!meta) return;
+    const group = meta.opinionGroups.find((item) => item.id === groupId);
+    if (!group) return;
+
+    const groupTurnIds = group.utterances
+      .map((u) => Number(u.id.replace("utt-", "")))
+      .filter((n) => !Number.isNaN(n) && n > 0)
+      .sort((a, b) => a - b);
+
+    setSelectedSummaryFocus({
+      ...meta,
+      pointText: `[${group.typeLabel}] ${group.summary}`,
+      rangeLabel: group.rangeLabel,
+      turnIds: groupTurnIds,
+      utterances: group.utterances,
+    });
+  };
+
   const focusTargetCard = (agendaId: string, targetId: string) => {
     if (analysisUiDisabled) return;
     const cleanTarget = safeText(targetId);
@@ -1245,6 +1561,28 @@ export default function Home() {
                           <span>{stripLeadingTimestamp(point)}</span>
                           {rangeLabel !== "-" ? <span className="summaryPointRange">{rangeLabel}</span> : null}
                         </button>
+                        {meta && meta.opinionGroups.length > 0 ? (
+                          <div className="summaryOpinionBlock">
+                            <p className="mutedLabel">의견 요약</p>
+                            <ul className="summaryOpinionList">
+                              {meta.opinionGroups.map((group) => (
+                                <li key={group.id}>
+                                  <button
+                                    className="opinionSummaryButton"
+                                    type="button"
+                                    onClick={() => focusByOpinionGroup(agenda.id, pointId, group.id)}
+                                    disabled={analysisUiDisabled}
+                                  >
+                                    <span className={`chip chipSoft opinionTypeChip opinionType-${group.type}`}>{group.typeLabel}</span>
+                                    <span>{group.summary}</span>
+                                    {group.detail ? <span className="opinionDetail">{group.detail}</span> : null}
+                                    {group.rangeLabel !== "-" ? <span className="summaryPointRange">{group.rangeLabel}</span> : null}
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : null}
                       </li>
                     );
                   })}
@@ -1630,7 +1968,7 @@ export default function Home() {
               {filteredTranscript.length === 0 ? (
                 <p className="emptyState">
                   {selectedSummaryFocus
-                    ? "선택한 핵심 포인트의 원문 발화를 찾지 못했습니다. 포커스를 해제하거나 다른 포인트를 선택해 주세요."
+                    ? "선택한 요약/의견의 원문 발화를 찾지 못했습니다. 포커스를 해제하거나 다른 항목을 선택해 주세요."
                     : "현재 필터와 일치하는 발화가 없습니다. 검색어나 화자 필터를 조정해 주세요."}
                 </p>
               ) : (
@@ -1806,6 +2144,28 @@ export default function Home() {
                                   <span>{stripLeadingTimestamp(point)}</span>
                                   {rangeLabel !== "-" ? <span className="summaryPointRange">{rangeLabel}</span> : null}
                                 </button>
+                                {meta && meta.opinionGroups.length > 0 ? (
+                                  <div className="summaryOpinionBlock">
+                                    <p className="mutedLabel">의견 요약</p>
+                                    <ul className="summaryOpinionList">
+                                      {meta.opinionGroups.map((group) => (
+                                        <li key={group.id}>
+                                          <button
+                                            className="opinionSummaryButton"
+                                            type="button"
+                                            onClick={() => focusByOpinionGroup(agenda.id, targetId, group.id)}
+                                            disabled={analysisUiDisabled}
+                                          >
+                                            <span className={`chip chipSoft opinionTypeChip opinionType-${group.type}`}>{group.typeLabel}</span>
+                                            <span>{group.summary}</span>
+                                            {group.detail ? <span className="opinionDetail">{group.detail}</span> : null}
+                                            {group.rangeLabel !== "-" ? <span className="summaryPointRange">{group.rangeLabel}</span> : null}
+                                          </button>
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                ) : null}
                               </li>
                             );
                           })}</ul>}
