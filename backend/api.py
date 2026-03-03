@@ -1601,7 +1601,7 @@ def _to_ids(raw_ids: Any) -> list[int]:
     return out
 
 
-def _build_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], current_agenda_title: str, mode: str = "windowed") -> str:
+def _build_agenda_outline_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], current_agenda_title: str, mode: str = "windowed") -> str:
     meeting_goal = _safe_text(rt.meeting_goal, "미정")
     turn_count = len(turns)
     agenda_hint_min = 1 if turn_count < 90 else max(2, min(10, round(turn_count / 100)))
@@ -1614,7 +1614,7 @@ def _build_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], current_agenda_
     transcript_block = "\n".join(lines)
 
     return f"""
-너는 회의록 구조화 분석기다. 출력은 반드시 JSON 하나만 반환한다.
+너는 회의 아젠다 구간 분할기다. 출력은 반드시 JSON 하나만 반환한다.
 
 [입력]
 - 전체 회의 목표: {meeting_goal}
@@ -1626,19 +1626,11 @@ def _build_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], current_agenda_
 [중요 규칙]
 1) 안건은 "흐름 전환 시점" 기준으로 순서대로 나눈다. 즉, 주제가 전환될 때마다 새 안건을 만든다.
 2) 안건 제목은 해당 안건 구간의 모든 발언을 관통하는 "상위 논지"를 한국어 한 문장으로 요약해 작성한다. 단어 나열/문장 복사는 금지한다.
-3) 각 안건에 키워드 3~6개를 반드시 넣는다(명사/핵심 용어 중심).
-4) 의사결정은 "확정된 내용"만 decision_results에 넣는다.
-5) 액션아이템은 누가/무엇/기한(없으면 빈문자열)과 근거 turn_id를 넣는다.
-6) evidence_turn_ids, key_utterance_turn_ids는 반드시 입력의 turn_id만 사용한다.
-7) 현재 진행 안건이 이미 있으면, 정말로 주제가 크게 바뀌었을 때만 새 ACTIVE 안건으로 둔다.
-8) 각 안건은 start_turn_id/end_turn_id를 반드시 포함하고, 안건 간 구간은 시간순/비중첩으로 작성한다.
-9) agenda_summary_items는 해당 안건 구간(end_turn_id 이전)에서만 요약하고, 각 요약문마다 evidence_turn_ids를 넣는다.
-10) 분석 모드가 full_document이면, 발화 전체를 끝까지 보고 안건을 한 번에 완성한다. 중간 단계 안건 생성은 금지한다.
-11) full_document에서는 총 발화 수({turn_count})를 고려해 안건 수를 동적으로 잡아라. 권장 안건 수는 {agenda_hint_min}~{agenda_hint_max}개이며, 마지막 안건만 과도하게 길어지지 않게 분할한다.
-12) key_utterance_turn_ids, agenda_summary_items는 고정 개수로 제한하지 말고, 안건에 의미 있는 내용이 있으면 가능한 만큼 반영하라.
-13) 요약/의견/결론 문장은 짧게 작성하고, 원문 장문 인용은 금지한다.
-14) 각 안건은 agenda_summary_items를 최소 2개 이상 작성하되, 핵심 내용이 더 많으면 그만큼 추가하라.
-15) 각 summary item의 evidence_turn_ids는 반드시 해당 안건의 start_turn_id~end_turn_id 범위 안에서만 선택한다.
+3) 현재 진행 안건이 이미 있으면, 정말로 주제가 크게 바뀌었을 때만 새 ACTIVE 안건으로 둔다.
+4) 각 안건은 start_turn_id/end_turn_id를 반드시 포함하고, 안건 간 구간은 시간순/비중첩으로 작성한다.
+5) 분석 모드가 full_document이면, 발화 전체를 끝까지 보고 안건을 한 번에 완성한다. 중간 단계 안건 생성은 금지한다.
+6) full_document에서는 총 발화 수({turn_count})를 고려해 안건 수를 동적으로 잡아라. 권장 안건 수는 {agenda_hint_min}~{agenda_hint_max}개이며, 마지막 안건만 과도하게 길어지지 않게 분할한다.
+7) 이 단계에서는 상세 필드(키워드, 핵심발언, 요약, 근거, 의사결정, 액션아이템)를 생성하지 않는다.
 
 [출력 JSON 스키마]
 {{
@@ -1649,28 +1641,75 @@ def _build_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], current_agenda_
       "agenda_state": "PROPOSED|ACTIVE|CLOSING|CLOSED",
       "start_turn_id": 1,
       "end_turn_id": 20,
-      "flow_type": "discussion|decision|action-planning",
-      "agenda_keywords": ["string", "string"],
-      "key_utterance_turn_ids": [1,2,3],
-      "agenda_summary_items": [
-        {{"summary": "string", "evidence_turn_ids": [1,2]}}
-      ],
-      "decision_results": [
-        {{
-          "conclusion": "string",
-          "opinions": ["string"],
-          "evidence_turn_ids": [1,2]
-        }}
-      ],
-      "action_items": [
-        {{
-          "item": "string",
-          "owner": "string",
-          "due": "string",
-          "reason": "string",
-          "evidence_turn_ids": [1,2]
-        }}
-      ]
+      "flow_type": "discussion|decision|action-planning"
+    }}
+  ]
+}}
+""".strip()
+
+
+def _build_agenda_detail_prompt(
+    rt: RuntimeStore,
+    agenda_title: str,
+    agenda_state: str,
+    flow_type: str,
+    start_turn_id: int,
+    end_turn_id: int,
+    seg_turns: list[dict[str, Any]],
+) -> str:
+    meeting_goal = _safe_text(rt.meeting_goal, "미정")
+    lines = []
+    for turn in seg_turns:
+        lines.append(
+            f"- turn_id={turn['turn_id']} | {turn['timestamp']} | {turn['speaker']} | {turn['text']}"
+        )
+    transcript_block = "\n".join(lines)
+
+    return f"""
+너는 회의 안건 상세 추출기다. 출력은 반드시 JSON 하나만 반환한다.
+
+[입력]
+- 전체 회의 목표: {meeting_goal}
+- 안건 제목: {_safe_text(agenda_title, "미정")}
+- 안건 상태: {_safe_text(agenda_state, "PROPOSED")}
+- 안건 흐름 타입: {_safe_text(flow_type, "discussion")}
+- 안건 turn 범위: {start_turn_id}~{end_turn_id}
+- 안건 구간 발화(시간순):
+{transcript_block}
+
+[중요 규칙]
+1) 아래 출력 필드만 채운다.
+2) evidence_turn_ids, key_utterance_turn_ids는 반드시 입력 turn_id만 사용한다.
+3) agenda_keywords는 3~6개 핵심 용어로 작성한다.
+4) key_utterance_turn_ids는 핵심 발언 turn_id를 3~10개로 선택한다.
+5) agenda_summary_items는 2개 이상 작성하고, 각 항목에 evidence_turn_ids를 포함한다.
+6) summary는 위 summary_items를 1~3문장으로 종합한 안건 요약이다.
+7) decision_results는 확정된 결론만 포함한다. 없으면 빈 배열.
+8) action_items는 누가/무엇/기한/근거를 포함한다. 없으면 빈 배열.
+9) 원문 장문 인용은 금지하고, 요약 문장으로 작성한다.
+
+[출력 JSON 스키마]
+{{
+  "agenda_keywords": ["string", "string"],
+  "key_utterance_turn_ids": [1,2,3],
+  "agenda_summary_items": [
+    {{"summary": "string", "evidence_turn_ids": [1,2]}}
+  ],
+  "summary": "string",
+  "decision_results": [
+    {{
+      "conclusion": "string",
+      "opinions": ["string"],
+      "evidence_turn_ids": [1,2]
+    }}
+  ],
+  "action_items": [
+    {{
+      "item": "string",
+      "owner": "string",
+      "due": "string",
+      "reason": "string",
+      "evidence_turn_ids": [1,2]
     }}
   ]
 }}
@@ -1736,44 +1775,108 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
             }
         )
 
+    # 1단계: 전체 전사 기준 안건 구간(제목/상태/흐름)만 먼저 추출
     active = _active_agenda(rt.agenda_outcomes)
     current_title = _safe_text((active or {}).get("agenda_title"))
-    prompt = _build_prompt(rt, turns, current_title, mode=mode)
-
+    outline_prompt = _build_agenda_outline_prompt(rt, turns, current_title, mode=mode)
     try:
-        parsed = client.generate_json(prompt, temperature=0.1, max_tokens=7000)
+        outline_parsed = client.generate_json(outline_prompt, temperature=0.1, max_tokens=2800)
     except Exception as exc:
-        return _run_local_fallback(rt, force=force, reason=f"LLM 오류: {exc}", mode=mode)
-    rt.last_llm_parsed_json = parsed if isinstance(parsed, dict) else {}
-    rt.last_llm_parsed_at = _now_ts()
+        return _run_local_fallback(rt, force=force, reason=f"LLM 1차(안건 구간) 오류: {exc}", mode=mode)
 
-    raw_agendas = parsed.get("agendas") or []
+    raw_agendas = outline_parsed.get("agendas") or []
     if not isinstance(raw_agendas, list) or not raw_agendas:
-        return _run_local_fallback(rt, force=force, reason="LLM 응답에서 agendas가 비어 로컬 폴백 사용", mode=mode)
+        return _run_local_fallback(rt, force=force, reason="LLM 1차 응답에서 agendas가 비어 로컬 폴백 사용", mode=mode)
 
-    active_title = _safe_text(parsed.get("active_agenda_title"))
-    normalized_active = _clean_agenda_title(active_title, rt.meeting_goal, []) if active_title else ""
-    outcomes: list[dict[str, Any]] = []
-    title_refine_attempts = 0
-    title_refine_success = 0
+    turn_ids = [int(t.get("turn_id") or 0) for t in turns if int(t.get("turn_id") or 0) > 0]
+    if not turn_ids:
+        return _run_local_fallback(rt, force=force, reason="안건 구간 계산용 turn_id 없음", mode=mode)
+    min_turn = min(turn_ids)
+    max_turn = max(turn_ids)
 
+    outline_rows: list[dict[str, Any]] = []
     for idx, agenda in enumerate(raw_agendas):
         if not isinstance(agenda, dict):
             continue
+        row = {
+            "agenda_title": _safe_text(agenda.get("agenda_title")),
+            "agenda_state": _normalize_agenda_state(agenda.get("agenda_state")),
+            "flow_type": _safe_text(agenda.get("flow_type"), "discussion"),
+            "_start_turn_id": int(agenda.get("start_turn_id") or 0),
+            "_end_turn_id": int(agenda.get("end_turn_id") or 0),
+        }
+        if row["_start_turn_id"] <= 0:
+            row["_start_turn_id"] = min_turn + idx
+        if row["_end_turn_id"] < row["_start_turn_id"]:
+            row["_end_turn_id"] = row["_start_turn_id"]
+        outline_rows.append(row)
 
-        keywords = _dedup_preserve([_safe_text(x) for x in (agenda.get("agenda_keywords") or []) if _safe_text(x)], limit=8)
+    if not outline_rows:
+        return _run_local_fallback(rt, force=force, reason="LLM 1차 안건 파싱 실패", mode=mode)
+
+    outline_rows = _normalize_outcome_ranges(outline_rows, min_turn, max_turn)
+    outline_rows, refine_note = _refine_outcomes_by_density(rt, outline_rows, turns)
+    if not outline_rows:
+        return _run_local_fallback(rt, force=force, reason="1차 안건 구간 보정 실패", mode=mode)
+
+    # 2단계: 안건 구간별 상세 필드 개별 요청
+    active_title = _safe_text(outline_parsed.get("active_agenda_title"))
+    active_title_norm = active_title.strip().lower()
+    outcomes: list[dict[str, Any]] = []
+    title_refine_attempts = 0
+    title_refine_success = 0
+    detail_attempts = 0
+    detail_success = 0
+    detail_logs: list[dict[str, Any]] = []
+
+    for idx, agenda in enumerate(outline_rows):
+        start_turn_id = int(agenda.get("_start_turn_id") or agenda.get("start_turn_id") or 0)
+        end_turn_id = int(agenda.get("_end_turn_id") or agenda.get("end_turn_id") or 0)
+        seg_turns = _slice_turns_by_id_range(turns, start_turn_id, end_turn_id)
+        if not seg_turns:
+            seg_turns = list(turns)
+
         raw_title = _safe_text(agenda.get("agenda_title"))
-
         state = _normalize_agenda_state(agenda.get("agenda_state"))
-        if normalized_active and raw_title and _clean_agenda_title(raw_title, rt.meeting_goal, keywords) == normalized_active:
-            state = "ACTIVE"
+        flow_type = _safe_text(agenda.get("flow_type"), "discussion")
 
-        key_refs = _extract_refs(rt, _to_ids(agenda.get("key_utterance_turn_ids")), turns)
+        detail_attempts += 1
+        detail_parsed: dict[str, Any] = {}
+        detail_error = ""
+        try:
+            detail_prompt = _build_agenda_detail_prompt(
+                rt=rt,
+                agenda_title=raw_title,
+                agenda_state=state,
+                flow_type=flow_type,
+                start_turn_id=start_turn_id,
+                end_turn_id=end_turn_id,
+                seg_turns=seg_turns,
+            )
+            detail_parsed = client.generate_json(detail_prompt, temperature=0.1, max_tokens=3200)
+            detail_success += 1
+        except Exception as exc:
+            detail_error = str(exc)
+            detail_parsed = {}
+
+        detail_logs.append(
+            {
+                "agenda_index": idx + 1,
+                "start_turn_id": start_turn_id,
+                "end_turn_id": end_turn_id,
+                "title_seed": raw_title,
+                "error": detail_error,
+                "response": detail_parsed,
+            }
+        )
+
+        keywords = _dedup_preserve([_safe_text(x) for x in (detail_parsed.get("agenda_keywords") or []) if _safe_text(x)], limit=8)
+        key_refs = _extract_refs(rt, _to_ids(detail_parsed.get("key_utterance_turn_ids")), turns)
         key_utterances = _dedup_preserve([f"[{r['timestamp']}] {r['quote']}" for r in key_refs], limit=8)
 
         summary_items: list[str] = []
         summary_references: list[dict[str, Any]] = []
-        for it in agenda.get("agenda_summary_items") or []:
+        for it in detail_parsed.get("agenda_summary_items") or []:
             if not isinstance(it, dict):
                 continue
             txt = _to_summary_point(_safe_text(it.get("summary")))
@@ -1817,7 +1920,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
                 )
 
         decisions: list[dict[str, Any]] = []
-        for it in agenda.get("decision_results") or []:
+        for it in detail_parsed.get("decision_results") or []:
             if not isinstance(it, dict):
                 continue
             conclusion = _safe_text(it.get("conclusion"))
@@ -1830,7 +1933,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
             decisions.append({"opinions": _dedup_preserve(opinions, 5), "conclusion": conclusion})
 
         actions: list[dict[str, Any]] = []
-        for it in agenda.get("action_items") or []:
+        for it in detail_parsed.get("action_items") or []:
             if not isinstance(it, dict):
                 continue
             item = _safe_text(it.get("item"))
@@ -1853,18 +1956,15 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
             actions.append({"item": item, "owner": owner, "due": due, "reasons": reasons})
 
         if not keywords:
-            synthetic_rows = [{"text": x.split("] ", 1)[-1]} for x in summary_items[:10]]
-            keywords = _top_keywords_from_rows(synthetic_rows, rt.meeting_goal, limit=6)
+            keywords = _top_keywords_from_rows(seg_turns, rt.meeting_goal, limit=6)
         if not key_utterances and turns:
-            pick_idx = min(len(turns) - 1, idx * max(1, len(turns) // max(1, len(raw_agendas))))
+            pick_idx = min(len(turns) - 1, idx * max(1, len(turns) // max(1, len(outline_rows))))
             key_utterances = [_format_line_from_turn(turns[pick_idx])]
 
-        all_ids = _to_ids(agenda.get("key_utterance_turn_ids"))
-        for s_item in agenda.get("agenda_summary_items") or []:
+        all_ids = _to_ids(detail_parsed.get("key_utterance_turn_ids"))
+        for s_item in detail_parsed.get("agenda_summary_items") or []:
             if isinstance(s_item, dict):
                 all_ids.extend(_to_ids(s_item.get("evidence_turn_ids")))
-        start_turn_id = int(agenda.get("start_turn_id") or 0)
-        end_turn_id = int(agenda.get("end_turn_id") or 0)
         if start_turn_id <= 0:
             start_turn_id = min(all_ids) if all_ids else (idx + 1) * 1000
         if end_turn_id < start_turn_id:
@@ -1904,16 +2004,20 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
                 title = regenerated
                 title_refine_success += 1
 
-        if normalized_active and title == normalized_active:
+        direct_match = active_title_norm and title.strip().lower() == active_title_norm
+        sim_match = active_title and _text_similarity(active_title, title) >= 0.55
+        if direct_match or sim_match:
             state = "ACTIVE"
 
-        summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:10])
+        summary = _to_summary_point(_safe_text(detail_parsed.get("summary")), max_len=300)
+        if not summary:
+            summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:10])
 
         outcomes.append(
             {
                 "agenda_title": title,
                 "agenda_state": state,
-                "flow_type": _safe_text(agenda.get("flow_type"), "discussion"),
+                "flow_type": flow_type,
                 "key_utterances": _dedup_preserve(key_utterances, limit=20),
                 "_summary_items": _dedup_preserve(summary_items, limit=20),
                 "summary_references": summary_references[:24],
@@ -1929,10 +2033,6 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
     if not outcomes:
         return _run_local_fallback(rt, force=force, reason="LLM agendas 파싱 실패", mode=mode)
 
-    outcomes, refine_note = _refine_outcomes_by_density(rt, outcomes, turns)
-    if not outcomes:
-        return _run_local_fallback(rt, force=force, reason="안건 보정 실패", mode=mode)
-
     enriched: list[dict[str, Any]] = []
     for row in outcomes:
         enriched.append(_enrich_outcome_summary(rt, row, turns))
@@ -1941,6 +2041,13 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
     title_refine_attempts += post_attempts
     title_refine_success += post_success
 
+    rt.last_llm_parsed_json = {
+        "pipeline": "two_stage",
+        "outline": outline_parsed,
+        "details": detail_logs,
+    }
+    rt.last_llm_parsed_at = _now_ts()
+
     _apply_outcomes(rt, outcomes)
 
     rt.last_analyzed_count = len(rt.transcript)
@@ -1948,6 +2055,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
     notes: list[str] = []
     if _safe_text(refine_note):
         notes.append(_safe_text(refine_note))
+    notes.append(f"안건 상세 추출 {detail_success}/{detail_attempts} 성공")
     notes.append(f"안건 제목 재요청 {title_refine_success}/{title_refine_attempts} 성공")
     rt.last_analysis_warning = " | ".join(notes)
     rt.last_tick_mode = "full_document" if mode == "full_document" else "windowed"
