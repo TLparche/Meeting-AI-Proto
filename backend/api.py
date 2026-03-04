@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "large")
 SUMMARY_INTERVAL = 4
 SUMMARY_POINT_TARGET_LEN = None
+REALTIME_MIN_SHIFT_SPAN = 6
 
 STOPWORDS = {
     "그냥",
@@ -691,6 +692,7 @@ class RuntimeStore:
     analysis_last_done_id: int = 0
     analysis_generation: int = 0
     transcript_version: int = 0
+    analysis_next_windowed_target: int = SUMMARY_INTERVAL
 
     def reset(self) -> None:
         self.meeting_goal = ""
@@ -723,6 +725,7 @@ class RuntimeStore:
         self.analysis_last_done_id = 0
         self.analysis_generation += 1
         self.transcript_version = 0
+        self.analysis_next_windowed_target = SUMMARY_INTERVAL
 
 
 RT = RuntimeStore()
@@ -731,9 +734,15 @@ ANALYSIS_WORKER_STARTED = False
 
 
 def _analysis_worker_status(rt: RuntimeStore) -> dict[str, Any]:
+    observed_waiting = max(0, int(ANALYSIS_QUEUE.qsize()))
+    observed_total = observed_waiting + (1 if rt.analysis_inflight else 0)
+    logical_total = int(max(0, rt.analysis_queued))
+    display_total = max(logical_total, observed_total)
     return {
         "inflight": bool(rt.analysis_inflight),
-        "queued": int(max(0, rt.analysis_queued)),
+        "queued": int(display_total),
+        "queued_logical": int(logical_total),
+        "queued_observed": int(observed_total),
         "last_enqueued_id": int(rt.analysis_last_enqueued_id),
         "last_started_id": int(rt.analysis_last_started_id),
         "last_done_id": int(rt.analysis_last_done_id),
@@ -779,7 +788,14 @@ def _apply_analysis_result(rt: RuntimeStore, snap: RuntimeStore) -> None:
     rt.last_llm_parsed_at = _safe_text(snap.last_llm_parsed_at)
 
 
-def _enqueue_analysis(rt: RuntimeStore, force: bool, mode: str, source: str = "") -> tuple[bool, int, str]:
+def _enqueue_analysis(
+    rt: RuntimeStore,
+    force: bool,
+    mode: str,
+    source: str = "",
+    skip_interval: bool = False,
+    target_count: int = 0,
+) -> tuple[bool, int, str]:
     rt.analysis_task_seq += 1
     task_id = int(rt.analysis_task_seq)
     task = {
@@ -790,6 +806,8 @@ def _enqueue_analysis(rt: RuntimeStore, force: bool, mode: str, source: str = ""
         "enqueued_at": _now_ts(),
         "generation": int(rt.analysis_generation),
         "transcript_version": int(rt.transcript_version),
+        "skip_interval": bool(skip_interval),
+        "target_count": int(max(0, target_count)),
     }
     try:
         ANALYSIS_QUEUE.put_nowait(task)
@@ -799,6 +817,34 @@ def _enqueue_analysis(rt: RuntimeStore, force: bool, mode: str, source: str = ""
     rt.analysis_last_enqueued_id = task_id
     rt.analysis_last_enqueued_at = _safe_text(task.get("enqueued_at"))
     return True, task_id, ""
+
+
+def _enqueue_windowed_with_backpressure(rt: RuntimeStore, source: str = "") -> tuple[bool, int, str, bool]:
+    transcript_count = len(rt.transcript)
+    if rt.analysis_next_windowed_target < SUMMARY_INTERVAL:
+        rt.analysis_next_windowed_target = SUMMARY_INTERVAL
+
+    enqueued = 0
+    last_task_id = 0
+    while rt.analysis_next_windowed_target <= transcript_count:
+        ok, task_id, err = _enqueue_analysis(
+            rt,
+            force=False,
+            mode="windowed",
+            source=source,
+            skip_interval=True,
+            target_count=rt.analysis_next_windowed_target,
+        )
+        if not ok:
+            return (enqueued > 0), int(last_task_id), _safe_text(err), False
+        enqueued += 1
+        last_task_id = int(task_id)
+        rt.analysis_next_windowed_target += SUMMARY_INTERVAL
+
+    if enqueued <= 0:
+        delta = transcript_count - int(rt.last_analyzed_count)
+        return False, 0, f"waiting interval: {delta}/{SUMMARY_INTERVAL}", True
+    return True, int(last_task_id), "", False
 
 
 def _analysis_worker_loop() -> None:
@@ -817,9 +863,20 @@ def _analysis_worker_loop() -> None:
                 RT.analysis_last_started_at = _now_ts()
                 RT.analysis_last_error = ""
                 snap = _snapshot_runtime_for_analysis(RT)
+                target_count = int(task.get("target_count") or 0)
+                if snap is not None and target_count > 0:
+                    target_count = max(1, min(target_count, len(snap.transcript)))
+                    snap.transcript = list(snap.transcript[:target_count])
+                    if snap.last_analyzed_count > target_count:
+                        snap.last_analyzed_count = target_count
             try:
                 if snap is not None:
-                    _run_analysis(snap, force=bool(task.get("force")), mode=_safe_text(task.get("mode"), "windowed"))
+                    _run_analysis(
+                        snap,
+                        force=bool(task.get("force")),
+                        mode=_safe_text(task.get("mode"), "windowed"),
+                        skip_interval=bool(task.get("skip_interval")),
+                    )
             except Exception as exc:
                 with RT.lock:
                     RT.analysis_last_error = _safe_text(exc)
@@ -828,6 +885,9 @@ def _analysis_worker_loop() -> None:
                 with RT.lock:
                     if task_gen == int(RT.analysis_generation) and snap is not None and not _safe_text(RT.analysis_last_error):
                         _apply_analysis_result(RT, snap)
+                        rt_count = len(RT.transcript)
+                        next_target = ((int(RT.last_analyzed_count) // SUMMARY_INTERVAL) + 1) * SUMMARY_INTERVAL
+                        RT.analysis_next_windowed_target = max(SUMMARY_INTERVAL, min(next_target, rt_count + SUMMARY_INTERVAL))
                     RT.analysis_inflight = False
                     RT.analysis_last_done_id = int(task.get("id") or 0)
                     RT.analysis_last_done_at = _now_ts()
@@ -2201,6 +2261,19 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
         shift_turn_id = max_turn
     if shift_turn_id <= active_start:
         shifted = False
+    shift_guard_reason = ""
+    active_title = _safe_text(active.get("agenda_title"))
+    candidate_title = _safe_text(shift_parsed.get("new_agenda_title"))
+    active_span = max(0, max_turn - active_start + 1)
+    if shifted and not candidate_title:
+        shifted = False
+        shift_guard_reason = "전환 차단: 새 안건 제목 비어 있음"
+    if shifted and (not _topic_far_enough(active_title, candidate_title)):
+        shifted = False
+        shift_guard_reason = "전환 차단: 현재 안건과 제목 유사"
+    if shifted and active_span < REALTIME_MIN_SHIFT_SPAN:
+        shifted = False
+        shift_guard_reason = f"전환 차단: 안건 길이 {active_span}turn < {REALTIME_MIN_SHIFT_SPAN}turn"
 
     title_refine_attempts = 0
     title_refine_success = 0
@@ -2315,10 +2388,13 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
     rt.last_tick_mode = "windowed"
     rt.last_title_refine_attempts = int(title_refine_attempts)
     rt.last_title_refine_success = int(title_refine_success)
-    rt.last_analysis_warning = (
+    warn = (
         f"실시간 모드: {'안건 전환 감지' if shifted else '현재 안건 유지'} | "
         f"안건 제목 재요청 {title_refine_success}/{title_refine_attempts} 성공"
     )
+    if shift_guard_reason:
+        warn = f"{warn} | {shift_guard_reason}"
+    rt.last_analysis_warning = warn
     rt.last_llm_parsed_json = {
         "pipeline": "windowed_realtime",
         "shift": shift_parsed,
@@ -2358,7 +2434,7 @@ def _run_local_fallback(rt: RuntimeStore, force: bool = False, reason: str = "",
     return True
 
 
-def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed") -> bool:
+def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed", skip_interval: bool = False) -> bool:
     if not rt.transcript:
         rt.used_local_fallback = True
         rt.last_analysis_warning = "전사 데이터가 없어 분석할 수 없습니다."
@@ -2366,7 +2442,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed")
         rt.last_title_refine_attempts = 0
         rt.last_title_refine_success = 0
         return False
-    if mode != "full_document" and (not force) and (len(rt.transcript) - rt.last_analyzed_count) < SUMMARY_INTERVAL:
+    if mode != "full_document" and (not force) and (not skip_interval) and (len(rt.transcript) - rt.last_analyzed_count) < SUMMARY_INTERVAL:
         return False
     if not rt.llm_enabled:
         return _run_local_fallback(rt, force=force, reason="LLM 미연결", mode=mode)
@@ -2921,7 +2997,7 @@ def post_config(payload: ConfigInput):
 def post_transcript_manual(payload: UtteranceInput):
     with RT.lock:
         _append_turn(RT, payload.speaker, payload.text, payload.timestamp)
-        _enqueue_analysis(RT, force=False, mode="windowed", source="manual_turn")
+        _enqueue_windowed_with_backpressure(RT, source="manual_turn")
         return _state_response(RT)
 
 
@@ -3143,9 +3219,10 @@ def post_replay_step(payload: ReplayStepInput):
         analyzed = False
         queued_task_id = 0
         queue_error = ""
+        deferred = False
         if payload.auto_analyze and added > 0:
-            analyzed, queued_task_id, queue_error = _enqueue_analysis(RT, force=False, mode="windowed", source="replay_step")
-            if not analyzed:
+            analyzed, queued_task_id, queue_error, deferred = _enqueue_windowed_with_backpressure(RT, source="replay_step")
+            if (not analyzed) and (not deferred) and _safe_text(queue_error):
                 RT.analysis_last_error = _safe_text(queue_error)
 
         remaining = max(0, total - int(RT.replay_index))
@@ -3155,9 +3232,10 @@ def post_replay_step(payload: ReplayStepInput):
             "replay_debug": {
                 "added": added,
                 "requested": take,
-                "analyzed": bool(analyzed),
+                "analyzed": bool(analyzed or deferred),
                 "queued_task_id": int(queued_task_id),
                 "queue_error": _safe_text(queue_error),
+                "deferred": bool(deferred),
                 "queued_total": total,
                 "queued_cursor": int(RT.replay_index),
                 "queued_remaining": remaining,
@@ -3240,7 +3318,7 @@ async def post_stt_chunk(
     with RT.lock:
         if status == "ok" and _safe_text(text):
             _append_turn(RT, speaker, text, _now_ts())
-            _enqueue_analysis(RT, force=False, mode="windowed", source="stt_chunk")
+            _enqueue_windowed_with_backpressure(RT, source="stt_chunk")
         state = _state_response(RT)
 
     steps.append({"step": "done", "t_ms": int((time.perf_counter() - t0) * 1000)})

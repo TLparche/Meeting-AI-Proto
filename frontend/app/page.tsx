@@ -650,11 +650,15 @@ export default function Home() {
   }, [loadState]);
 
   useEffect(() => {
+    const worker = state.analysis_runtime?.analysis_worker;
+    const queued = Number(worker?.queued || 0);
+    const inflight = Boolean(worker?.inflight);
+    const pollMs = replayRunning || inflight || queued > 0 ? 200 : 1200;
     const id = window.setInterval(() => {
       void loadState();
-    }, 1400);
+    }, pollMs);
     return () => window.clearInterval(id);
-  }, [loadState]);
+  }, [loadState, replayRunning, state.analysis_runtime?.analysis_worker?.inflight, state.analysis_runtime?.analysis_worker?.queued]);
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -2284,6 +2288,7 @@ export default function Home() {
                 {state.analysis_runtime?.control_plane_reason ? <p className="mutedLabel">분석 상태: {state.analysis_runtime.control_plane_reason}</p> : null}
                 <p className="mutedLabel">
                   분석 워커: {analysisInflight ? "처리중" : "대기"} . 큐 {analysisQueuedCount}
+                  {analysisWorker?.queued_observed !== undefined ? ` (obs ${Number(analysisWorker.queued_observed)})` : ""}
                   {analysisWorker?.last_done_id ? ` . 마지막 완료 #${analysisWorker.last_done_id}` : ""}
                 </p>
                 {analysisWorker?.last_error ? <p className="mutedLabel">분석 워커 오류: {analysisWorker.last_error}</p> : null}

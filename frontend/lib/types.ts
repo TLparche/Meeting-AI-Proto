@@ -134,6 +134,8 @@ export interface MeetingState {
     analysis_worker?: {
       inflight?: boolean;
       queued?: number;
+      queued_logical?: number;
+      queued_observed?: number;
       last_enqueued_id?: number;
       last_started_id?: number;
       last_done_id?: number;
@@ -225,6 +227,7 @@ export interface ReplayStepResponse {
     analyzed: boolean;
     queued_task_id?: number;
     queue_error?: string;
+    deferred?: boolean;
     queued_total: number;
     queued_cursor: number;
     queued_remaining: number;
