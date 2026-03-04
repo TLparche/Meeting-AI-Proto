@@ -1750,6 +1750,10 @@ export default function Home() {
   const analysisWorker = state.analysis_runtime?.analysis_worker;
   const analysisQueuedCount = Number(analysisWorker?.queued || 0);
   const analysisInflight = Boolean(analysisWorker?.inflight);
+  const llmIoLogs = Array.isArray(state.llm_io_logs) ? state.llm_io_logs : [];
+  const llmReqCount = llmIoLogs.filter((x) => safeText(x?.direction).toLowerCase() === "request").length;
+  const llmResCount = llmIoLogs.filter((x) => safeText(x?.direction).toLowerCase() === "response").length;
+  const llmErrCount = llmIoLogs.filter((x) => safeText(x?.direction).toLowerCase() === "error").length;
 
   useEffect(() => {
     const current = {
@@ -2479,6 +2483,45 @@ export default function Home() {
                   </div>
                 ))}
               </div>
+              </div>
+            </details>
+
+            <details className="card panelCard sidebarSection panelFold" open={false}>
+              <summary className="panelHeader tight panelFoldHeader">
+                <h3>LLM 디버그 탭</h3>
+                <span className="chip chipSoft">{llmIoLogs.length} logs</span>
+              </summary>
+              <div className="panelFoldBody">
+                <div className="transcriptMetaBar">
+                  <span className="chip chipSoft">req {llmReqCount}</span>
+                  <span className="chip chipSoft">res {llmResCount}</span>
+                  <span className="chip chipSoft">err {llmErrCount}</span>
+                </div>
+                {llmIoLogs.length === 0 ? (
+                  <p className="emptyState compact">아직 LLM 요청/응답 로그가 없습니다.</p>
+                ) : (
+                  <div className="llmIoList">
+                    {[...llmIoLogs].slice(-50).reverse().map((log) => {
+                      const seq = Number(log?.seq || 0);
+                      const at = safeText(log?.at, "-");
+                      const direction = safeText(log?.direction, "-").toLowerCase();
+                      const stage = safeText(log?.stage, "-");
+                      const payload = safeText(log?.payload, "");
+                      const dirLabel = direction === "request" ? "REQ" : direction === "response" ? "RES" : direction === "error" ? "ERR" : direction;
+                      return (
+                        <details key={`llm-io-${seq}-${at}-${stage}`} className="llmIoItem">
+                          <summary>
+                            <span className="chip chipSoft">{dirLabel}</span>
+                            <span>#{seq}</span>
+                            <span>{at}</span>
+                            <span>{stage}</span>
+                          </summary>
+                          <pre className="emptyState compact llmIoPayload">{payload || "(empty)"}</pre>
+                        </details>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             </details>
           </section>

@@ -26,6 +26,8 @@ WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "large")
 SUMMARY_INTERVAL = 4
 SUMMARY_POINT_TARGET_LEN = None
 REALTIME_MIN_SHIFT_SPAN = 6
+LLM_IO_LOG_MAX = 160
+LLM_IO_PREVIEW_MAX = 6000
 
 STOPWORDS = {
     "그냥",
@@ -693,6 +695,8 @@ class RuntimeStore:
     analysis_generation: int = 0
     transcript_version: int = 0
     analysis_next_windowed_target: int = SUMMARY_INTERVAL
+    llm_io_seq: int = 0
+    llm_io_logs: list[dict[str, Any]] = field(default_factory=list)
 
     def reset(self) -> None:
         self.meeting_goal = ""
@@ -726,6 +730,8 @@ class RuntimeStore:
         self.analysis_generation += 1
         self.transcript_version = 0
         self.analysis_next_windowed_target = SUMMARY_INTERVAL
+        self.llm_io_seq = 0
+        self.llm_io_logs = []
 
 
 RT = RuntimeStore()
@@ -753,6 +759,57 @@ def _analysis_worker_status(rt: RuntimeStore) -> dict[str, Any]:
     }
 
 
+def _truncate_text(raw: Any, limit: int = LLM_IO_PREVIEW_MAX) -> str:
+    s = _safe_text(raw)
+    if len(s) <= limit:
+        return s
+    return _safe_text(s[: max(0, limit - 1)] + "…")
+
+
+def _append_llm_io_log(rt: RuntimeStore, direction: str, stage: str, payload: Any, meta: dict[str, Any] | None = None) -> None:
+    rt.llm_io_seq += 1
+    preview = _truncate_text(payload)
+    entry = {
+        "seq": int(rt.llm_io_seq),
+        "at": _now_ts(),
+        "direction": _safe_text(direction),
+        "stage": _safe_text(stage),
+        "payload": preview,
+        "meta": dict(meta or {}),
+    }
+    rt.llm_io_logs.append(entry)
+    if len(rt.llm_io_logs) > LLM_IO_LOG_MAX:
+        rt.llm_io_logs = rt.llm_io_logs[-LLM_IO_LOG_MAX:]
+
+
+def _call_llm_json(
+    rt: RuntimeStore,
+    client: Any,
+    prompt: str,
+    stage: str,
+    temperature: float,
+    max_tokens: int,
+) -> dict[str, Any]:
+    _append_llm_io_log(
+        rt,
+        direction="request",
+        stage=stage,
+        payload=prompt,
+        meta={"temperature": temperature, "max_tokens": max_tokens},
+    )
+    try:
+        parsed = client.generate_json(prompt, temperature=temperature, max_tokens=max_tokens)
+    except Exception as exc:
+        _append_llm_io_log(rt, direction="error", stage=stage, payload=str(exc), meta={})
+        raise
+    try:
+        payload = json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        payload = str(parsed)
+    _append_llm_io_log(rt, direction="response", stage=stage, payload=payload, meta={})
+    return parsed
+
+
 def _snapshot_runtime_for_analysis(rt: RuntimeStore) -> RuntimeStore:
     snap = RuntimeStore()
     snap.meeting_goal = _safe_text(rt.meeting_goal)
@@ -772,6 +829,8 @@ def _snapshot_runtime_for_analysis(rt: RuntimeStore) -> RuntimeStore:
     snap.last_llm_parsed_at = _safe_text(rt.last_llm_parsed_at)
     snap.analysis_generation = int(rt.analysis_generation)
     snap.transcript_version = int(rt.transcript_version)
+    snap.llm_io_seq = int(rt.llm_io_seq)
+    snap.llm_io_logs = copy.deepcopy(rt.llm_io_logs) if isinstance(rt.llm_io_logs, list) else []
     return snap
 
 
@@ -786,6 +845,8 @@ def _apply_analysis_result(rt: RuntimeStore, snap: RuntimeStore) -> None:
     rt.last_title_refine_success = int(snap.last_title_refine_success)
     rt.last_llm_parsed_json = copy.deepcopy(snap.last_llm_parsed_json) if isinstance(snap.last_llm_parsed_json, dict) else {}
     rt.last_llm_parsed_at = _safe_text(snap.last_llm_parsed_at)
+    rt.llm_io_seq = int(snap.llm_io_seq)
+    rt.llm_io_logs = copy.deepcopy(snap.llm_io_logs) if isinstance(snap.llm_io_logs, list) else []
 
 
 def _enqueue_analysis(
@@ -1007,8 +1068,10 @@ def _state_response(rt: RuntimeStore) -> dict[str, Any]:
             "last_llm_json_available": bool(rt.last_llm_parsed_json),
             "last_llm_json_at": _safe_text(rt.last_llm_parsed_at),
             "analysis_worker": _analysis_worker_status(rt),
+            "llm_io_count": len(rt.llm_io_logs),
         },
         "replay": _replay_status(rt),
+        "llm_io_logs": list(rt.llm_io_logs[-80:]),
         "analysis": analysis,
     }
 
@@ -1451,7 +1514,14 @@ def _request_agenda_title_with_llm(
 """.strip()
 
     try:
-        parsed = client.generate_json(prompt, temperature=0.05, max_tokens=220)
+        parsed = _call_llm_json(
+            rt=rt,
+            client=client,
+            prompt=prompt,
+            stage="title_refine.segment",
+            temperature=0.05,
+            max_tokens=220,
+        )
     except Exception:
         return ""
 
@@ -2250,7 +2320,14 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
         recent_turns=recent_turns,
     )
     try:
-        shift_parsed = client.generate_json(shift_prompt, temperature=0.05, max_tokens=700)
+        shift_parsed = _call_llm_json(
+            rt=rt,
+            client=client,
+            prompt=shift_prompt,
+            stage="realtime.shift",
+            temperature=0.05,
+            max_tokens=700,
+        )
     except Exception as exc:
         return _run_local_fallback(rt, force=False, reason=f"실시간 안건 전환 감지 실패: {exc}", mode="windowed")
 
@@ -2296,7 +2373,14 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
                     end_turn_id=prev_end,
                     seg_turns=prev_turns,
                 )
-                prev_detail = client.generate_json(prev_prompt, temperature=0.1, max_tokens=2200)
+                prev_detail = _call_llm_json(
+                    rt=rt,
+                    client=client,
+                    prompt=prev_prompt,
+                    stage="realtime.prev_detail",
+                    temperature=0.1,
+                    max_tokens=2200,
+                )
             except Exception:
                 prev_detail = {}
         prev_fields = _extract_detail_fields_from_parsed(rt, turns, prev_turns or recent_turns, prev_detail or {})
@@ -2339,7 +2423,14 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
                     end_turn_id=max_turn,
                     seg_turns=new_turns,
                 )
-                new_detail = client.generate_json(new_prompt, temperature=0.1, max_tokens=2200)
+                new_detail = _call_llm_json(
+                    rt=rt,
+                    client=client,
+                    prompt=new_prompt,
+                    stage="realtime.new_detail",
+                    temperature=0.1,
+                    max_tokens=2200,
+                )
             except Exception:
                 new_detail = {}
         new_fields = _extract_detail_fields_from_parsed(rt, turns, new_turns or recent_turns, new_detail or {})
@@ -2377,7 +2468,14 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
                     end_turn_id=max_turn,
                     seg_turns=seg_turns,
                 )
-                detail_parsed = client.generate_json(prompt, temperature=0.1, max_tokens=2000)
+                detail_parsed = _call_llm_json(
+                    rt=rt,
+                    client=client,
+                    prompt=prompt,
+                    stage="realtime.active_detail",
+                    temperature=0.1,
+                    max_tokens=2000,
+                )
             except Exception:
                 detail_parsed = {}
         fields = _extract_detail_fields_from_parsed(rt, turns, seg_turns or recent_turns, detail_parsed or {})
@@ -2472,7 +2570,14 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed",
     current_title = _safe_text((active or {}).get("agenda_title"))
     outline_prompt = _build_agenda_outline_prompt(rt, turns, current_title, mode=mode)
     try:
-        outline_parsed = client.generate_json(outline_prompt, temperature=0.1, max_tokens=2800)
+        outline_parsed = _call_llm_json(
+            rt=rt,
+            client=client,
+            prompt=outline_prompt,
+            stage="full.outline",
+            temperature=0.1,
+            max_tokens=2800,
+        )
     except Exception as exc:
         return _run_local_fallback(rt, force=force, reason=f"LLM 1차(안건 구간) 오류: {exc}", mode=mode)
 
@@ -2545,7 +2650,14 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed",
                 end_turn_id=end_turn_id,
                 seg_turns=seg_turns,
             )
-            detail_parsed = client.generate_json(detail_prompt, temperature=0.1, max_tokens=3200)
+            detail_parsed = _call_llm_json(
+                rt=rt,
+                client=client,
+                prompt=detail_prompt,
+                stage=f"full.detail.{idx + 1}",
+                temperature=0.1,
+                max_tokens=3200,
+            )
             detail_success += 1
         except Exception as exc:
             detail_error = str(exc)

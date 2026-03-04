@@ -111,6 +111,14 @@ export interface MeetingState {
   agenda_stack: AgendaItem[];
   llm_enabled?: boolean;
   llm_status?: LlmStatus;
+  llm_io_logs?: Array<{
+    seq?: number;
+    at?: string;
+    direction?: "request" | "response" | "error" | string;
+    stage?: string;
+    payload?: string;
+    meta?: Record<string, unknown>;
+  }>;
   replay?: {
     queued_total?: number;
     queued_cursor?: number;
@@ -131,6 +139,7 @@ export interface MeetingState {
     title_refine_success?: number;
     last_llm_json_available?: boolean;
     last_llm_json_at?: string;
+    llm_io_count?: number;
     analysis_worker?: {
       inflight?: boolean;
       queued?: number;

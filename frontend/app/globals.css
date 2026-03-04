@@ -204,6 +204,43 @@ select {
   line-height: 1.4;
 }
 
+.llmIoList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.llmIoItem {
+  border: 1px solid #e2e8f3;
+  border-radius: 10px;
+  background: #fbfcff;
+}
+
+.llmIoItem > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  font-size: 0.8rem;
+  color: #30415f;
+}
+
+.llmIoItem > summary::-webkit-details-marker {
+  display: none;
+}
+
+.llmIoPayload {
+  margin: 0 10px 10px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .timelineTime {
   font-size: 0.73rem;
   color: #6a7488;
