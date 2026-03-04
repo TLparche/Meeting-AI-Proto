@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import platform
+import queue
 import re
 import tempfile
 import threading
 import time
 import importlib.util
+import copy
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -650,6 +652,11 @@ class ImportDirInput(BaseModel):
     max_files: int = Field(default=500, ge=1, le=2000)
 
 
+class ReplayStepInput(BaseModel):
+    lines: int = Field(default=1, ge=1, le=100)
+    auto_analyze: bool = True
+
+
 @dataclass
 class RuntimeStore:
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -668,6 +675,22 @@ class RuntimeStore:
     last_title_refine_success: int = 0
     last_llm_parsed_json: dict[str, Any] = field(default_factory=dict)
     last_llm_parsed_at: str = ""
+    replay_rows: list[dict[str, str]] = field(default_factory=list)
+    replay_index: int = 0
+    replay_source: str = ""
+    replay_loaded_at: str = ""
+    analysis_task_seq: int = 0
+    analysis_queued: int = 0
+    analysis_inflight: bool = False
+    analysis_last_enqueued_at: str = ""
+    analysis_last_started_at: str = ""
+    analysis_last_done_at: str = ""
+    analysis_last_error: str = ""
+    analysis_last_enqueued_id: int = 0
+    analysis_last_started_id: int = 0
+    analysis_last_done_id: int = 0
+    analysis_generation: int = 0
+    transcript_version: int = 0
 
     def reset(self) -> None:
         self.meeting_goal = ""
@@ -684,9 +707,156 @@ class RuntimeStore:
         self.last_title_refine_success = 0
         self.last_llm_parsed_json = {}
         self.last_llm_parsed_at = ""
+        self.replay_rows = []
+        self.replay_index = 0
+        self.replay_source = ""
+        self.replay_loaded_at = ""
+        self.analysis_task_seq = 0
+        self.analysis_queued = 0
+        self.analysis_inflight = False
+        self.analysis_last_enqueued_at = ""
+        self.analysis_last_started_at = ""
+        self.analysis_last_done_at = ""
+        self.analysis_last_error = ""
+        self.analysis_last_enqueued_id = 0
+        self.analysis_last_started_id = 0
+        self.analysis_last_done_id = 0
+        self.analysis_generation += 1
+        self.transcript_version = 0
 
 
 RT = RuntimeStore()
+ANALYSIS_QUEUE: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=2048)
+ANALYSIS_WORKER_STARTED = False
+
+
+def _analysis_worker_status(rt: RuntimeStore) -> dict[str, Any]:
+    return {
+        "inflight": bool(rt.analysis_inflight),
+        "queued": int(max(0, rt.analysis_queued)),
+        "last_enqueued_id": int(rt.analysis_last_enqueued_id),
+        "last_started_id": int(rt.analysis_last_started_id),
+        "last_done_id": int(rt.analysis_last_done_id),
+        "last_enqueued_at": _safe_text(rt.analysis_last_enqueued_at),
+        "last_started_at": _safe_text(rt.analysis_last_started_at),
+        "last_done_at": _safe_text(rt.analysis_last_done_at),
+        "last_error": _safe_text(rt.analysis_last_error),
+    }
+
+
+def _snapshot_runtime_for_analysis(rt: RuntimeStore) -> RuntimeStore:
+    snap = RuntimeStore()
+    snap.meeting_goal = _safe_text(rt.meeting_goal)
+    snap.window_size = int(rt.window_size)
+    snap.transcript = [dict(row) for row in rt.transcript]
+    snap.agenda_outcomes = copy.deepcopy(rt.agenda_outcomes)
+    snap.llm_enabled = bool(rt.llm_enabled)
+    snap.last_analyzed_count = int(rt.last_analyzed_count)
+    snap.agenda_seq = int(rt.agenda_seq)
+    snap.stt_chunk_seq = int(rt.stt_chunk_seq)
+    snap.used_local_fallback = bool(rt.used_local_fallback)
+    snap.last_analysis_warning = _safe_text(rt.last_analysis_warning)
+    snap.last_tick_mode = _safe_text(rt.last_tick_mode, "windowed")
+    snap.last_title_refine_attempts = int(rt.last_title_refine_attempts)
+    snap.last_title_refine_success = int(rt.last_title_refine_success)
+    snap.last_llm_parsed_json = copy.deepcopy(rt.last_llm_parsed_json) if isinstance(rt.last_llm_parsed_json, dict) else {}
+    snap.last_llm_parsed_at = _safe_text(rt.last_llm_parsed_at)
+    snap.analysis_generation = int(rt.analysis_generation)
+    snap.transcript_version = int(rt.transcript_version)
+    return snap
+
+
+def _apply_analysis_result(rt: RuntimeStore, snap: RuntimeStore) -> None:
+    rt.agenda_outcomes = copy.deepcopy(snap.agenda_outcomes)
+    rt.last_analyzed_count = int(snap.last_analyzed_count)
+    rt.agenda_seq = int(snap.agenda_seq)
+    rt.used_local_fallback = bool(snap.used_local_fallback)
+    rt.last_analysis_warning = _safe_text(snap.last_analysis_warning)
+    rt.last_tick_mode = _safe_text(snap.last_tick_mode, "windowed")
+    rt.last_title_refine_attempts = int(snap.last_title_refine_attempts)
+    rt.last_title_refine_success = int(snap.last_title_refine_success)
+    rt.last_llm_parsed_json = copy.deepcopy(snap.last_llm_parsed_json) if isinstance(snap.last_llm_parsed_json, dict) else {}
+    rt.last_llm_parsed_at = _safe_text(snap.last_llm_parsed_at)
+
+
+def _enqueue_analysis(rt: RuntimeStore, force: bool, mode: str, source: str = "") -> tuple[bool, int, str]:
+    rt.analysis_task_seq += 1
+    task_id = int(rt.analysis_task_seq)
+    task = {
+        "id": task_id,
+        "force": bool(force),
+        "mode": "full_document" if _safe_text(mode) == "full_document" else "windowed",
+        "source": _safe_text(source),
+        "enqueued_at": _now_ts(),
+        "generation": int(rt.analysis_generation),
+        "transcript_version": int(rt.transcript_version),
+    }
+    try:
+        ANALYSIS_QUEUE.put_nowait(task)
+    except queue.Full:
+        return False, task_id, "analysis queue is full"
+    rt.analysis_queued += 1
+    rt.analysis_last_enqueued_id = task_id
+    rt.analysis_last_enqueued_at = _safe_text(task.get("enqueued_at"))
+    return True, task_id, ""
+
+
+def _analysis_worker_loop() -> None:
+    while True:
+        task = ANALYSIS_QUEUE.get()
+        try:
+            task_gen = int(task.get("generation") or 0)
+            snap: RuntimeStore | None = None
+            with RT.lock:
+                current_gen = int(RT.analysis_generation)
+                if task_gen != current_gen:
+                    RT.analysis_queued = max(0, int(RT.analysis_queued) - 1)
+                    continue
+                RT.analysis_inflight = True
+                RT.analysis_last_started_id = int(task.get("id") or 0)
+                RT.analysis_last_started_at = _now_ts()
+                RT.analysis_last_error = ""
+                snap = _snapshot_runtime_for_analysis(RT)
+            try:
+                if snap is not None:
+                    _run_analysis(snap, force=bool(task.get("force")), mode=_safe_text(task.get("mode"), "windowed"))
+            except Exception as exc:
+                with RT.lock:
+                    RT.analysis_last_error = _safe_text(exc)
+                    RT.last_analysis_warning = f"analysis worker 오류: {exc}"
+            finally:
+                with RT.lock:
+                    if task_gen == int(RT.analysis_generation) and snap is not None and not _safe_text(RT.analysis_last_error):
+                        _apply_analysis_result(RT, snap)
+                    RT.analysis_inflight = False
+                    RT.analysis_last_done_id = int(task.get("id") or 0)
+                    RT.analysis_last_done_at = _now_ts()
+                    RT.analysis_queued = max(0, int(RT.analysis_queued) - 1)
+        finally:
+            ANALYSIS_QUEUE.task_done()
+
+
+def _ensure_analysis_worker_started() -> None:
+    global ANALYSIS_WORKER_STARTED
+    if ANALYSIS_WORKER_STARTED:
+        return
+    t = threading.Thread(target=_analysis_worker_loop, daemon=True, name="analysis-worker")
+    t.start()
+    ANALYSIS_WORKER_STARTED = True
+
+
+def _replay_status(rt: RuntimeStore) -> dict[str, Any]:
+    total = len(rt.replay_rows)
+    cursor = max(0, min(int(rt.replay_index), total))
+    remaining = max(0, total - cursor)
+    return {
+        "queued_total": total,
+        "queued_cursor": cursor,
+        "queued_remaining": remaining,
+        "done": bool(total > 0 and remaining == 0),
+        "source": _safe_text(rt.replay_source),
+        "loaded_at": _safe_text(rt.replay_loaded_at),
+    }
 
 
 def _agenda_stack_from_outcomes(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -776,7 +946,9 @@ def _state_response(rt: RuntimeStore) -> dict[str, Any]:
             "title_refine_success": int(rt.last_title_refine_success),
             "last_llm_json_available": bool(rt.last_llm_parsed_json),
             "last_llm_json_at": _safe_text(rt.last_llm_parsed_at),
+            "analysis_worker": _analysis_worker_status(rt),
         },
+        "replay": _replay_status(rt),
         "analysis": analysis,
     }
 
@@ -2544,6 +2716,7 @@ def _append_turn(rt: RuntimeStore, speaker: str, text: str, timestamp: str | Non
             "timestamp": _safe_text(timestamp, _now_ts()),
         }
     )
+    rt.transcript_version += 1
 
 
 def _append_many_turns(rt: RuntimeStore, rows: list[dict[str, str]]) -> int:
@@ -2551,6 +2724,65 @@ def _append_many_turns(rt: RuntimeStore, rows: list[dict[str, str]]) -> int:
     for row in rows:
         _append_turn(rt, row.get("speaker", "화자"), row.get("text", ""), row.get("timestamp"))
     return len(rt.transcript) - before
+
+
+async def _collect_rows_from_uploads(files: list[UploadFile]) -> dict[str, Any]:
+    files_scanned = 0
+    files_parsed = 0
+    files_skipped = 0
+    parse_errors: list[dict[str, str]] = []
+    file_stats: list[dict[str, Any]] = []
+    all_rows: list[dict[str, str]] = []
+    applied_goal = None
+
+    for upload in files:
+        files_scanned += 1
+        try:
+            blob = await upload.read()
+            raw = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                raw = blob.decode("utf-8-sig")
+            except Exception:
+                files_skipped += 1
+                parse_errors.append({"file": upload.filename or "upload.json", "error": "decode failed"})
+                continue
+        except Exception:
+            files_skipped += 1
+            parse_errors.append({"file": upload.filename or "upload.json", "error": "read failed"})
+            continue
+
+        data = _extract_json(raw)
+        if not data:
+            files_skipped += 1
+            parse_errors.append({"file": upload.filename or "upload.json", "error": "json parse failed"})
+            continue
+        ok_payload, payload_reason = _looks_like_meeting_payload(data)
+        if not ok_payload:
+            files_skipped += 1
+            parse_errors.append({"file": upload.filename or "upload.json", "error": payload_reason})
+            continue
+        goal, rows = _parse_meeting_json_payload(data)
+        if not rows:
+            files_skipped += 1
+            parse_errors.append({"file": upload.filename or "upload.json", "error": "utterance rows extracted = 0"})
+            continue
+
+        if goal and not applied_goal:
+            applied_goal = goal
+        all_rows.extend(rows)
+        files_parsed += 1
+        file_stats.append({"file": upload.filename or "upload.json", "rows": len(rows)})
+
+    return {
+        "rows": all_rows,
+        "files_scanned": files_scanned,
+        "files_parsed": files_parsed,
+        "files_skipped": files_skipped,
+        "file_stats": file_stats,
+        "parse_errors": parse_errors[:20],
+        "applied_goal": applied_goal,
+    }
 
 
 def _load_whisper_model():
@@ -2603,6 +2835,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+_ensure_analysis_worker_started()
 
 
 @app.get("/api/health")
@@ -2639,15 +2872,18 @@ def post_llm_connect():
         client = get_client()
         result = client.connect()
         RT.llm_enabled = bool(result.get("ok"))
+        queue_ok = False
+        queue_err = ""
+        queued_task_id = 0
         if RT.llm_enabled:
-            try:
-                _run_analysis(RT, force=True, mode="full_document")
-            except Exception:
-                pass
+            queue_ok, queued_task_id, queue_err = _enqueue_analysis(RT, force=True, mode="full_document", source="llm_connect")
+            if not queue_ok:
+                RT.analysis_last_error = _safe_text(queue_err)
         return {
             "enabled": RT.llm_enabled,
             "result": result,
             "llm_status": client.status(),
+            "queued_analysis": {"ok": queue_ok, "task_id": queued_task_id, "error": queue_err},
             "state": _state_response(RT),
         }
 
@@ -2685,10 +2921,7 @@ def post_config(payload: ConfigInput):
 def post_transcript_manual(payload: UtteranceInput):
     with RT.lock:
         _append_turn(RT, payload.speaker, payload.text, payload.timestamp)
-        try:
-            _run_analysis(RT, force=False, mode="windowed")
-        except Exception:
-            pass
+        _enqueue_analysis(RT, force=False, mode="windowed", source="manual_turn")
         return _state_response(RT)
 
 
@@ -2754,11 +2987,12 @@ def post_import_json_dir(payload: ImportDirInput):
             RT.meeting_goal = applied_goal
 
         ticked = False
+        queue_err = ""
+        queued_task_id = 0
         if payload.auto_tick and RT.transcript:
-            try:
-                ticked = _run_analysis(RT, force=True, mode="full_document")
-            except Exception:
-                ticked = False
+            ticked, queued_task_id, queue_err = _enqueue_analysis(RT, force=True, mode="full_document", source="import_json_dir")
+            if not ticked:
+                RT.analysis_last_error = _safe_text(queue_err)
 
         return {
             "state": _state_response(RT),
@@ -2773,6 +3007,8 @@ def post_import_json_dir(payload: ImportDirInput):
                 "reset_state": bool(payload.reset_state),
                 "auto_tick": bool(payload.auto_tick),
                 "ticked": bool(ticked),
+                "queued_task_id": int(queued_task_id),
+                "queue_error": _safe_text(queue_err),
                 "analysis_mode": "none" if not RT.llm_enabled else "full_document_once",
                 "meeting_goal_applied": bool(applied_goal),
                 "warning": "" if files_parsed > 0 else ("파싱된 JSON 파일이 없습니다." + (f" 예: {parse_errors[0]['error']}" if parse_errors else "")),
@@ -2788,87 +3024,145 @@ async def post_import_json_files(
     reset_state: str = Form(default="true"),
     auto_tick: str = Form(default="true"),
 ):
+    parsed = await _collect_rows_from_uploads(files)
     with RT.lock:
         do_reset = _boolify(reset_state, True)
         do_tick = _boolify(auto_tick, True)
         if do_reset:
             RT.reset()
 
-        files_scanned = 0
-        files_parsed = 0
-        files_skipped = 0
-        rows_loaded = 0
-        file_stats = []
-        parse_errors: list[dict[str, str]] = []
-        applied_goal = None
+        rows_loaded = _append_many_turns(RT, parsed["rows"])
 
-        for upload in files:
-            files_scanned += 1
-            try:
-                blob = await upload.read()
-                raw = blob.decode("utf-8")
-            except UnicodeDecodeError:
-                try:
-                    raw = blob.decode("utf-8-sig")
-                except Exception:
-                    files_skipped += 1
-                    parse_errors.append({"file": upload.filename or "upload.json", "error": "decode failed"})
-                    continue
-            except Exception:
-                files_skipped += 1
-                parse_errors.append({"file": upload.filename or "upload.json", "error": "read failed"})
-                continue
-
-            data = _extract_json(raw)
-            if not data:
-                files_skipped += 1
-                parse_errors.append({"file": upload.filename or "upload.json", "error": "json parse failed"})
-                continue
-            ok_payload, payload_reason = _looks_like_meeting_payload(data)
-            if not ok_payload:
-                files_skipped += 1
-                parse_errors.append({"file": upload.filename or "upload.json", "error": payload_reason})
-                continue
-            goal, rows = _parse_meeting_json_payload(data)
-            if not rows:
-                files_skipped += 1
-                parse_errors.append({"file": upload.filename or "upload.json", "error": "utterance rows extracted = 0"})
-                continue
-            if goal and not applied_goal:
-                applied_goal = goal
-            added = _append_many_turns(RT, rows)
-            rows_loaded += added
-            files_parsed += 1
-            file_stats.append({"file": upload.filename or "upload.json", "rows": added})
-
-        if applied_goal:
-            RT.meeting_goal = applied_goal
+        if parsed["applied_goal"]:
+            RT.meeting_goal = parsed["applied_goal"]
 
         ticked = False
+        queue_err = ""
+        queued_task_id = 0
         if do_tick and RT.transcript:
-            try:
-                ticked = _run_analysis(RT, force=True, mode="full_document")
-            except Exception:
-                ticked = False
+            ticked, queued_task_id, queue_err = _enqueue_analysis(RT, force=True, mode="full_document", source="import_json_files")
+            if not ticked:
+                RT.analysis_last_error = _safe_text(queue_err)
 
         return {
             "state": _state_response(RT),
             "import_debug": {
                 "folder": "<uploaded>",
-                "files_scanned": files_scanned,
-                "files_parsed": files_parsed,
-                "files_skipped": files_skipped,
+                "files_scanned": int(parsed["files_scanned"]),
+                "files_parsed": int(parsed["files_parsed"]),
+                "files_skipped": int(parsed["files_skipped"]),
                 "rows_loaded": rows_loaded,
                 "meeting_goal": RT.meeting_goal or "",
                 "added": rows_loaded,
                 "reset_state": do_reset,
                 "auto_tick": do_tick,
                 "ticked": bool(ticked),
+                "queued_task_id": int(queued_task_id),
+                "queue_error": _safe_text(queue_err),
                 "analysis_mode": "none" if not RT.llm_enabled else "full_document_once",
-                "meeting_goal_applied": bool(applied_goal),
-                "warning": "" if files_parsed > 0 else ("파싱된 JSON 파일이 없습니다." + (f" 예: {parse_errors[0]['error']}" if parse_errors else "")),
-                "file_stats": file_stats,
-                "parse_errors": parse_errors[:20],
+                "meeting_goal_applied": bool(parsed["applied_goal"]),
+                "warning": ""
+                if int(parsed["files_parsed"]) > 0
+                else ("파싱된 JSON 파일이 없습니다." + (f" 예: {parsed['parse_errors'][0]['error']}" if parsed["parse_errors"] else "")),
+                "file_stats": list(parsed["file_stats"]),
+                "parse_errors": list(parsed["parse_errors"]),
+            },
+        }
+
+
+@app.post("/api/transcript/replay/import-json-files")
+async def post_replay_import_json_files(
+    files: list[UploadFile] = File(default=[]),
+    reset_state: str = Form(default="true"),
+    apply_goal: str = Form(default="true"),
+):
+    parsed = await _collect_rows_from_uploads(files)
+    with RT.lock:
+        do_reset = _boolify(reset_state, True)
+        do_apply_goal = _boolify(apply_goal, True)
+        if do_reset:
+            RT.reset()
+
+        RT.replay_rows = list(parsed["rows"])
+        RT.replay_index = 0
+        RT.replay_source = "upload_json_files"
+        RT.replay_loaded_at = _now_ts() if RT.replay_rows else ""
+
+        if do_apply_goal and parsed["applied_goal"]:
+            RT.meeting_goal = parsed["applied_goal"]
+
+        return {
+            "state": _state_response(RT),
+            "replay_debug": {
+                "queued_total": len(RT.replay_rows),
+                "queued_cursor": int(RT.replay_index),
+                "queued_remaining": max(0, len(RT.replay_rows) - int(RT.replay_index)),
+                "done": False,
+                "source": _safe_text(RT.replay_source),
+                "loaded_at": _safe_text(RT.replay_loaded_at),
+                "files_scanned": int(parsed["files_scanned"]),
+                "files_parsed": int(parsed["files_parsed"]),
+                "files_skipped": int(parsed["files_skipped"]),
+                "meeting_goal_applied": bool(do_apply_goal and parsed["applied_goal"]),
+                "warning": ""
+                if int(parsed["files_parsed"]) > 0
+                else ("파싱된 JSON 파일이 없습니다." + (f" 예: {parsed['parse_errors'][0]['error']}" if parsed["parse_errors"] else "")),
+                "file_stats": list(parsed["file_stats"]),
+                "parse_errors": list(parsed["parse_errors"]),
+            },
+        }
+
+
+@app.post("/api/transcript/replay/step")
+def post_replay_step(payload: ReplayStepInput):
+    with RT.lock:
+        total = len(RT.replay_rows)
+        cursor = max(0, min(int(RT.replay_index), total))
+        if total <= 0 or cursor >= total:
+            RT.replay_index = total
+            return {
+                "state": _state_response(RT),
+                "replay_debug": {
+                    "added": 0,
+                    "requested": int(payload.lines),
+                    "analyzed": False,
+                    "queued_total": total,
+                    "queued_cursor": int(RT.replay_index),
+                    "queued_remaining": 0,
+                    "done": True,
+                    "warning": "주입할 replay 큐가 없습니다.",
+                },
+            }
+
+        take = max(1, min(int(payload.lines), 100))
+        end = min(total, cursor + take)
+        batch = RT.replay_rows[cursor:end]
+        added = _append_many_turns(RT, batch)
+        RT.replay_index = end
+
+        analyzed = False
+        queued_task_id = 0
+        queue_error = ""
+        if payload.auto_analyze and added > 0:
+            analyzed, queued_task_id, queue_error = _enqueue_analysis(RT, force=False, mode="windowed", source="replay_step")
+            if not analyzed:
+                RT.analysis_last_error = _safe_text(queue_error)
+
+        remaining = max(0, total - int(RT.replay_index))
+        done = remaining == 0
+        return {
+            "state": _state_response(RT),
+            "replay_debug": {
+                "added": added,
+                "requested": take,
+                "analyzed": bool(analyzed),
+                "queued_task_id": int(queued_task_id),
+                "queue_error": _safe_text(queue_error),
+                "queued_total": total,
+                "queued_cursor": int(RT.replay_index),
+                "queued_remaining": remaining,
+                "done": done,
+                "warning": "",
             },
         }
 
@@ -2876,7 +3170,10 @@ async def post_import_json_files(
 @app.post("/api/analysis/tick")
 def post_analysis_tick():
     with RT.lock:
-        _run_analysis(RT, force=True, mode="full_document")
+        ok, _, err = _enqueue_analysis(RT, force=True, mode="full_document", source="manual_tick")
+        if not ok:
+            RT.analysis_last_error = _safe_text(err)
+            RT.last_analysis_warning = f"분석 요청 큐 적재 실패: {err}"
         return _state_response(RT)
 
 
@@ -2943,10 +3240,7 @@ async def post_stt_chunk(
     with RT.lock:
         if status == "ok" and _safe_text(text):
             _append_turn(RT, speaker, text, _now_ts())
-            try:
-                _run_analysis(RT, force=False, mode="windowed")
-            except Exception:
-                pass
+            _enqueue_analysis(RT, force=False, mode="windowed", source="stt_chunk")
         state = _state_response(RT)
 
     steps.append({"step": "done", "t_ms": int((time.perf_counter() - t0) * 1000)})

@@ -901,9 +901,46 @@ h4 {
   min-height: 560px;
 }
 
+.transcriptCardLeft {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 560px;
+  max-height: calc(100vh - 120px);
+}
+
+.transcriptCardLeft .panelHeader,
+.transcriptCardLeft .summaryFocusBar,
+.transcriptCardLeft .transcriptControls,
+.transcriptCardLeft .transcriptMetaBar {
+  flex-shrink: 0;
+}
+
 .transcriptCardLeft .transcriptList {
+  flex: 1 1 auto;
+  min-height: 260px;
   max-height: none;
-  overflow: visible;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.leftSectionLineMode .transcriptCardLeft .transcriptList {
+  overscroll-behavior: auto;
+}
+
+.transcriptJumpButton {
+  position: absolute;
+  right: 20px;
+  bottom: 20px;
+  z-index: 4;
+  border: 1px solid #c6d8ff;
+  background: #f5f9ff;
+  color: #1f4ba7;
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 0.82rem;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(21, 43, 90, 0.14);
 }
 
 .transcriptControls {
@@ -1548,6 +1585,10 @@ th {
 
   .leftSection .pageHeader {
     position: static;
+  }
+
+  .transcriptCardLeft {
+    max-height: none;
   }
 
   .topGrid {

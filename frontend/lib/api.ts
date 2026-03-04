@@ -5,6 +5,8 @@ import type {
   LlmPingResponse,
   LlmStatus,
   MeetingState,
+  ReplayImportResponse,
+  ReplayStepResponse,
   SttChunkResponse,
 } from "./types";
 
@@ -103,6 +105,35 @@ export async function importJsonFiles(payload: {
   return requestJson<ImportJsonDirResponse>("/api/transcript/import-json-files", {
     method: "POST",
     body: form,
+  });
+}
+
+export async function importJsonFilesReplay(payload: {
+  files: File[];
+  reset_state?: boolean;
+  apply_goal?: boolean;
+}): Promise<ReplayImportResponse> {
+  const form = new FormData();
+  payload.files.forEach((file) => form.append("files", file, file.name));
+  form.append("reset_state", String(payload.reset_state ?? true));
+  form.append("apply_goal", String(payload.apply_goal ?? true));
+  return requestJson<ReplayImportResponse>("/api/transcript/replay/import-json-files", {
+    method: "POST",
+    body: form,
+  });
+}
+
+export async function replayStep(payload?: {
+  lines?: number;
+  auto_analyze?: boolean;
+}): Promise<ReplayStepResponse> {
+  return requestJson<ReplayStepResponse>("/api/transcript/replay/step", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      lines: payload?.lines ?? 1,
+      auto_analyze: payload?.auto_analyze ?? true,
+    }),
   });
 }
 

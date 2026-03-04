@@ -9,7 +9,9 @@ import {
   getState,
   importJsonDir,
   importJsonFiles,
+  importJsonFilesReplay,
   pingLlm,
+  replayStep,
   resetState,
   saveConfig,
   tickAnalysis,
@@ -253,6 +255,10 @@ function quoteSimilar(a: string, b: string): boolean {
   if (tokens.length === 0) return false;
   const hitCount = tokens.filter((token) => right.includes(token)).length;
   return hitCount >= Math.min(3, Math.ceil(tokens.length * 0.6));
+}
+
+function isNearBottom(el: HTMLDivElement, threshold = 16): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
 }
 
 function compactLine(text: string, maxLen = 88): string {
@@ -555,12 +561,18 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [speakerFilter, setSpeakerFilter] = useState("전체");
   const [highlightRelated, setHighlightRelated] = useState(true);
+  const [transcriptAutoFollow, setTranscriptAutoFollow] = useState(true);
+  const [pendingTranscriptCount, setPendingTranscriptCount] = useState(0);
   const [summaryScope, setSummaryScope] = useState<SummaryScope>("current");
   const [selectedAgendaId, setSelectedAgendaId] = useState("");
 
   const [datasetFolder, setDatasetFolder] = useState("dataset/economy");
   const [datasetFiles, setDatasetFiles] = useState<File[]>([]);
   const [datasetImportInfo, setDatasetImportInfo] = useState("");
+  const [lineUploadMode, setLineUploadMode] = useState(false);
+  const [replayLinesPerStep, setReplayLinesPerStep] = useState(1);
+  const [replayIntervalMs, setReplayIntervalMs] = useState(1200);
+  const [replayRunning, setReplayRunning] = useState(false);
   const [meetingGoalDraft, setMeetingGoalDraft] = useState("");
   const [meetingGoalDirty, setMeetingGoalDirty] = useState(false);
 
@@ -585,6 +597,11 @@ export default function Home() {
   const chunkSeqRef = useRef(0);
   const sttSessionRef = useRef(0);
   const sendQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const replayTimerRef = useRef<number | null>(null);
+  const replayBusyRef = useRef(false);
+  const transcriptListRef = useRef<HTMLDivElement | null>(null);
+  const transcriptPrevCountRef = useRef(0);
+  const transcriptInitRef = useRef(false);
   const debugSnapshotRef = useRef<{
     transcriptCount: number;
     outcomeCount: number;
@@ -617,6 +634,17 @@ export default function Home() {
     }
   }, []);
 
+  const stopReplayAuto = useCallback((message?: string) => {
+    if (replayTimerRef.current !== null) {
+      window.clearInterval(replayTimerRef.current);
+      replayTimerRef.current = null;
+    }
+    setReplayRunning(false);
+    if (message) {
+      setDatasetImportInfo(message);
+    }
+  }, []);
+
   useEffect(() => {
     void loadState();
   }, [loadState]);
@@ -636,6 +664,15 @@ export default function Home() {
   }, [refreshLlmStatus]);
 
   useEffect(() => {
+    return () => {
+      if (replayTimerRef.current !== null) {
+        window.clearInterval(replayTimerRef.current);
+        replayTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!loading || !taskStartedAt) {
       setTaskElapsedSec(0);
       return;
@@ -645,6 +682,20 @@ export default function Home() {
     }, 200);
     return () => window.clearInterval(id);
   }, [loading, taskStartedAt]);
+
+  useEffect(() => {
+    if (!lineUploadMode) {
+      stopReplayAuto();
+    }
+  }, [lineUploadMode, stopReplayAuto]);
+
+  useEffect(() => {
+    if (!replayRunning) return;
+    const remaining = Number(state.replay?.queued_remaining || 0);
+    if (remaining <= 0) {
+      stopReplayAuto("line-mode 완료: 모든 발화를 주입했습니다.");
+    }
+  }, [replayRunning, state.replay?.queued_remaining, stopReplayAuto]);
 
   const beginTask = useCallback((label: string) => {
     setLoading(true);
@@ -657,6 +708,14 @@ export default function Home() {
     setActiveTask("");
     setTaskStartedAt(null);
     setTaskElapsedSec(0);
+  }, []);
+
+  const scrollTranscriptToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const el = transcriptListRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+    setTranscriptAutoFollow(true);
+    setPendingTranscriptCount(0);
   }, []);
 
   useEffect(() => {
@@ -739,6 +798,7 @@ export default function Home() {
       setError("업로드할 JSON 파일을 먼저 선택하세요.");
       return;
     }
+    stopReplayAuto();
     beginTask("JSON 업로드 분석 중");
     setAnalysisPending(true);
     try {
@@ -766,6 +826,86 @@ export default function Home() {
       setAnalysisPending(false);
       endTask();
     }
+  };
+
+  const onQueueDatasetFilesLineMode = async () => {
+    if (datasetFiles.length === 0) {
+      setError("업로드할 JSON 파일을 먼저 선택하세요.");
+      return;
+    }
+    stopReplayAuto();
+    beginTask("라인모드 큐 적재 중");
+    try {
+      const res = await importJsonFilesReplay({ files: datasetFiles, reset_state: true, apply_goal: true });
+      setState(res.state);
+      setMeetingGoalDraft(res.state.meeting_goal || "");
+      setMeetingGoalDirty(false);
+      setError("");
+      const d = res.replay_debug;
+      setDatasetImportInfo(
+        `line-mode queued=${d.queued_total}, parsed=${d.files_parsed}/${d.files_scanned}, skipped=${d.files_skipped}`,
+      );
+      const firstParseError = d.parse_errors?.[0];
+      if (firstParseError) {
+        setDebugEvents((rows) => [
+          `${formatNowTime()} | JSON 파싱 오류: ${firstParseError.file} -> ${firstParseError.error}`,
+          ...rows,
+        ].slice(0, 80));
+      }
+      if (d.warning) setError(d.warning);
+    } catch (err) {
+      setError((err as Error).message);
+      setDatasetImportInfo("");
+    } finally {
+      endTask();
+    }
+  };
+
+  const runReplayStepOnce = useCallback(async (lines?: number) => {
+    if (replayBusyRef.current) return;
+    replayBusyRef.current = true;
+    try {
+      const take = Math.max(1, Math.min(100, Number(lines || replayLinesPerStep) || 1));
+      const res = await replayStep({ lines: take, auto_analyze: true });
+      setState(res.state);
+      setError("");
+      const d = res.replay_debug;
+      setDatasetImportInfo(
+        `line-mode progress ${d.queued_cursor}/${d.queued_total} (remaining=${d.queued_remaining}, last_added=${d.added})`,
+      );
+      setDebugEvents((rows) => [
+        `${formatNowTime()} | line-step added=${d.added}, analysis-queued=${d.analyzed ? "yes" : "no"}, remaining=${d.queued_remaining}`,
+        ...rows,
+      ].slice(0, 80));
+      if (d.warning) {
+        setError(d.warning);
+      }
+      if (d.done) {
+        stopReplayAuto("line-mode 완료: 모든 발화를 주입했습니다.");
+      }
+    } catch (err) {
+      stopReplayAuto();
+      setError((err as Error).message);
+    } finally {
+      replayBusyRef.current = false;
+    }
+  }, [replayLinesPerStep, stopReplayAuto]);
+
+  const onStartReplayAuto = () => {
+    const remaining = Number(state.replay?.queued_remaining || 0);
+    if (remaining <= 0) {
+      setError("먼저 라인모드 큐를 적재하세요.");
+      return;
+    }
+    if (replayRunning) return;
+    setError("");
+    const interval = Math.max(100, Number(replayIntervalMs) || 1200);
+    setReplayRunning(true);
+    setDatasetImportInfo(`line-mode auto running (${interval}ms, step=${Math.max(1, replayLinesPerStep)})`);
+    void runReplayStepOnce();
+    replayTimerRef.current = window.setInterval(() => {
+      void runReplayStepOnce();
+    }, interval);
   };
 
   const onPingLlm = async () => {
@@ -925,10 +1065,27 @@ export default function Home() {
     return state.analysis.agenda_outcomes as unknown as AgendaOutcome[];
   }, [state.analysis]);
 
-  const sortedOutcomeRows = useMemo<AgendaOutcome[]>(
-    () => [...outcomeRows].sort((a, b) => Number(a.start_turn_id || 0) - Number(b.start_turn_id || 0)),
-    [outcomeRows],
-  );
+  const sortedOutcomeRows = useMemo<AgendaOutcome[]>(() => {
+    const toTurn = (raw: unknown): number => {
+      const n = Number(raw || 0);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    };
+    return outcomeRows
+      .map((row, idx) => ({ row, idx }))
+      .sort((a, b) => {
+        const aStart = toTurn(a.row.start_turn_id);
+        const bStart = toTurn(b.row.start_turn_id);
+        const aEnd = toTurn(a.row.end_turn_id);
+        const bEnd = toTurn(b.row.end_turn_id);
+        const aKey = aStart > 0 ? aStart : aEnd > 0 ? aEnd : Number.MAX_SAFE_INTEGER;
+        const bKey = bStart > 0 ? bStart : bEnd > 0 ? bEnd : Number.MAX_SAFE_INTEGER;
+        if (aKey !== bKey) return aKey - bKey;
+        if (aStart !== bStart) return aStart - bStart;
+        if (aEnd !== bEnd) return aEnd - bEnd;
+        return a.idx - b.idx;
+      })
+      .map((item) => item.row);
+  }, [outcomeRows]);
 
   const agendas = useMemo<Agenda[]>(() => {
     if (outcomeRows.length === 0) {
@@ -1374,6 +1531,52 @@ export default function Home() {
     });
   }, [query, speakerFilter, transcript, selectedSummaryFocus]);
 
+  const onTranscriptScroll = useCallback(() => {
+    const el = transcriptListRef.current;
+    if (!el) return;
+    const atBottom = isNearBottom(el, 18);
+    setTranscriptAutoFollow(atBottom);
+    if (atBottom) {
+      setPendingTranscriptCount(0);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!transcriptInitRef.current) {
+      transcriptInitRef.current = true;
+      transcriptPrevCountRef.current = transcript.length;
+      requestAnimationFrame(() => {
+        const el = transcriptListRef.current;
+        if (el) {
+          el.scrollTop = el.scrollHeight;
+          setTranscriptAutoFollow(true);
+          setPendingTranscriptCount(0);
+        }
+      });
+      return;
+    }
+
+    const prev = transcriptPrevCountRef.current;
+    const next = transcript.length;
+    const added = Math.max(0, next - prev);
+    transcriptPrevCountRef.current = next;
+    if (added <= 0) return;
+
+    if (selectedSummaryFocus) return;
+
+    const el = transcriptListRef.current;
+    if (!el) return;
+    const atBottomNow = isNearBottom(el, 18);
+    if (atBottomNow || transcriptAutoFollow) {
+      requestAnimationFrame(() => {
+        scrollTranscriptToBottom("auto");
+      });
+      return;
+    }
+
+    setPendingTranscriptCount((count) => count + added);
+  }, [transcript.length, transcriptAutoFollow, selectedSummaryFocus, scrollTranscriptToBottom]);
+
   const summaryAgendas = useMemo(() => {
     if (!selectedAgenda) return [];
     if (summaryScope === "all") return agendas;
@@ -1536,6 +1739,13 @@ export default function Home() {
 
   const llmEnabled = Boolean(state.llm_enabled);
   const analysisUiDisabled = analysisPending;
+  const replayQueuedTotal = Number(state.replay?.queued_total || 0);
+  const replayQueuedCursor = Number(state.replay?.queued_cursor || 0);
+  const replayQueuedRemaining = Number(state.replay?.queued_remaining || 0);
+  const replayDone = Boolean(state.replay?.done);
+  const analysisWorker = state.analysis_runtime?.analysis_worker;
+  const analysisQueuedCount = Number(analysisWorker?.queued || 0);
+  const analysisInflight = Boolean(analysisWorker?.inflight);
 
   useEffect(() => {
     const current = {
@@ -1882,7 +2092,7 @@ export default function Home() {
 
       <main className="mainArea">
         <div className="mainInner">
-          <section className="leftSection">
+          <section className={`leftSection ${lineUploadMode ? "leftSectionLineMode" : ""}`}>
           <header className="pageHeader awsHeader glassStickyHeader">
             <div className="headerMain">
               <div>
@@ -1966,83 +2176,165 @@ export default function Home() {
                   <option key={n} value={n}>{n} turns</option>
                 ))}
               </select>
+              <label className="toggleLabel">
+                <input
+                  checked={lineUploadMode}
+                  type="checkbox"
+                  onChange={(event) => setLineUploadMode(event.target.checked)}
+                />
+                JSON 라인 주입 모드
+              </label>
             </div>
             <div className="panelActions">
               <button type="button" onClick={() => void onSaveConfig()} disabled={loading}>설정 저장</button>
               <button type="button" onClick={() => void onImportDataset()} disabled={loading}>JSON 폴더 로드</button>
               <button type="button" onClick={() => void onImportDatasetFiles()} disabled={loading || datasetFiles.length === 0}>JSON 업로드</button>
+              {lineUploadMode ? (
+                <button type="button" onClick={() => void onQueueDatasetFilesLineMode()} disabled={loading || datasetFiles.length === 0}>
+                  라인모드 큐 적재
+                </button>
+              ) : null}
               <button type="button" onClick={() => void apply(() => tickAnalysis(), "전체 분석 실행 중", true)} disabled={loading || analysisUiDisabled}>분석 실행</button>
-              <button type="button" onClick={() => void apply(() => resetState(), "상태 초기화 중")} disabled={loading}>초기화</button>
+              <button type="button" onClick={() => { stopReplayAuto(); void apply(() => resetState(), "상태 초기화 중"); }} disabled={loading}>초기화</button>
               <button type="button" onClick={() => void onConnectLlm()} disabled={llmChecking}>{llmChecking ? "연결 중" : "LLM 연결"}</button>
               <button type="button" onClick={() => void onDisconnectLlm()} disabled={llmChecking || !llmEnabled}>연결 해제</button>
               <button type="button" onClick={() => void onPingLlm()} disabled={llmChecking}>{llmChecking ? "확인 중" : "연결 테스트"}</button>
             </div>
-            <p className="mutedLabel">전사 건수: {state.transcript?.length || 0}</p>
+            {lineUploadMode ? (
+              <>
+                <div className="transcriptControls transcriptControlsCompact">
+                  <label className="toggleLabel">
+                    step lines
+                    <input
+                      aria-label="라인 주입 step 크기"
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={replayLinesPerStep}
+                      onChange={(event) => setReplayLinesPerStep(Math.max(1, Math.min(100, Number(event.target.value) || 1)))}
+                    />
+                  </label>
+                  <label className="toggleLabel">
+                    interval ms
+                    <input
+                      aria-label="라인 주입 간격(ms)"
+                      type="number"
+                      min={100}
+                      max={10000}
+                      step={100}
+                      value={replayIntervalMs}
+                      onChange={(event) => setReplayIntervalMs(Math.max(100, Math.min(10000, Number(event.target.value) || 1200)))}
+                    />
+                  </label>
+                </div>
+                <div className="panelActions">
+                  <button
+                    type="button"
+                    onClick={() => void runReplayStepOnce()}
+                    disabled={loading || replayRunning || replayQueuedRemaining <= 0}
+                  >
+                    {replayLinesPerStep}줄 주입
+                  </button>
+                  {!replayRunning ? (
+                    <button
+                      type="button"
+                      onClick={() => onStartReplayAuto()}
+                      disabled={loading || replayQueuedRemaining <= 0}
+                    >
+                      자동 재생 시작
+                    </button>
+                  ) : (
+                    <button type="button" onClick={() => stopReplayAuto("line-mode 자동 재생 중지")} disabled={loading}>
+                      자동 재생 중지
+                    </button>
+                  )}
+                </div>
+              </>
+            ) : null}
             {loading ? (
               <p className="runIndicator">
                 <span className="runDot" />
                 <span>{activeTask || "작업 실행 중"} ({taskElapsedSec}s)</span>
               </p>
             ) : null}
-            {analysisUiDisabled ? <p className="mutedLabel">분석 비활성화: 결과 수신 대기 중</p> : null}
-            {datasetImportInfo ? <p className="mutedLabel">{datasetImportInfo}</p> : null}
-            {llmPingMessage ? <p className="mutedLabel">Ping: {llmPingMessage}</p> : null}
-            {llmPingOk === false ? <p className="mutedLabel">LLM 연결 오류를 확인하세요.</p> : null}
-            {state.llm_status?.last_error ? <p className="mutedLabel">LLM 오류: {state.llm_status.last_error}</p> : null}
-            {state.llm_status?.last_finish_reason ? <p className="mutedLabel">LLM finish_reason: {state.llm_status.last_finish_reason}</p> : null}
-            {state.llm_status?.last_raw_preview ? (
-              <details>
-                <summary>LLM 원문 미리보기</summary>
-                <pre className="emptyState compact">{String(state.llm_status.last_raw_preview)}</pre>
-              </details>
-            ) : null}
-            {state.analysis_runtime?.control_plane_reason ? <p className="mutedLabel">분석 상태: {state.analysis_runtime.control_plane_reason}</p> : null}
-            <p className="mutedLabel">
-              안건 제목 재요청: {Number(state.analysis_runtime?.title_refine_success ?? 0)}/{Number(state.analysis_runtime?.title_refine_attempts ?? 0)}
-            </p>
-            <p className="mutedLabel">
-              수신 JSON: {state.analysis_runtime?.last_llm_json_available ? "있음" : "없음"} {state.analysis_runtime?.last_llm_json_at ? `(${state.analysis_runtime.last_llm_json_at})` : ""}
-            </p>
-            {state.analysis_runtime?.used_local_fallback ? <p className="mutedLabel">현재 로컬 폴백 분석 모드</p> : null}
-            {error ? <p className="emptyState compact">{error}</p> : null}
+            <details className="panelFold">
+              <summary className="panelHeader tight panelFoldHeader">
+                <h3>디버그 모드</h3>
+                <span className="chip chipSoft">{analysisInflight ? "RUNNING" : "IDLE"}</span>
+              </summary>
+              <div className="panelFoldBody">
+                {lineUploadMode ? (
+                  <p className="mutedLabel">
+                    line-mode queue: {replayQueuedCursor}/{replayQueuedTotal} (remaining {replayQueuedRemaining}) {replayDone ? "| done" : ""}
+                  </p>
+                ) : null}
+                <p className="mutedLabel">전사 건수: {state.transcript?.length || 0}</p>
+                {analysisUiDisabled ? <p className="mutedLabel">분석 비활성화: 결과 수신 대기 중</p> : null}
+                {datasetImportInfo ? <p className="mutedLabel">{datasetImportInfo}</p> : null}
+                {llmPingMessage ? <p className="mutedLabel">Ping: {llmPingMessage}</p> : null}
+                {llmPingOk === false ? <p className="mutedLabel">LLM 연결 오류를 확인하세요.</p> : null}
+                {state.llm_status?.last_error ? <p className="mutedLabel">LLM 오류: {state.llm_status.last_error}</p> : null}
+                {state.llm_status?.last_finish_reason ? <p className="mutedLabel">LLM finish_reason: {state.llm_status.last_finish_reason}</p> : null}
+                {state.llm_status?.last_raw_preview ? (
+                  <details>
+                    <summary>LLM 원문 미리보기</summary>
+                    <pre className="emptyState compact">{String(state.llm_status.last_raw_preview)}</pre>
+                  </details>
+                ) : null}
+                {state.analysis_runtime?.control_plane_reason ? <p className="mutedLabel">분석 상태: {state.analysis_runtime.control_plane_reason}</p> : null}
+                <p className="mutedLabel">
+                  분석 워커: {analysisInflight ? "처리중" : "대기"} . 큐 {analysisQueuedCount}
+                  {analysisWorker?.last_done_id ? ` . 마지막 완료 #${analysisWorker.last_done_id}` : ""}
+                </p>
+                {analysisWorker?.last_error ? <p className="mutedLabel">분석 워커 오류: {analysisWorker.last_error}</p> : null}
+                <p className="mutedLabel">
+                  안건 제목 재요청: {Number(state.analysis_runtime?.title_refine_success ?? 0)}/{Number(state.analysis_runtime?.title_refine_attempts ?? 0)}
+                </p>
+                <p className="mutedLabel">
+                  수신 JSON: {state.analysis_runtime?.last_llm_json_available ? "있음" : "없음"} {state.analysis_runtime?.last_llm_json_at ? `(${state.analysis_runtime.last_llm_json_at})` : ""}
+                </p>
+                {state.analysis_runtime?.used_local_fallback ? <p className="mutedLabel">현재 로컬 폴백 분석 모드</p> : null}
+                {error ? <p className="emptyState compact">{error}</p> : null}
 
-            <details open>
-              <summary>디버그 패널</summary>
-              <div className="transcriptMetaBar">
-                <span className="chip chipSoft">agenda_outcomes: {outcomeRows.length}</span>
-                <span className="chip chipSoft">active: {state.analysis?.agenda?.active?.title || "-"}</span>
-                <span className="chip chipSoft">decisions: {decisions.length}</span>
-                <span className="chip chipSoft">actions: {actionItems.length}</span>
-              </div>
-              <div className="panelActions">
-                <button type="button" onClick={() => void onDebugRefresh()} disabled={loading || llmChecking}>상태 강제 새로고침</button>
-                <button type="button" onClick={() => void onLoadLastLlmJson()} disabled={loading || llmChecking || llmJsonLoading}>
-                  {llmJsonLoading ? "조회 중" : "LLM 수신 JSON 보기"}
-                </button>
-                <button type="button" onClick={() => setDebugEvents([])}>디버그 로그 지우기</button>
-              </div>
-              <div className="signalTimeline">
-                {(debugEvents.length ? debugEvents.slice(0, 10) : ["변화 로그 없음"]).map((line, idx) => (
-                  <div key={`debug-log-${idx}`}>
-                    <p>{line}</p>
+                <details>
+                  <summary>디버그 패널</summary>
+                  <div className="transcriptMetaBar">
+                    <span className="chip chipSoft">agenda_outcomes: {outcomeRows.length}</span>
+                    <span className="chip chipSoft">active: {state.analysis?.agenda?.active?.title || "-"}</span>
+                    <span className="chip chipSoft">decisions: {decisions.length}</span>
+                    <span className="chip chipSoft">actions: {actionItems.length}</span>
                   </div>
-                ))}
+                  <div className="panelActions">
+                    <button type="button" onClick={() => void onDebugRefresh()} disabled={loading || llmChecking}>상태 강제 새로고침</button>
+                    <button type="button" onClick={() => void onLoadLastLlmJson()} disabled={loading || llmChecking || llmJsonLoading}>
+                      {llmJsonLoading ? "조회 중" : "LLM 수신 JSON 보기"}
+                    </button>
+                    <button type="button" onClick={() => setDebugEvents([])}>디버그 로그 지우기</button>
+                  </div>
+                  <div className="signalTimeline">
+                    {(debugEvents.length ? debugEvents.slice(0, 10) : ["변화 로그 없음"]).map((line, idx) => (
+                      <div key={`debug-log-${idx}`}>
+                        <p>{line}</p>
+                      </div>
+                    ))}
+                  </div>
+                  <details>
+                    <summary>Raw State 요약(JSON)</summary>
+                    <pre className="emptyState compact">{JSON.stringify(debugSnapshot, null, 2)}</pre>
+                  </details>
+                  <details open={Boolean(lastLlmJson)}>
+                    <summary>LLM 수신 JSON</summary>
+                    {lastLlmJson ? (
+                      <>
+                        <p className="mutedLabel">수신 시각: {lastLlmJsonAt || "-"}</p>
+                        <pre className="emptyState compact">{JSON.stringify(lastLlmJson, null, 2)}</pre>
+                      </>
+                    ) : (
+                      <p className="emptyState compact">버튼을 눌러 최근 수신 JSON을 조회하세요.</p>
+                    )}
+                  </details>
+                </details>
               </div>
-              <details>
-                <summary>Raw State 요약(JSON)</summary>
-                <pre className="emptyState compact">{JSON.stringify(debugSnapshot, null, 2)}</pre>
-              </details>
-              <details open={Boolean(lastLlmJson)}>
-                <summary>LLM 수신 JSON</summary>
-                {lastLlmJson ? (
-                  <>
-                    <p className="mutedLabel">수신 시각: {lastLlmJsonAt || "-"}</p>
-                    <pre className="emptyState compact">{JSON.stringify(lastLlmJson, null, 2)}</pre>
-                  </>
-                ) : (
-                  <p className="emptyState compact">버튼을 눌러 최근 수신 JSON을 조회하세요.</p>
-                )}
-              </details>
             </details>
           </article>
           
@@ -2090,7 +2382,7 @@ export default function Home() {
               <span className="chip chipSoft">연결된 의사결정: {selectedContext.decisionCount}</span>
               <span className="chip chipSoft">연결된 액션: {selectedContext.actionCount}</span>
             </div>
-            <div className="transcriptList">
+            <div ref={transcriptListRef} className="transcriptList" onScroll={onTranscriptScroll}>
               {filteredTranscript.length === 0 ? (
                 <p className="emptyState">
                   {selectedSummaryFocus
@@ -2122,6 +2414,15 @@ export default function Home() {
                 })
               )}
             </div>
+            {!selectedSummaryFocus && pendingTranscriptCount > 0 ? (
+              <button
+                type="button"
+                className="transcriptJumpButton"
+                onClick={() => scrollTranscriptToBottom("smooth")}
+              >
+                새 전사 {pendingTranscriptCount}개 . 아래로
+              </button>
+            ) : null}
           </article>
           </section>
 

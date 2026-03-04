@@ -111,6 +111,14 @@ export interface MeetingState {
   agenda_stack: AgendaItem[];
   llm_enabled?: boolean;
   llm_status?: LlmStatus;
+  replay?: {
+    queued_total?: number;
+    queued_cursor?: number;
+    queued_remaining?: number;
+    done?: boolean;
+    source?: string;
+    loaded_at?: string;
+  };
   analysis_runtime?: {
     tick_mode?: "full_context" | "full_document" | "windowed";
     transcript_count?: number;
@@ -123,6 +131,17 @@ export interface MeetingState {
     title_refine_success?: number;
     last_llm_json_available?: boolean;
     last_llm_json_at?: string;
+    analysis_worker?: {
+      inflight?: boolean;
+      queued?: number;
+      last_enqueued_id?: number;
+      last_started_id?: number;
+      last_done_id?: number;
+      last_enqueued_at?: string;
+      last_started_at?: string;
+      last_done_at?: string;
+      last_error?: string;
+    };
   };
   analysis: AnalysisOutput | null;
 }
@@ -176,5 +195,40 @@ export interface ImportJsonDirResponse {
     warning?: string;
     file_stats: Array<{ file: string; rows: number }>;
     parse_errors?: Array<{ file: string; error: string }>;
+  };
+}
+
+export interface ReplayImportResponse {
+  state: MeetingState;
+  replay_debug: {
+    queued_total: number;
+    queued_cursor: number;
+    queued_remaining: number;
+    done: boolean;
+    source?: string;
+    loaded_at?: string;
+    files_scanned: number;
+    files_parsed: number;
+    files_skipped: number;
+    meeting_goal_applied?: boolean;
+    warning?: string;
+    file_stats: Array<{ file: string; rows: number }>;
+    parse_errors?: Array<{ file: string; error: string }>;
+  };
+}
+
+export interface ReplayStepResponse {
+  state: MeetingState;
+  replay_debug: {
+    added: number;
+    requested: number;
+    analyzed: boolean;
+    queued_task_id?: number;
+    queue_error?: string;
+    queued_total: number;
+    queued_cursor: number;
+    queued_remaining: number;
+    done: boolean;
+    warning?: string;
   };
 }
