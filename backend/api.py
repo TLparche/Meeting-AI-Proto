@@ -25,7 +25,6 @@ ROOT = Path(__file__).resolve().parent.parent
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "large")
 SUMMARY_INTERVAL = 4
 SUMMARY_POINT_TARGET_LEN = None
-REALTIME_MIN_SHIFT_SPAN = 6
 LLM_IO_LOG_MAX = 160
 LLM_IO_PREVIEW_MAX = 6000
 
@@ -445,6 +444,21 @@ def _normalize_summary_item_lines(lines: list[str]) -> list[str]:
             continue
         out.append(f"[{ts}] {summary}" if ts else summary)
     return _dedup_preserve(out, limit=20)
+
+
+def _normalize_summary_item_quality(text: str) -> str:
+    s = _to_summary_point(text, max_len=None)
+    if not s:
+        return ""
+    s = re.sub(r"\s+", " ", s).strip(" .,!?:;")
+    if len(s) < 10:
+        return ""
+    toks = re.findall(r"[A-Za-z0-9가-힣]{2,}", s)
+    if len(toks) < 2:
+        return ""
+    if re.search(r"(언급|소개|요청|질문|확인|설명|진행)\s*$", s) and len(toks) < 4:
+        return ""
+    return _safe_text(s)
 
 
 def _extractive_title_from_candidates(candidates: list[str], meeting_goal: str) -> str:
@@ -997,6 +1011,32 @@ def _active_agenda(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
+def _build_shift_agenda_context(rows: list[dict[str, Any]], limit: int = 18) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    source = rows[-max(1, int(limit)) :]
+    for row in source:
+        if not isinstance(row, dict):
+            continue
+        summary_preview = []
+        for item in list(row.get("_summary_items") or [])[-2:]:
+            txt = _safe_text(item)
+            if txt:
+                summary_preview.append(txt)
+        out.append(
+            {
+                "agenda_id": _safe_text(row.get("agenda_id")),
+                "agenda_title": _safe_text(row.get("agenda_title")),
+                "agenda_state": _normalize_agenda_state(row.get("agenda_state")),
+                "flow_type": _normalize_flow_type(row.get("flow_type")),
+                "start_turn_id": int(row.get("start_turn_id") or 0),
+                "end_turn_id": int(row.get("end_turn_id") or 0),
+                "agenda_keywords": [x for x in list(row.get("agenda_keywords") or [])[:4] if _safe_text(x)],
+                "summary_preview": summary_preview,
+            }
+        )
+    return out
+
+
 def _refresh_analysis(rt: RuntimeStore) -> dict[str, Any]:
     outcomes = []
     for row in rt.agenda_outcomes:
@@ -1445,6 +1485,7 @@ def _sample_turns_for_title(seg_turns: list[dict[str, Any]], max_items: int = 14
 
 
 def _request_agenda_title_with_llm(
+    rt: RuntimeStore,
     client: Any,
     meeting_goal: str,
     turns: list[dict[str, Any]],
@@ -1550,6 +1591,7 @@ def _refresh_low_quality_titles_with_llm(
         if (not title) or _is_low_quality_title(title, rt.meeting_goal):
             attempts += 1
             regenerated = _request_agenda_title_with_llm(
+                rt=rt,
                 client=client,
                 meeting_goal=rt.meeting_goal,
                 turns=turns,
@@ -1891,9 +1933,9 @@ def _apply_outcomes(rt: RuntimeStore, outcomes: list[dict[str, Any]]) -> None:
     for row in cleaned:
         created = _create_agenda(rt, _safe_text(row.get("agenda_title"), "안건 제목 미정"), _normalize_agenda_state(row.get("agenda_state")))
         created["flow_type"] = _safe_text(row.get("flow_type"))
-        created["key_utterances"] = _dedup_preserve(list(row.get("key_utterances") or []), limit=20)
-        created["_summary_items"] = _dedup_preserve(list(row.get("_summary_items") or []), limit=20)
-        created["summary_references"] = list(row.get("summary_references") or [])
+        created["key_utterances"] = _dedup_preserve(list(row.get("key_utterances") or []), limit=10)
+        created["_summary_items"] = _dedup_preserve(list(row.get("_summary_items") or []), limit=8)
+        created["summary_references"] = list(row.get("summary_references") or [])[:12]
         created["summary"] = _safe_text(row.get("summary"))
         created["agenda_keywords"] = _dedup_preserve(list(row.get("agenda_keywords") or []), limit=6)
         created["opinion_groups"] = list(row.get("opinion_groups") or [])
@@ -1994,7 +2036,7 @@ def _build_agenda_detail_prompt(
 2) evidence_turn_ids, key_utterance_turn_ids는 반드시 입력 turn_id만 사용한다.
 3) agenda_keywords는 3~6개 핵심 용어로 작성한다.
 4) key_utterance_turn_ids는 핵심 발언 turn_id를 3~10개로 선택한다.
-5) agenda_summary_items는 2개 이상 작성하고, 각 항목에 evidence_turn_ids를 포함한다.
+5) agenda_summary_items는 2~4개만 작성하고, 각 항목에 evidence_turn_ids를 포함한다.
 6) summary는 위 summary_items를 1~3문장으로 종합한 안건 요약이다.
 7) decision_results는 확정된 결론만 포함한다. 없으면 빈 배열.
 8) action_items는 누가/무엇/기한/근거를 포함한다. 없으면 빈 배열.
@@ -2040,10 +2082,12 @@ def _build_agenda_detail_prompt(
 
 def _build_windowed_shift_prompt(
     rt: RuntimeStore,
+    current_agenda_id: str,
     current_title: str,
     current_flow_type: str,
     current_start_turn_id: int,
     recent_turns: list[dict[str, Any]],
+    existing_agendas: list[dict[str, Any]],
 ) -> str:
     meeting_goal = _safe_text(rt.meeting_goal, "미정")
     lines = []
@@ -2051,30 +2095,35 @@ def _build_windowed_shift_prompt(
         lines.append(
             f"- turn_id={turn['turn_id']} | {turn['timestamp']} | {turn['speaker']} | {turn['text']}"
         )
-    transcript_block = "\n".join(lines)
+    transcript_block = "\n".join(lines) if lines else "- (최근 발화 없음)"
+    agendas_block = json.dumps(existing_agendas, ensure_ascii=False, indent=2)
     return f"""
 너는 실시간 회의 안건 전환 감지기다. 출력은 JSON 하나만 반환한다.
 
 [입력]
 - 회의 목표: {meeting_goal}
+- 현재 ACTIVE agenda_id: {_safe_text(current_agenda_id, "없음")}
 - 현재 ACTIVE 안건: {_safe_text(current_title, "없음")}
 - 현재 안건 흐름 타입: {_safe_text(current_flow_type, "discussion")}
 - 현재 안건 시작 turn_id: {int(current_start_turn_id or 1)}
-- 최근 발화:
+- 기존 안건 목록(JSON):
+{agendas_block}
+- 최근 4턴 발화:
 {transcript_block}
 
 [규칙]
-1) 최근 발화가 현재 안건과 동일 흐름이면 shifted=false.
-2) 주제 전환이 충분히 명확하면 shifted=true.
-3) shifted=true일 때만 new_agenda_title/new_flow_type/shift_turn_id를 채운다.
-4) shift_turn_id는 입력 turn_id 중 하나여야 한다.
-5) new_agenda_title은 상위 논지 한 문장으로 작성한다.
+1) 최근 4턴의 상위 논지를 반드시 new_agenda_title로 작성한다(빈 문자열 금지).
+2) shifted는 "기존 ACTIVE 안건과 충분히 다르면 true, 유사하면 false"로 판단한다.
+3) reuse_agenda_id는 선택값이며, 반드시 채울 필요는 없다.
+4) shift_turn_id는 최근 4턴의 turn_id 중 하나여야 한다.
+5) new_agenda_title은 단어 나열이 아닌 상위 논지 1문장으로 작성한다.
 
 [출력 JSON]
 {{
-  "shifted": true,
+  "shifted": false,
   "shift_turn_id": 120,
-  "new_agenda_title": "string",
+  "reuse_agenda_id": "agenda-3",
+  "new_agenda_title": "",
   "new_flow_type": "discussion|decision|action-planning",
   "reason": "string"
 }}
@@ -2089,20 +2138,20 @@ def _extract_detail_fields_from_parsed(
 ) -> dict[str, Any]:
     keywords = _dedup_preserve([_safe_text(x) for x in (detail_parsed.get("agenda_keywords") or []) if _safe_text(x)], limit=8)
     key_refs = _extract_refs(rt, _to_ids(detail_parsed.get("key_utterance_turn_ids")), turns)
-    key_utterances = _dedup_preserve([f"[{r['timestamp']}] {r['quote']}" for r in key_refs], limit=8)
+    key_utterances = _dedup_preserve([f"[{r['timestamp']}] {r['quote']}" for r in key_refs], limit=10)
 
     summary_items: list[str] = []
     summary_references: list[dict[str, Any]] = []
     for it in detail_parsed.get("agenda_summary_items") or []:
         if not isinstance(it, dict):
             continue
-        txt = _to_summary_point(_safe_text(it.get("summary")))
+        txt = _normalize_summary_item_quality(_safe_text(it.get("summary")))
         if not txt:
             continue
         refs = _extract_refs(rt, _to_ids(it.get("evidence_turn_ids")), turns)
         if refs:
             summary_items.append(f"[{refs[0]['timestamp']}] {txt}")
-            for ref in refs[:6]:
+            for ref in refs[:3]:
                 summary_references.append(
                     {
                         "turn_id": int(ref.get("turn_id") or 0),
@@ -2114,18 +2163,28 @@ def _extract_detail_fields_from_parsed(
                 )
         else:
             summary_items.append(txt)
+        if len(summary_items) >= 4:
+            break
+
+    if not summary_items:
+        parsed_summary = _normalize_summary_item_quality(_safe_text(detail_parsed.get("summary")))
+        if parsed_summary:
+            summary_items.append(parsed_summary)
     if not summary_items:
         from_keys: list[str] = []
-        for line in key_utterances[:10]:
+        for line in key_utterances[:6]:
             ts, body = _split_ts_prefix(line)
-            point = _to_summary_point(body)
+            point = _normalize_summary_item_quality(body)
             if not point:
                 continue
             from_keys.append(f"[{ts}] {point}" if ts else point)
+            if len(from_keys) >= 2:
+                break
         summary_items = from_keys
-    summary_items = _normalize_summary_item_lines(summary_items)
+    summary_items = _dedup_preserve(_normalize_summary_item_lines(summary_items), limit=4)
+
     if not summary_references:
-        for ref in key_refs[:10]:
+        for ref in key_refs[:8]:
             summary_references.append(
                 {
                     "turn_id": int(ref.get("turn_id") or 0),
@@ -2135,6 +2194,8 @@ def _extract_detail_fields_from_parsed(
                     "why": "핵심 발언",
                 }
             )
+            if len(summary_references) >= 12:
+                break
 
     if not keywords:
         keywords = _top_keywords_from_rows(seg_turns, rt.meeting_goal, limit=6)
@@ -2203,13 +2264,13 @@ def _extract_detail_fields_from_parsed(
 
     summary = _to_summary_point(_safe_text(detail_parsed.get("summary")), max_len=None)
     if not summary:
-        summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:10])
+        summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:4])
 
     return {
         "agenda_keywords": _dedup_preserve(keywords, limit=6),
-        "key_utterances": _dedup_preserve(key_utterances, limit=20),
-        "_summary_items": _dedup_preserve(summary_items, limit=20),
-        "summary_references": summary_references[:24],
+        "key_utterances": _dedup_preserve(key_utterances, limit=10),
+        "_summary_items": _dedup_preserve(summary_items, limit=6),
+        "summary_references": summary_references[:12],
         "summary": _safe_text(summary),
         "opinion_groups": opinion_groups[:12],
         "decision_results": decisions,
@@ -2223,15 +2284,15 @@ def _merge_agenda_fields(target: dict[str, Any], fields: dict[str, Any]) -> None
         limit=6,
     )
     target["key_utterances"] = _dedup_preserve(
-        list(target.get("key_utterances") or []) + list(fields.get("key_utterances") or []),
-        limit=20,
+        list(fields.get("key_utterances") or []) + list(target.get("key_utterances") or []),
+        limit=10,
     )
     target["_summary_items"] = _dedup_preserve(
-        list(target.get("_summary_items") or []) + list(fields.get("_summary_items") or []),
-        limit=20,
+        list(fields.get("_summary_items") or []) + list(target.get("_summary_items") or []),
+        limit=8,
     )
-    refs = [dict(x) for x in (target.get("summary_references") or []) if isinstance(x, dict)] + [
-        dict(x) for x in (fields.get("summary_references") or []) if isinstance(x, dict)
+    refs = [dict(x) for x in (fields.get("summary_references") or []) if isinstance(x, dict)] + [
+        dict(x) for x in (target.get("summary_references") or []) if isinstance(x, dict)
     ]
     dedup_refs: list[dict[str, Any]] = []
     seen_ref: set[str] = set()
@@ -2241,7 +2302,7 @@ def _merge_agenda_fields(target: dict[str, Any], fields: dict[str, Any]) -> None
             continue
         seen_ref.add(key)
         dedup_refs.append(ref)
-        if len(dedup_refs) >= 24:
+        if len(dedup_refs) >= 12:
             break
     target["summary_references"] = dedup_refs
     if _safe_text(fields.get("summary")):
@@ -2310,14 +2371,16 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
     active["start_turn_id"] = active_start
     active["end_turn_id"] = max(active_end, max_turn)
 
-    recent_window = max(40, min(160, rt.window_size * 10))
-    recent_turns = turns[max(0, len(turns) - recent_window) :]
+    recent_turns = turns[max(0, len(turns) - SUMMARY_INTERVAL) :]
+    existing_agendas = _build_shift_agenda_context(rt.agenda_outcomes, limit=24)
     shift_prompt = _build_windowed_shift_prompt(
         rt=rt,
+        current_agenda_id=_safe_text(active.get("agenda_id")),
         current_title=_safe_text(active.get("agenda_title")),
         current_flow_type=_normalize_flow_type(active.get("flow_type")),
         current_start_turn_id=active_start,
         recent_turns=recent_turns,
+        existing_agendas=existing_agendas,
     )
     try:
         shift_parsed = _call_llm_json(
@@ -2333,27 +2396,46 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
 
     shifted = _boolify(shift_parsed.get("shifted"), False)
     shift_turn_id = int(shift_parsed.get("shift_turn_id") or 0)
-    recent_ids = {int(t.get("turn_id") or 0) for t in recent_turns}
-    if shift_turn_id not in recent_ids:
+    recent_ids = [int(t.get("turn_id") or 0) for t in recent_turns if int(t.get("turn_id") or 0) > 0]
+    recent_first_id = recent_ids[0] if recent_ids else max_turn
+    if shift_turn_id not in set(recent_ids):
+        shift_turn_id = max(active_start + 1, recent_first_id)
+    if shift_turn_id > max_turn:
         shift_turn_id = max_turn
-    if shift_turn_id <= active_start:
-        shifted = False
+
     shift_guard_reason = ""
     active_title = _safe_text(active.get("agenda_title"))
     candidate_title = _safe_text(shift_parsed.get("new_agenda_title"))
-    active_span = max(0, max_turn - active_start + 1)
-    if shifted and not candidate_title:
-        shifted = False
-        shift_guard_reason = "전환 차단: 새 안건 제목 비어 있음"
-    if shifted and (not _topic_far_enough(active_title, candidate_title)):
-        shifted = False
-        shift_guard_reason = "전환 차단: 현재 안건과 제목 유사"
-    if shifted and active_span < REALTIME_MIN_SHIFT_SPAN:
-        shifted = False
-        shift_guard_reason = f"전환 차단: 안건 길이 {active_span}turn < {REALTIME_MIN_SHIFT_SPAN}turn"
+    if not candidate_title:
+        candidate_title = _extractive_title_from_candidates(
+            [_safe_text(t.get("text")) for t in recent_turns if _safe_text(t.get("text"))],
+            rt.meeting_goal,
+        )
+    candidate_title = _safe_text(_to_summary_point(candidate_title, max_len=None))
+    shift_parsed["new_agenda_title"] = candidate_title
+    shift_parsed["shift_turn_id"] = shift_turn_id
+
+    # 실시간 모드: 4턴마다 새 안건 후보를 만들고, 기존 ACTIVE와 거의 동일할 때만 유지
+    create_new = bool(candidate_title) and _topic_far_enough(active_title, candidate_title)
+    shifted = bool(create_new)
+    switch_to_existing = False
+    reuse_agenda_id = ""
+    reuse_row = None
+    if not create_new:
+        shift_guard_reason = "전환 차단: 현재 안건과 실질적으로 동일"
+
+    if shifted and shift_turn_id <= active_start:
+        shift_turn_id = max_turn
+        shift_parsed["shift_turn_id"] = shift_turn_id
+        if shift_turn_id <= active_start:
+            shifted = False
+            create_new = False
+            shift_guard_reason = "전환 차단: shift_turn_id가 현재 안건 범위 밖"
 
     title_refine_attempts = 0
     title_refine_success = 0
+    transition_mode = "keep_active"
+    switched_agenda_id = ""
 
     if shifted:
         prev_end = max(active_start, min(max_turn, shift_turn_id - 1))
@@ -2361,17 +2443,19 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
         active["agenda_state"] = "CLOSED"
 
         prev_turns = _slice_turns_by_id_range(turns, active_start, prev_end)
+        prev_tail_start = max(active_start, prev_end - SUMMARY_INTERVAL + 1)
+        prev_detail_turns = _slice_turns_by_id_range(turns, prev_tail_start, prev_end)
         prev_detail: dict[str, Any] = {}
-        if prev_turns:
+        if prev_detail_turns:
             try:
                 prev_prompt = _build_agenda_detail_prompt(
                     rt=rt,
                     agenda_title=_safe_text(active.get("agenda_title")),
                     agenda_state="CLOSED",
                     flow_type=_normalize_flow_type(active.get("flow_type")),
-                    start_turn_id=active_start,
+                    start_turn_id=prev_tail_start,
                     end_turn_id=prev_end,
-                    seg_turns=prev_turns,
+                    seg_turns=prev_detail_turns,
                 )
                 prev_detail = _call_llm_json(
                     rt=rt,
@@ -2383,13 +2467,14 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
                 )
             except Exception:
                 prev_detail = {}
-        prev_fields = _extract_detail_fields_from_parsed(rt, turns, prev_turns or recent_turns, prev_detail or {})
+        prev_fields = _extract_detail_fields_from_parsed(rt, turns, prev_detail_turns or recent_turns, prev_detail or {})
         _merge_agenda_fields(active, prev_fields)
 
         title = _safe_text(active.get("agenda_title"))
         if (not title) or _is_low_quality_title(title, rt.meeting_goal):
             title_refine_attempts += 1
             regenerated = _request_agenda_title_with_llm(
+                rt=rt,
                 client=client,
                 meeting_goal=rt.meeting_goal,
                 turns=turns,
@@ -2403,58 +2488,82 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
                 active["agenda_title"] = regenerated
                 title_refine_success += 1
 
-        new_title = _safe_text(shift_parsed.get("new_agenda_title"))
-        new_flow = _normalize_flow_type(shift_parsed.get("new_flow_type"))
-        new_row = _create_agenda(rt, _safe_text(new_title, "새 안건"), "ACTIVE")
-        new_row["flow_type"] = new_flow
-        new_row["start_turn_id"] = shift_turn_id
-        new_row["end_turn_id"] = max_turn
+        next_row: dict[str, Any]
+        next_flow_raw = _safe_text(shift_parsed.get("new_flow_type"))
+        next_flow = _normalize_flow_type(next_flow_raw)
+        if switch_to_existing and reuse_row is not None:
+            next_row = reuse_row
+            switched_agenda_id = _safe_text(next_row.get("agenda_id"))
+            transition_mode = "switch_existing"
+            next_row["flow_type"] = _normalize_flow_type(next_flow_raw or next_row.get("flow_type"))
+            existing_start = int(next_row.get("start_turn_id") or 0)
+            if existing_start <= 0:
+                existing_start = shift_turn_id
+            next_row["start_turn_id"] = min(existing_start, shift_turn_id)
+            next_row["end_turn_id"] = max(int(next_row.get("end_turn_id") or 0), max_turn)
+            next_row["agenda_state"] = "ACTIVE"
+        else:
+            transition_mode = "create_new"
+            new_title = _safe_text(shift_parsed.get("new_agenda_title"))
+            next_row = _create_agenda(rt, _safe_text(new_title, "새 안건"), "ACTIVE")
+            next_row["flow_type"] = next_flow
+            next_row["start_turn_id"] = shift_turn_id
+            next_row["end_turn_id"] = max_turn
 
-        new_turns = _slice_turns_by_id_range(turns, shift_turn_id, max_turn)
-        new_detail: dict[str, Any] = {}
-        if new_turns:
+        for row in rt.agenda_outcomes:
+            if row is next_row:
+                row["agenda_state"] = "ACTIVE"
+            elif _normalize_agenda_state(row.get("agenda_state")) in {"ACTIVE", "CLOSING"}:
+                row["agenda_state"] = "CLOSED"
+
+        next_turns = _slice_turns_by_id_range(turns, shift_turn_id, max_turn)
+        next_detail: dict[str, Any] = {}
+        if next_turns:
             try:
-                new_prompt = _build_agenda_detail_prompt(
+                next_prompt = _build_agenda_detail_prompt(
                     rt=rt,
-                    agenda_title=_safe_text(new_row.get("agenda_title")),
+                    agenda_title=_safe_text(next_row.get("agenda_title")),
                     agenda_state="ACTIVE",
-                    flow_type=new_flow,
+                    flow_type=_normalize_flow_type(next_row.get("flow_type")),
                     start_turn_id=shift_turn_id,
                     end_turn_id=max_turn,
-                    seg_turns=new_turns,
+                    seg_turns=next_turns,
                 )
-                new_detail = _call_llm_json(
+                next_detail = _call_llm_json(
                     rt=rt,
                     client=client,
-                    prompt=new_prompt,
-                    stage="realtime.new_detail",
+                    prompt=next_prompt,
+                    stage="realtime.reuse_detail" if transition_mode == "switch_existing" else "realtime.new_detail",
                     temperature=0.1,
                     max_tokens=2200,
                 )
             except Exception:
-                new_detail = {}
-        new_fields = _extract_detail_fields_from_parsed(rt, turns, new_turns or recent_turns, new_detail or {})
-        _merge_agenda_fields(new_row, new_fields)
+                next_detail = {}
+        next_fields = _extract_detail_fields_from_parsed(rt, turns, next_turns or recent_turns, next_detail or {})
+        _merge_agenda_fields(next_row, next_fields)
 
-        if (not _safe_text(new_row.get("agenda_title"))) or _is_low_quality_title(_safe_text(new_row.get("agenda_title")), rt.meeting_goal):
+        if transition_mode == "create_new" and (
+            (not _safe_text(next_row.get("agenda_title"))) or _is_low_quality_title(_safe_text(next_row.get("agenda_title")), rt.meeting_goal)
+        ):
             title_refine_attempts += 1
             regenerated = _request_agenda_title_with_llm(
+                rt=rt,
                 client=client,
                 meeting_goal=rt.meeting_goal,
                 turns=turns,
                 start_turn_id=shift_turn_id,
                 end_turn_id=max_turn,
-                summary_items=list(new_row.get("_summary_items") or []),
-                key_utterances=list(new_row.get("key_utterances") or []),
-                keywords=list(new_row.get("agenda_keywords") or []),
+                summary_items=list(next_row.get("_summary_items") or []),
+                key_utterances=list(next_row.get("key_utterances") or []),
+                keywords=list(next_row.get("agenda_keywords") or []),
             )
             if regenerated:
-                new_row["agenda_title"] = regenerated
+                next_row["agenda_title"] = regenerated
                 title_refine_success += 1
     else:
         active["agenda_state"] = "ACTIVE"
         active["end_turn_id"] = max_turn
-        seg_start = max(active_start, max_turn - recent_window + 1)
+        seg_start = max(active_start, max_turn - SUMMARY_INTERVAL + 1)
         seg_turns = _slice_turns_by_id_range(turns, seg_start, max_turn)
         detail_parsed: dict[str, Any] = {}
         if seg_turns:
@@ -2481,13 +2590,61 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
         fields = _extract_detail_fields_from_parsed(rt, turns, seg_turns or recent_turns, detail_parsed or {})
         _merge_agenda_fields(active, fields)
 
+    # shifted 여부와 무관하게 ACTIVE 안건 제목은 반드시 유효해야 한다.
+    active_after = _active_agenda(rt.agenda_outcomes)
+    if active_after is not None:
+        active_after_title = _safe_text(active_after.get("agenda_title"))
+        if (not active_after_title) or _is_low_quality_title(active_after_title, rt.meeting_goal):
+            title_refine_attempts += 1
+            a_start = int(active_after.get("start_turn_id") or 1)
+            a_end = int(active_after.get("end_turn_id") or max_turn)
+            if a_end < a_start:
+                a_end = max_turn
+            regenerated = _request_agenda_title_with_llm(
+                rt=rt,
+                client=client,
+                meeting_goal=rt.meeting_goal,
+                turns=turns,
+                start_turn_id=a_start,
+                end_turn_id=a_end,
+                summary_items=list(active_after.get("_summary_items") or []),
+                key_utterances=list(active_after.get("key_utterances") or []),
+                keywords=list(active_after.get("agenda_keywords") or []),
+            )
+            if regenerated:
+                active_after["agenda_title"] = regenerated
+                title_refine_success += 1
+            else:
+                fallback_title = _finalize_agenda_title(
+                    active_after_title,
+                    rt.meeting_goal,
+                    list(active_after.get("agenda_keywords") or []),
+                    list(active_after.get("_summary_items") or []),
+                    list(active_after.get("key_utterances") or []),
+                )
+                if (not _safe_text(fallback_title)) or _is_low_quality_title(fallback_title, rt.meeting_goal):
+                    a_recent = _slice_turns_by_id_range(turns, max(1, max_turn - 12), max_turn)
+                    fallback_title = _extractive_title_from_candidates(
+                        [_safe_text(t.get("text")) for t in a_recent if _safe_text(t.get("text"))],
+                        rt.meeting_goal,
+                    )
+                if (not _safe_text(fallback_title)) or _is_low_quality_title(fallback_title, rt.meeting_goal):
+                    fallback_title = f"{_safe_text(rt.meeting_goal, '현재 논의')}의 원인과 대안"
+                active_after["agenda_title"] = _safe_text(fallback_title[:80], "현재 논의의 원인과 대안")
+
     rt.last_analyzed_count = len(rt.transcript)
     rt.used_local_fallback = False
     rt.last_tick_mode = "windowed"
     rt.last_title_refine_attempts = int(title_refine_attempts)
     rt.last_title_refine_success = int(title_refine_success)
+    if transition_mode == "switch_existing":
+        mode_label = f"기존 안건 재활성화({switched_agenda_id or 'id없음'})"
+    elif transition_mode == "create_new":
+        mode_label = "새 안건 전환"
+    else:
+        mode_label = "현재 안건 유지"
     warn = (
-        f"실시간 모드: {'안건 전환 감지' if shifted else '현재 안건 유지'} | "
+        f"실시간 모드: {mode_label} | "
         f"안건 제목 재요청 {title_refine_success}/{title_refine_attempts} 성공"
     )
     if shift_guard_reason:
@@ -2496,6 +2653,8 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
     rt.last_llm_parsed_json = {
         "pipeline": "windowed_realtime",
         "shift": shift_parsed,
+        "transition_mode": transition_mode,
+        "reuse_agenda_id": switched_agenda_id or reuse_agenda_id,
         "agenda_count": len(rt.agenda_outcomes),
         "active_agenda_title": _safe_text((_active_agenda(rt.agenda_outcomes) or {}).get("agenda_title")),
     }
@@ -2802,6 +2961,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed",
         if need_title_refine:
             title_refine_attempts += 1
             regenerated = _request_agenda_title_with_llm(
+                rt=rt,
                 client=client,
                 meeting_goal=rt.meeting_goal,
                 turns=turns,
@@ -2819,6 +2979,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed",
         if (not _safe_text(title)) or _is_low_quality_title(title, rt.meeting_goal):
             title_refine_attempts += 1
             regenerated = _request_agenda_title_with_llm(
+                rt=rt,
                 client=client,
                 meeting_goal=rt.meeting_goal,
                 turns=turns,
