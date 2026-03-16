@@ -27,8 +27,8 @@ SUMMARY_INTERVAL = 4
 SUMMARY_POINT_TARGET_LEN = None
 LLM_IO_LOG_MAX = 160
 LLM_IO_PREVIEW_MAX = 6000
-DYNAMIC_MIN_WINDOW_TURNS = 3
-DYNAMIC_MAX_WINDOW_TURNS = 10
+DYNAMIC_MIN_WINDOW_TURNS = 6
+DYNAMIC_MAX_WINDOW_TURNS = 8
 DYNAMIC_CHAR_TARGET = 260
 DYNAMIC_INFO_TARGET = 14
 
@@ -712,7 +712,8 @@ class RuntimeStore:
     analysis_last_done_id: int = 0
     analysis_generation: int = 0
     transcript_version: int = 0
-    analysis_next_windowed_target: int = 1
+    analysis_next_windowed_target: int = 0
+    analysis_last_enqueued_target_count: int = 0
     llm_io_seq: int = 0
     llm_io_logs: list[dict[str, Any]] = field(default_factory=list)
 
@@ -747,7 +748,8 @@ class RuntimeStore:
         self.analysis_last_done_id = 0
         self.analysis_generation += 1
         self.transcript_version = 0
-        self.analysis_next_windowed_target = 1
+        self.analysis_next_windowed_target = 0
+        self.analysis_last_enqueued_target_count = 0
         self.llm_io_seq = 0
         self.llm_io_logs = []
 
@@ -939,8 +941,10 @@ def _utterance_information_units(text: str) -> tuple[int, int]:
 def _compute_next_windowed_target(rt: RuntimeStore, from_count: int, transcript_count: int) -> int:
     start = max(0, int(from_count))
     total = max(0, int(transcript_count))
+    min_target = start + DYNAMIC_MIN_WINDOW_TURNS
+    max_target = start + DYNAMIC_MAX_WINDOW_TURNS
     if total <= start:
-        return total + 1
+        return min_target
 
     max_end = min(total, start + DYNAMIC_MAX_WINDOW_TURNS)
     turns = 0
@@ -954,12 +958,16 @@ def _compute_next_windowed_target(rt: RuntimeStore, from_count: int, transcript_
         turns += 1
         chars += ch
         info += inf
+        if turns < DYNAMIC_MIN_WINDOW_TURNS:
+            continue
         # 글자/정보량 임계치는 "현재 발화 포함 후" 판정한다.
         if chars >= DYNAMIC_CHAR_TARGET or info >= DYNAMIC_INFO_TARGET:
             return idx + 1
 
+    if turns < DYNAMIC_MIN_WINDOW_TURNS:
+        return min_target
     if max_end >= total:
-        return total + 1
+        return max_target
     return max_end
 
 
@@ -1024,6 +1032,7 @@ def _enqueue_analysis(
     source: str = "",
     skip_interval: bool = False,
     target_count: int = 0,
+    start_count: int = 0,
 ) -> tuple[bool, int, str]:
     rt.analysis_task_seq += 1
     task_id = int(rt.analysis_task_seq)
@@ -1037,6 +1046,7 @@ def _enqueue_analysis(
         "transcript_version": int(rt.transcript_version),
         "skip_interval": bool(skip_interval),
         "target_count": int(max(0, target_count)),
+        "start_count": int(max(0, start_count)),
     }
     try:
         ANALYSIS_QUEUE.put_nowait(task)
@@ -1051,8 +1061,12 @@ def _enqueue_analysis(
 def _enqueue_windowed_with_backpressure(rt: RuntimeStore, source: str = "") -> tuple[bool, int, str, bool]:
     transcript_count = len(rt.transcript)
     base_count = max(0, int(rt.last_analyzed_count))
-    if rt.analysis_next_windowed_target <= base_count:
-        rt.analysis_next_windowed_target = _compute_next_windowed_target(rt, base_count, transcript_count)
+    if (not rt.analysis_inflight) and int(rt.analysis_queued) <= 0:
+        rt.analysis_last_enqueued_target_count = int(base_count)
+
+    window_start_count = max(int(base_count), int(rt.analysis_last_enqueued_target_count))
+    if rt.analysis_next_windowed_target <= window_start_count:
+        rt.analysis_next_windowed_target = _compute_next_windowed_target(rt, window_start_count, transcript_count)
 
     enqueued = 0
     last_task_id = 0
@@ -1065,11 +1079,14 @@ def _enqueue_windowed_with_backpressure(rt: RuntimeStore, source: str = "") -> t
             source=source,
             skip_interval=True,
             target_count=target_count,
+            start_count=window_start_count,
         )
         if not ok:
             return (enqueued > 0), int(last_task_id), _safe_text(err), False
         enqueued += 1
         last_task_id = int(task_id)
+        window_start_count = int(target_count)
+        rt.analysis_last_enqueued_target_count = int(window_start_count)
         next_target = _compute_next_windowed_target(rt, target_count, transcript_count)
         rt.analysis_next_windowed_target = max(target_count + 1, int(next_target))
 
@@ -1094,6 +1111,8 @@ def _analysis_worker_loop() -> None:
                 current_gen = int(RT.analysis_generation)
                 if task_gen != current_gen:
                     RT.analysis_queued = max(0, int(RT.analysis_queued) - 1)
+                    if int(RT.analysis_queued) == 0:
+                        RT.analysis_last_enqueued_target_count = int(RT.last_analyzed_count)
                     continue
                 RT.analysis_inflight = True
                 RT.analysis_last_started_id = int(task.get("id") or 0)
@@ -1101,11 +1120,12 @@ def _analysis_worker_loop() -> None:
                 RT.analysis_last_error = ""
                 snap = _snapshot_runtime_for_analysis(RT)
                 target_count = int(task.get("target_count") or 0)
+                start_count = int(task.get("start_count") or 0)
                 if snap is not None and target_count > 0:
                     target_count = max(1, min(target_count, len(snap.transcript)))
                     snap.transcript = list(snap.transcript[:target_count])
-                    if snap.last_analyzed_count > target_count:
-                        snap.last_analyzed_count = target_count
+                    start_count = max(0, min(start_count, target_count))
+                    snap.last_analyzed_count = int(start_count)
             try:
                 if snap is not None:
                     _run_analysis(
@@ -1119,6 +1139,7 @@ def _analysis_worker_loop() -> None:
                     RT.analysis_last_error = _safe_text(exc)
                     RT.last_analysis_warning = f"analysis worker 오류: {exc}"
             finally:
+                should_chain_enqueue = False
                 with RT.lock:
                     if task_gen == int(RT.analysis_generation) and snap is not None and not _safe_text(RT.analysis_last_error):
                         _apply_analysis_result(RT, snap)
@@ -1129,6 +1150,19 @@ def _analysis_worker_loop() -> None:
                     RT.analysis_last_done_id = int(task.get("id") or 0)
                     RT.analysis_last_done_at = _now_ts()
                     RT.analysis_queued = max(0, int(RT.analysis_queued) - 1)
+                    if int(RT.analysis_queued) == 0:
+                        RT.analysis_last_enqueued_target_count = int(RT.last_analyzed_count)
+                    mode = _safe_text(task.get("mode"), "windowed")
+                    if (
+                        mode == "windowed"
+                        and task_gen == int(RT.analysis_generation)
+                        and int(RT.analysis_queued) == 0
+                        and int(RT.last_analyzed_count) < len(RT.transcript)
+                    ):
+                        should_chain_enqueue = True
+                if should_chain_enqueue:
+                    with RT.lock:
+                        _enqueue_windowed_with_backpressure(RT, source="worker_chain")
         finally:
             ANALYSIS_QUEUE.task_done()
 
@@ -2144,9 +2178,10 @@ def _build_agenda_outline_prompt(rt: RuntimeStore, turns: list[dict[str, Any]], 
 2) 안건 제목은 해당 안건 구간의 모든 발언을 관통하는 "상위 논지"를 한국어 한 문장으로 요약해 작성한다. 단어 나열/문장 복사는 금지한다.
 3) 현재 진행 안건이 이미 있으면, 정말로 주제가 크게 바뀌었을 때만 새 ACTIVE 안건으로 둔다.
 4) 각 안건은 start_turn_id/end_turn_id를 반드시 포함하고, 안건 간 구간은 시간순/비중첩으로 작성한다.
-5) 분석 모드가 full_document이면, 발화 전체를 끝까지 보고 안건을 한 번에 완성한다. 중간 단계 안건 생성은 금지한다.
-6) full_document에서는 총 발화 수({turn_count})를 고려해 안건 수를 동적으로 잡아라. 권장 안건 수는 {agenda_hint_min}~{agenda_hint_max}개이며, 마지막 안건만 과도하게 길어지지 않게 분할한다.
-7) 이 단계에서는 상세 필드(키워드, 핵심발언, 요약, 근거, 의사결정, 액션아이템)를 생성하지 않는다.
+5) 경계(turn) 판정 시, 해당 발화가 이전 안건 문맥과 더 유사하면 반드시 이전 안건 구간에 포함한다.
+6) 분석 모드가 full_document이면, 발화 전체를 끝까지 보고 안건을 한 번에 완성한다. 중간 단계 안건 생성은 금지한다.
+7) full_document에서는 총 발화 수({turn_count})를 고려해 안건 수를 동적으로 잡아라. 권장 안건 수는 {agenda_hint_min}~{agenda_hint_max}개이며, 마지막 안건만 과도하게 길어지지 않게 분할한다.
+8) 이 단계에서는 상세 필드(키워드, 핵심발언, 요약, 근거, 의사결정, 액션아이템)를 생성하지 않는다.
 
 [출력 JSON 스키마]
 {{
@@ -2270,15 +2305,17 @@ def _build_windowed_shift_prompt(
 - 현재 안건 시작 turn_id: {int(current_start_turn_id or 1)}
 - 기존 안건 목록(JSON):
 {agendas_block}
-- 최근 4턴 발화:
+- 이번 분석 윈도우 발화({len(recent_turns)}턴):
 {transcript_block}
 
 [규칙]
-1) 최근 4턴의 상위 논지를 반드시 new_agenda_title로 작성한다(빈 문자열 금지).
+1) 이번 윈도우 발화의 상위 논지를 반드시 new_agenda_title로 작성한다(빈 문자열 금지).
 2) shifted는 "기존 ACTIVE 안건과 충분히 다르면 true, 유사하면 false"로 판단한다.
 3) reuse_agenda_id는 선택값이며, 반드시 채울 필요는 없다.
-4) shift_turn_id는 최근 4턴의 turn_id 중 하나여야 한다.
+4) shift_turn_id는 이번 윈도우 발화 turn_id 중 하나여야 한다.
 5) new_agenda_title은 단어 나열이 아닌 상위 논지 1문장으로 작성한다.
+6) 윈도우 앞쪽 발화가 기존 ACTIVE 안건 문맥에 더 가깝다면, 그 발화들은 기존 안건에 남겨두고 실제 전환 시작 turn_id를 shift_turn_id로 지정한다.
+7) 즉, shift_turn_id는 "새 안건이 실제로 시작되는 첫 turn_id"여야 하며, 경계 발화가 이전 주제에 가깝다면 더 뒤 turn_id를 선택한다.
 
 [출력 JSON]
 {{
@@ -2533,7 +2570,11 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
     active["start_turn_id"] = active_start
     active["end_turn_id"] = max(active_end, max_turn)
 
-    recent_turns = turns[max(0, len(turns) - SUMMARY_INTERVAL) :]
+    window_start_turn_id = max(1, int(rt.last_analyzed_count) + 1)
+    window_end_turn_id = max_turn
+    recent_turns = _slice_turns_by_id_range(turns, window_start_turn_id, window_end_turn_id)
+    if not recent_turns:
+        recent_turns = turns[max(0, len(turns) - SUMMARY_INTERVAL) :]
     existing_agendas = _build_shift_agenda_context(rt.agenda_outcomes, limit=24)
     shift_prompt = _build_windowed_shift_prompt(
         rt=rt,
@@ -2577,8 +2618,10 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
     shift_parsed["new_agenda_title"] = candidate_title
     shift_parsed["shift_turn_id"] = shift_turn_id
 
-    # 실시간 모드: 4턴마다 새 안건 후보를 만들고, 기존 ACTIVE와 거의 동일할 때만 유지
-    create_new = bool(candidate_title) and _topic_far_enough(active_title, candidate_title)
+    # 실시간 모드: 현재 분석 윈도우 기준으로 전환 여부를 결정한다.
+    llm_shifted = _boolify(shift_parsed.get("shifted"), False)
+    partial_window_split = llm_shifted and bool(recent_ids) and shift_turn_id > recent_first_id
+    create_new = bool(candidate_title) and (llm_shifted or partial_window_split or _topic_far_enough(active_title, candidate_title))
     shifted = bool(create_new)
     switch_to_existing = False
     reuse_agenda_id = ""
