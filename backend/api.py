@@ -2691,6 +2691,22 @@ def _run_local_fallback(rt: RuntimeStore, force: bool = False, reason: str = "",
     return True
 
 
+def _ensure_llm_ready(rt: RuntimeStore) -> tuple[bool, str]:
+    client = get_client()
+    if bool(rt.llm_enabled) and bool(client.connected):
+        return True, ""
+    try:
+        result = client.connect()
+    except Exception as exc:
+        rt.llm_enabled = False
+        return False, f"LLM 연결 실패: {exc}"
+    ok = bool((result or {}).get("ok"))
+    rt.llm_enabled = ok
+    if ok and bool(client.connected):
+        return True, ""
+    return False, _safe_text((result or {}).get("message"), "LLM 연결 실패")
+
+
 def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed", skip_interval: bool = False) -> bool:
     if not rt.transcript:
         rt.used_local_fallback = True
@@ -3339,9 +3355,15 @@ def post_import_json_dir(payload: ImportDirInput):
         queue_err = ""
         queued_task_id = 0
         if payload.auto_tick and RT.transcript:
-            ticked, queued_task_id, queue_err = _enqueue_analysis(RT, force=True, mode="full_document", source="import_json_dir")
-            if not ticked:
-                RT.analysis_last_error = _safe_text(queue_err)
+            ready, ready_msg = _ensure_llm_ready(RT)
+            if not ready:
+                queue_err = _safe_text(ready_msg, "LLM 연결 실패")
+                RT.analysis_last_error = queue_err
+                RT.last_analysis_warning = f"JSON 업로드 후 전체 분석 준비 실패: {queue_err}"
+            else:
+                ticked, queued_task_id, queue_err = _enqueue_analysis(RT, force=True, mode="full_document", source="import_json_dir")
+                if not ticked:
+                    RT.analysis_last_error = _safe_text(queue_err)
 
         return {
             "state": _state_response(RT),
@@ -3389,9 +3411,15 @@ async def post_import_json_files(
         queue_err = ""
         queued_task_id = 0
         if do_tick and RT.transcript:
-            ticked, queued_task_id, queue_err = _enqueue_analysis(RT, force=True, mode="full_document", source="import_json_files")
-            if not ticked:
-                RT.analysis_last_error = _safe_text(queue_err)
+            ready, ready_msg = _ensure_llm_ready(RT)
+            if not ready:
+                queue_err = _safe_text(ready_msg, "LLM 연결 실패")
+                RT.analysis_last_error = queue_err
+                RT.last_analysis_warning = f"JSON 업로드 후 전체 분석 준비 실패: {queue_err}"
+            else:
+                ticked, queued_task_id, queue_err = _enqueue_analysis(RT, force=True, mode="full_document", source="import_json_files")
+                if not ticked:
+                    RT.analysis_last_error = _safe_text(queue_err)
 
         return {
             "state": _state_response(RT),
@@ -3521,10 +3549,18 @@ def post_replay_step(payload: ReplayStepInput):
 @app.post("/api/analysis/tick")
 def post_analysis_tick():
     with RT.lock:
-        ok, _, err = _enqueue_analysis(RT, force=True, mode="full_document", source="manual_tick")
+        ready, ready_msg = _ensure_llm_ready(RT)
+        if not ready:
+            RT.analysis_last_error = _safe_text(ready_msg, "LLM 연결 실패")
+            RT.last_analysis_warning = f"분석 요청 중단: {RT.analysis_last_error}"
+            return _state_response(RT)
+
+        ok, task_id, err = _enqueue_analysis(RT, force=True, mode="full_document", source="manual_tick")
         if not ok:
             RT.analysis_last_error = _safe_text(err)
             RT.last_analysis_warning = f"분석 요청 큐 적재 실패: {err}"
+        else:
+            RT.last_analysis_warning = f"분석 요청 큐 적재 완료: #{task_id}"
         return _state_response(RT)
 
 
