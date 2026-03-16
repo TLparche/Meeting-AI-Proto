@@ -1,4 +1,5 @@
 import type {
+  AgendaMarkdownExportResponse,
   ImportJsonDirResponse,
   LastLlmJsonResponse,
   LlmConnectResponse,
@@ -143,6 +144,10 @@ export async function tickAnalysis(): Promise<MeetingState> {
 
 export async function getLastLlmJson(): Promise<LastLlmJsonResponse> {
   return requestJson<LastLlmJsonResponse>("/api/analysis/last-llm-json", { cache: "no-store" });
+}
+
+export async function exportAgendaMarkdown(): Promise<AgendaMarkdownExportResponse> {
+  return requestJson<AgendaMarkdownExportResponse>("/api/export/agenda-markdown", { cache: "no-store" });
 }
 
 export async function resetState(): Promise<MeetingState> {

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   connectLlm,
   disconnectLlm,
+  exportAgendaMarkdown,
   getLastLlmJson,
   getLlmStatus,
   getState,
@@ -1841,6 +1842,32 @@ export default function Home() {
     }
   };
 
+  const onExportAgendaMarkdown = async () => {
+    beginTask("Markdown 내보내기 준비 중");
+    try {
+      const res = await exportAgendaMarkdown();
+      const filename = safeText(res.filename, `agenda_export_${Date.now()}.md`);
+      const blob = new Blob([safeText(res.markdown)], { type: "text/markdown;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setError("");
+      setDebugEvents((rows) => [
+        `${formatNowTime()} | Markdown 내보내기 완료: ${filename} (agenda=${res.agenda_count}, turns=${res.transcript_count})`,
+        ...rows,
+      ].slice(0, 80));
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      endTask();
+    }
+  };
+
   const renderSummaryCard = () => (
     <details className="card panelCard panelFold" open={false}>
       <summary className="panelHeader panelFoldHeader">
@@ -2203,6 +2230,7 @@ export default function Home() {
                 </button>
               ) : null}
               <button type="button" onClick={() => void apply(() => tickAnalysis(), "전체 분석 실행 중", true)} disabled={loading || analysisUiDisabled}>분석 실행</button>
+              <button type="button" onClick={() => void onExportAgendaMarkdown()} disabled={loading}>안건 MD 내보내기</button>
               <button type="button" onClick={() => { stopReplayAuto(); void apply(() => resetState(), "상태 초기화 중"); }} disabled={loading}>초기화</button>
               <button type="button" onClick={() => void onConnectLlm()} disabled={llmChecking}>{llmChecking ? "연결 중" : "LLM 연결"}</button>
               <button type="button" onClick={() => void onDisconnectLlm()} disabled={llmChecking || !llmEnabled}>연결 해제</button>

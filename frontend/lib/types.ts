@@ -164,6 +164,14 @@ export interface LastLlmJsonResponse {
   json: Record<string, unknown>;
 }
 
+export interface AgendaMarkdownExportResponse {
+  ok: boolean;
+  filename: string;
+  agenda_count: number;
+  transcript_count: number;
+  markdown: string;
+}
+
 export interface SttStepMark {
   step: string;
   t_ms: number;

@@ -27,6 +27,10 @@ SUMMARY_INTERVAL = 4
 SUMMARY_POINT_TARGET_LEN = None
 LLM_IO_LOG_MAX = 160
 LLM_IO_PREVIEW_MAX = 6000
+DYNAMIC_MIN_WINDOW_TURNS = 3
+DYNAMIC_MAX_WINDOW_TURNS = 10
+DYNAMIC_CHAR_TARGET = 260
+DYNAMIC_INFO_TARGET = 14
 
 STOPWORDS = {
     "그냥",
@@ -708,7 +712,7 @@ class RuntimeStore:
     analysis_last_done_id: int = 0
     analysis_generation: int = 0
     transcript_version: int = 0
-    analysis_next_windowed_target: int = SUMMARY_INTERVAL
+    analysis_next_windowed_target: int = 1
     llm_io_seq: int = 0
     llm_io_logs: list[dict[str, Any]] = field(default_factory=list)
 
@@ -743,7 +747,7 @@ class RuntimeStore:
         self.analysis_last_done_id = 0
         self.analysis_generation += 1
         self.transcript_version = 0
-        self.analysis_next_windowed_target = SUMMARY_INTERVAL
+        self.analysis_next_windowed_target = 1
         self.llm_io_seq = 0
         self.llm_io_logs = []
 
@@ -824,6 +828,156 @@ def _call_llm_json(
     return parsed
 
 
+def _md_text(raw: Any) -> str:
+    return re.sub(r"\s+", " ", _safe_text(raw)).strip()
+
+
+def _build_agenda_markdown(rt: RuntimeStore) -> str:
+    lines: list[str] = []
+    lines.append("# 회의 안건/발언 구조")
+    lines.append("")
+    lines.append(f"- 생성 시각: {_now_ts()}")
+    lines.append(f"- 회의 목표: {_safe_text(rt.meeting_goal, '-')}")
+    lines.append(f"- 전사 수: {len(rt.transcript)}")
+    lines.append(f"- 안건 수: {len(rt.agenda_outcomes)}")
+    lines.append("")
+
+    if not rt.agenda_outcomes:
+        lines.append("## 안건 없음")
+        lines.append("")
+        lines.append("현재 분석된 안건이 없습니다.")
+        return "\n".join(lines).strip() + "\n"
+
+    # 화자명을 짧은 별칭으로 통일해 가독성을 높인다.
+    speaker_alias: dict[str, str] = {}
+    speaker_seq = 0
+    for turn in rt.transcript:
+        name = _safe_text(turn.get("speaker"), "화자")
+        if name in speaker_alias:
+            continue
+        speaker_seq += 1
+        speaker_alias[name] = f"화자{speaker_seq}"
+
+    lines.append("## 화자 약어")
+    lines.append("")
+    for name, alias in speaker_alias.items():
+        lines.append(f"- {alias}: {name}")
+    lines.append("")
+
+    total_turns = len(rt.transcript)
+    agenda_outline_rows: list[str] = []
+    for idx, row in enumerate(rt.agenda_outcomes, start=1):
+        agenda_id = _safe_text(row.get("agenda_id"), f"agenda-{idx}")
+        title = _safe_text(row.get("agenda_title"), "안건 제목 미정")
+        state = _normalize_agenda_state(row.get("agenda_state"))
+        flow = _normalize_flow_type(row.get("flow_type"))
+        start_id = int(row.get("start_turn_id") or row.get("_start_turn_id") or 0)
+        end_id = int(row.get("end_turn_id") or row.get("_end_turn_id") or 0)
+        if start_id <= 0:
+            start_id = 1
+        if end_id < start_id:
+            end_id = min(total_turns, start_id)
+        end_id = min(total_turns, end_id)
+
+        lines.append(f"## 안건 {idx}. {title}")
+        lines.append("")
+        lines.append(f"- agenda_id: `{agenda_id}`")
+        lines.append(f"- 상태: `{state}`")
+        lines.append(f"- 흐름: `{flow}`")
+        lines.append(f"- turn 범위: `{start_id} ~ {end_id}`")
+        summary = _md_text(row.get("summary"))
+        if summary:
+            lines.append(f"- 요약: {summary}")
+        lines.append("")
+        agenda_outline_rows.append(f"- 안건 {idx}: {title} (`{state}`, turn {start_id}~{end_id})")
+
+        utterances: list[tuple[int, dict[str, Any]]] = []
+        if 1 <= start_id <= end_id <= total_turns:
+            for turn_id in range(start_id, end_id + 1):
+                utterances.append((turn_id, rt.transcript[turn_id - 1]))
+        else:
+            seen_ids: set[int] = set()
+            for ref in list(row.get("summary_references") or []):
+                if not isinstance(ref, dict):
+                    continue
+                tid = int(ref.get("turn_id") or 0)
+                if tid <= 0 or tid > total_turns or tid in seen_ids:
+                    continue
+                seen_ids.add(tid)
+                utterances.append((tid, rt.transcript[tid - 1]))
+            utterances.sort(key=lambda x: x[0])
+
+        lines.append(f"### 발언 ({len(utterances)})")
+        if not utterances:
+            lines.append("- 매핑된 발언이 없습니다.")
+        else:
+            for turn_id, turn in utterances:
+                speaker = _safe_text(turn.get("speaker"), "화자")
+                speaker_short = speaker_alias.get(speaker, "화자")
+                text = _md_text(turn.get("text"))
+                lines.append(f"- ({turn_id}) **{speaker_short}**: {text}")
+        lines.append("")
+
+    lines.append("## 안건 목록 요약")
+    lines.append("")
+    lines.extend(agenda_outline_rows if agenda_outline_rows else ["- 안건 없음"])
+    lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _utterance_information_units(text: str) -> tuple[int, int]:
+    body = _safe_text(text)
+    if not body:
+        return 0, 0
+    info_tokens = len(set(_keyword_tokens(body)))
+    # 발화 단위는 절대 자르지 않고, 실제 글자 수를 그대로 반영한다.
+    char_units = len(body)
+    return char_units, info_tokens
+
+
+def _compute_next_windowed_target(rt: RuntimeStore, from_count: int, transcript_count: int) -> int:
+    start = max(0, int(from_count))
+    total = max(0, int(transcript_count))
+    if total <= start:
+        return total + 1
+
+    max_end = min(total, start + DYNAMIC_MAX_WINDOW_TURNS)
+    turns = 0
+    chars = 0
+    info = 0
+    for idx in range(start, max_end):
+        if idx >= len(rt.transcript):
+            break
+        turn = rt.transcript[idx]
+        ch, inf = _utterance_information_units(_safe_text(turn.get("text")))
+        turns += 1
+        chars += ch
+        info += inf
+        # 글자/정보량 임계치는 "현재 발화 포함 후" 판정한다.
+        if chars >= DYNAMIC_CHAR_TARGET or info >= DYNAMIC_INFO_TARGET:
+            return idx + 1
+
+    if max_end >= total:
+        return total + 1
+    return max_end
+
+
+def _windowed_progress(rt: RuntimeStore, from_count: int, transcript_count: int) -> tuple[int, int, int]:
+    start = max(0, int(from_count))
+    total = max(0, min(int(transcript_count), len(rt.transcript)))
+    turns = 0
+    chars = 0
+    info = 0
+    for idx in range(start, total):
+        turn = rt.transcript[idx]
+        ch, inf = _utterance_information_units(_safe_text(turn.get("text")))
+        turns += 1
+        chars += ch
+        info += inf
+    return turns, chars, info
+
+
 def _snapshot_runtime_for_analysis(rt: RuntimeStore) -> RuntimeStore:
     snap = RuntimeStore()
     snap.meeting_goal = _safe_text(rt.meeting_goal)
@@ -896,29 +1050,37 @@ def _enqueue_analysis(
 
 def _enqueue_windowed_with_backpressure(rt: RuntimeStore, source: str = "") -> tuple[bool, int, str, bool]:
     transcript_count = len(rt.transcript)
-    if rt.analysis_next_windowed_target < SUMMARY_INTERVAL:
-        rt.analysis_next_windowed_target = SUMMARY_INTERVAL
+    base_count = max(0, int(rt.last_analyzed_count))
+    if rt.analysis_next_windowed_target <= base_count:
+        rt.analysis_next_windowed_target = _compute_next_windowed_target(rt, base_count, transcript_count)
 
     enqueued = 0
     last_task_id = 0
     while rt.analysis_next_windowed_target <= transcript_count:
+        target_count = int(rt.analysis_next_windowed_target)
         ok, task_id, err = _enqueue_analysis(
             rt,
             force=False,
             mode="windowed",
             source=source,
             skip_interval=True,
-            target_count=rt.analysis_next_windowed_target,
+            target_count=target_count,
         )
         if not ok:
             return (enqueued > 0), int(last_task_id), _safe_text(err), False
         enqueued += 1
         last_task_id = int(task_id)
-        rt.analysis_next_windowed_target += SUMMARY_INTERVAL
+        next_target = _compute_next_windowed_target(rt, target_count, transcript_count)
+        rt.analysis_next_windowed_target = max(target_count + 1, int(next_target))
 
     if enqueued <= 0:
-        delta = transcript_count - int(rt.last_analyzed_count)
-        return False, 0, f"waiting interval: {delta}/{SUMMARY_INTERVAL}", True
+        turns, chars, info = _windowed_progress(rt, base_count, transcript_count)
+        return (
+            False,
+            0,
+            f"waiting info-threshold: turns={turns}, chars={chars}/{DYNAMIC_CHAR_TARGET}, info={info}/{DYNAMIC_INFO_TARGET}",
+            True,
+        )
     return True, int(last_task_id), "", False
 
 
@@ -961,8 +1123,8 @@ def _analysis_worker_loop() -> None:
                     if task_gen == int(RT.analysis_generation) and snap is not None and not _safe_text(RT.analysis_last_error):
                         _apply_analysis_result(RT, snap)
                         rt_count = len(RT.transcript)
-                        next_target = ((int(RT.last_analyzed_count) // SUMMARY_INTERVAL) + 1) * SUMMARY_INTERVAL
-                        RT.analysis_next_windowed_target = max(SUMMARY_INTERVAL, min(next_target, rt_count + SUMMARY_INTERVAL))
+                        next_target = _compute_next_windowed_target(RT, int(RT.last_analyzed_count), rt_count)
+                        RT.analysis_next_windowed_target = max(int(RT.last_analyzed_count) + 1, int(next_target))
                     RT.analysis_inflight = False
                     RT.analysis_last_done_id = int(task.get("id") or 0)
                     RT.analysis_last_done_at = _now_ts()
@@ -1101,7 +1263,7 @@ def _state_response(rt: RuntimeStore) -> dict[str, Any]:
             "llm_window_turns": rt.window_size,
             "engine_window_turns": rt.window_size,
             "control_plane_source": "gemini",
-            "control_plane_reason": rt.last_analysis_warning or ("full_document_once" if rt.last_tick_mode == "full_document" else "summary_every_4_turns"),
+            "control_plane_reason": rt.last_analysis_warning or ("full_document_once" if rt.last_tick_mode == "full_document" else "summary_by_information_units"),
             "used_local_fallback": bool(rt.used_local_fallback),
             "title_refine_attempts": int(rt.last_title_refine_attempts),
             "title_refine_success": int(rt.last_title_refine_success),
@@ -2665,7 +2827,7 @@ def _run_realtime_window_analysis(rt: RuntimeStore, client: Any) -> bool:
 def _run_local_fallback(rt: RuntimeStore, force: bool = False, reason: str = "", mode: str = "windowed") -> bool:
     if not rt.transcript:
         return False
-    if mode != "full_document" and (not force) and (len(rt.transcript) - rt.last_analyzed_count) < SUMMARY_INTERVAL:
+    if mode != "full_document" and (not force) and (len(rt.transcript) - rt.last_analyzed_count) < DYNAMIC_MIN_WINDOW_TURNS:
         return False
 
     turns: list[dict[str, Any]] = []
@@ -2715,7 +2877,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed",
         rt.last_title_refine_attempts = 0
         rt.last_title_refine_success = 0
         return False
-    if mode != "full_document" and (not force) and (not skip_interval) and (len(rt.transcript) - rt.last_analyzed_count) < SUMMARY_INTERVAL:
+    if mode != "full_document" and (not force) and (not skip_interval) and (len(rt.transcript) - rt.last_analyzed_count) < DYNAMIC_MIN_WINDOW_TURNS:
         return False
     if not rt.llm_enabled:
         return _run_local_fallback(rt, force=force, reason="LLM 미연결", mode=mode)
@@ -3572,6 +3734,20 @@ def get_last_llm_json():
             "received_at": _safe_text(RT.last_llm_parsed_at),
             "has_json": bool(RT.last_llm_parsed_json),
             "json": RT.last_llm_parsed_json if isinstance(RT.last_llm_parsed_json, dict) else {},
+        }
+
+
+@app.get("/api/export/agenda-markdown")
+def get_export_agenda_markdown():
+    with RT.lock:
+        markdown = _build_agenda_markdown(RT)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        return {
+            "ok": True,
+            "filename": f"agenda_export_{stamp}.md",
+            "agenda_count": len(RT.agenda_outcomes),
+            "transcript_count": len(RT.transcript),
+            "markdown": markdown,
         }
 
 
