@@ -140,6 +140,7 @@ type OpinionGroup = {
 };
 
 type CanvasComposerTool = "note" | "comment" | "topic" | "agenda";
+type CanvasStage = "ideation" | "problem-definition" | "solution";
 
 type CanvasIdea = {
   id: string;
@@ -938,6 +939,7 @@ export default function Home() {
   const [canvasRightPanelAnim, setCanvasRightPanelAnim] = useState<"idle" | "out" | "in">("idle");
   const [canvasComposerOpen, setCanvasComposerOpen] = useState(false);
   const [canvasComposerTool, setCanvasComposerTool] = useState<CanvasComposerTool>("note");
+  const [canvasStage, setCanvasStage] = useState<CanvasStage>("ideation");
   const [canvasReturnContext, setCanvasReturnContext] = useState("");
   const [transcriptAutoFollow, setTranscriptAutoFollow] = useState(true);
   const [pendingTranscriptCount, setPendingTranscriptCount] = useState(0);
@@ -1602,6 +1604,8 @@ export default function Home() {
   }, [agendas, selectedAgendaId]);
 
   const selectedAgenda = agendas.find((agenda) => agenda.id === selectedAgendaId) || agendas[0] || null;
+  const canvasTopicLabel = selectedAgenda?.title || safeText(meetingGoalDraft) || safeText(state.meeting_goal) || "공용 캔버스";
+  const isIdeationStage = canvasStage === "ideation";
 
   const transcript = useMemo<TranscriptUtterance[]>(() => {
     const src = state.transcript || [];
@@ -3336,12 +3340,35 @@ export default function Home() {
           </>
           ) : (
             <header className="canvasPageHeader">
-              <div className="canvasPageHeaderLeft">
-                <span className="canvasPageBadge">Canvas</span>
-                <h1>공용 캔버스</h1>
-              </div>
-              <div className="canvasCanvasToolbar">
-                <span className="canvasToolbarMeta">{meeting.title}</span>
+              <div className="canvasPageHeaderStack">
+                <div className="canvasPageHeaderLeft">
+                  <span className="canvasPageBadge">Canvas</span>
+                  <h1>공용 캔버스</h1>
+                </div>
+                <div className="canvasStageBar">
+                  <div className="canvasStageTopic">
+                    <span className="canvasStageTopicLabel">주제</span>
+                    <strong>{canvasTopicLabel}</strong>
+                  </div>
+                  <div className="canvasStageTabs" role="tablist" aria-label="캔버스 단계">
+                    {([
+                      ["ideation", "아이디어 단계"],
+                      ["problem-definition", "문제 정의 단계"],
+                      ["solution", "해결책 단계"],
+                    ] as const).map(([stage, label]) => (
+                      <button
+                        key={stage}
+                        type="button"
+                        role="tab"
+                        aria-selected={canvasStage === stage}
+                        className={`canvasStageTab ${canvasStage === stage ? "canvasStageTabActive" : ""}`}
+                        onClick={() => setCanvasStage(stage)}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
             </header>
           )}
@@ -3670,88 +3697,100 @@ export default function Home() {
             ) : (
               <div className="canvasWorkspace canvasWorkspaceImmersive">
                 <div className="canvasBoard canvasBoardImmersive">
-                  <CanvasFlowSurface
-                    nodeSeed={flowNodeSeed}
-                    edgeSeed={flowEdgeSeed}
-                    hasNodes={flowNodeSeed.length > 0}
-                    canvasLanesCount={canvasLanes.length}
-                    canvasIdeasCount={canvasIdeas.length}
-                    selectedAgendaLabel={selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}
-                    onNodeClick={onFlowNodeClick}
-                    onPaneClick={handleCanvasPaneClick}
-                    onNodeDragStop={onFlowNodeDragStop}
-                  />
-                  {canvasComposerOpen ? (
-                    <div className="canvasDockComposer" aria-label="캔버스 작성 패널">
-                      <div className="canvasDockComposerHeader">
-                        <div>
-                          <p className="canvasEyebrow">{canvasToolLabel(canvasComposerTool)}</p>
-                          <h3>{canvasToolLabel(canvasComposerTool)} 추가</h3>
-                          <p className="mutedLabel">
-                            {canvasComposerTool === "agenda"
-                              ? "새 안건 레인을 캔버스에 직접 추가합니다."
-                              : `${selectedAgenda ? agendaLabel(selectedAgenda) : "현재 안건"}에 ${canvasToolLabel(canvasComposerTool)}를 배치합니다. 기본 상태는 비공개입니다.`}
-                            {selectedSummaryFocus && canvasComposerTool !== "agenda" ? " 현재 선택 요약과 연결됩니다." : ""}
-                          </p>
+                  {isIdeationStage ? (
+                    <>
+                      <CanvasFlowSurface
+                        nodeSeed={flowNodeSeed}
+                        edgeSeed={flowEdgeSeed}
+                        hasNodes={flowNodeSeed.length > 0}
+                        canvasLanesCount={canvasLanes.length}
+                        canvasIdeasCount={canvasIdeas.length}
+                        selectedAgendaLabel={selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}
+                        onNodeClick={onFlowNodeClick}
+                        onPaneClick={handleCanvasPaneClick}
+                        onNodeDragStop={onFlowNodeDragStop}
+                      />
+                      {canvasComposerOpen ? (
+                        <div className="canvasDockComposer" aria-label="캔버스 작성 패널">
+                          <div className="canvasDockComposerHeader">
+                            <div>
+                              <p className="canvasEyebrow">{canvasToolLabel(canvasComposerTool)}</p>
+                              <h3>{canvasToolLabel(canvasComposerTool)} 추가</h3>
+                              <p className="mutedLabel">
+                                {canvasComposerTool === "agenda"
+                                  ? "새 안건 레인을 캔버스에 직접 추가합니다."
+                                  : `${selectedAgenda ? agendaLabel(selectedAgenda) : "현재 안건"}에 ${canvasToolLabel(canvasComposerTool)}를 배치합니다. 기본 상태는 비공개입니다.`}
+                                {selectedSummaryFocus && canvasComposerTool !== "agenda" ? " 현재 선택 요약과 연결됩니다." : ""}
+                              </p>
+                            </div>
+                            <button type="button" className="ghostButton" onClick={() => setCanvasComposerOpen(false)}>
+                              닫기
+                            </button>
+                          </div>
+                          <div className="canvasComposerGrid">
+                            <input
+                              aria-label={`${canvasToolLabel(canvasComposerTool)} 제목`}
+                              placeholder={canvasComposerTool === "agenda" ? "안건 제목" : "짧은 제목"}
+                              value={canvasIdeaTitle}
+                              onChange={(event) => setCanvasIdeaTitle(event.target.value)}
+                            />
+                            <textarea
+                              aria-label={`${canvasToolLabel(canvasComposerTool)} 내용`}
+                              placeholder={
+                                canvasComposerTool === "note"
+                                  ? "메모할 내용을 입력"
+                                  : canvasComposerTool === "comment"
+                                    ? "코멘트나 피드백을 입력"
+                                    : canvasComposerTool === "topic"
+                                      ? "새 주제 설명을 입력"
+                                      : "안건 설명을 입력"
+                              }
+                              value={canvasIdeaBody}
+                              onChange={(event) => setCanvasIdeaBody(event.target.value)}
+                            />
+                          </div>
+                          <div className="panelActions">
+                            <button
+                              type="button"
+                              onClick={addCanvasItem}
+                              disabled={analysisUiDisabled || (!safeText(canvasIdeaTitle) && !safeText(canvasIdeaBody))}
+                            >
+                              {canvasToolLabel(canvasComposerTool)} 추가
+                            </button>
+                            <button type="button" className="ghostButton" onClick={clearCanvasIdeaInputs} disabled={analysisUiDisabled}>
+                              입력 지우기
+                            </button>
+                          </div>
                         </div>
-                        <button type="button" className="ghostButton" onClick={() => setCanvasComposerOpen(false)}>
-                          닫기
-                        </button>
+                      ) : null}
+                      <div className="canvasBottomDock" aria-label="캔버스 도구 모음">
+                        {([
+                          ["note", "메모 입력"],
+                          ["comment", "코멘트 입력"],
+                          ["topic", "주제 추가"],
+                          ["agenda", "Agenda 추가"],
+                        ] as const).map(([tool, label]) => (
+                          <button
+                            key={tool}
+                            type="button"
+                            className={`canvasDockTool ${canvasComposerOpen && canvasComposerTool === tool ? "canvasDockToolActive" : ""}`}
+                            onClick={() => selectCanvasTool(tool)}
+                          >
+                            <span className="canvasDockToolIcon">{tool === "note" ? "N" : tool === "comment" ? "C" : tool === "topic" ? "T" : "A"}</span>
+                            <span>{label}</span>
+                          </button>
+                        ))}
                       </div>
-                      <div className="canvasComposerGrid">
-                        <input
-                          aria-label={`${canvasToolLabel(canvasComposerTool)} 제목`}
-                          placeholder={canvasComposerTool === "agenda" ? "안건 제목" : "짧은 제목"}
-                          value={canvasIdeaTitle}
-                          onChange={(event) => setCanvasIdeaTitle(event.target.value)}
-                        />
-                        <textarea
-                          aria-label={`${canvasToolLabel(canvasComposerTool)} 내용`}
-                          placeholder={
-                            canvasComposerTool === "note"
-                              ? "메모할 내용을 입력"
-                              : canvasComposerTool === "comment"
-                                ? "코멘트나 피드백을 입력"
-                                : canvasComposerTool === "topic"
-                                  ? "새 주제 설명을 입력"
-                                  : "안건 설명을 입력"
-                          }
-                          value={canvasIdeaBody}
-                          onChange={(event) => setCanvasIdeaBody(event.target.value)}
-                        />
-                      </div>
-                      <div className="panelActions">
-                        <button
-                          type="button"
-                          onClick={addCanvasItem}
-                          disabled={analysisUiDisabled || (!safeText(canvasIdeaTitle) && !safeText(canvasIdeaBody))}
-                        >
-                          {canvasToolLabel(canvasComposerTool)} 추가
-                        </button>
-                        <button type="button" className="ghostButton" onClick={clearCanvasIdeaInputs} disabled={analysisUiDisabled}>
-                          입력 지우기
-                        </button>
+                    </>
+                  ) : (
+                    <div className="canvasStageEmpty">
+                      <div className="canvasStageEmptyCard">
+                        <p className="canvasEyebrow">{canvasTopicLabel}</p>
+                        <h3>{canvasStage === "problem-definition" ? "문제 정의 단계" : "해결책 단계"}</h3>
+                        <p>이 단계는 아직 비어 있습니다. 현재 아이디어 단계 작업 상태는 그대로 저장되어 있습니다.</p>
                       </div>
                     </div>
-                  ) : null}
-                  <div className="canvasBottomDock" aria-label="캔버스 도구 모음">
-                    {([
-                      ["note", "메모 입력"],
-                      ["comment", "코멘트 입력"],
-                      ["topic", "주제 추가"],
-                      ["agenda", "Agenda 추가"],
-                    ] as const).map(([tool, label]) => (
-                      <button
-                        key={tool}
-                        type="button"
-                        className={`canvasDockTool ${canvasComposerOpen && canvasComposerTool === tool ? "canvasDockToolActive" : ""}`}
-                        onClick={() => selectCanvasTool(tool)}
-                      >
-                        <span className="canvasDockToolIcon">{tool === "note" ? "N" : tool === "comment" ? "C" : tool === "topic" ? "T" : "A"}</span>
-                        <span>{label}</span>
-                      </button>
-                    ))}
-                  </div>
+                  )}
                 </div>
               </div>
             )}
