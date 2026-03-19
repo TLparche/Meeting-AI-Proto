@@ -31,6 +31,7 @@ DYNAMIC_MIN_WINDOW_TURNS = 6
 DYNAMIC_MAX_WINDOW_TURNS = 8
 DYNAMIC_CHAR_TARGET = 260
 DYNAMIC_INFO_TARGET = 14
+AGENDA_SUMMARY_ITEM_TARGET = 3
 
 STOPWORDS = {
     "그냥",
@@ -1966,16 +1967,16 @@ def _enrich_outcome_summary(
                 break
 
         if not has_min_summary:
-            summary_items = _dedup_preserve(summary_items + auto_items, limit=20)
+            summary_items = _dedup_preserve(summary_items + auto_items, limit=AGENDA_SUMMARY_ITEM_TARGET)
         if not has_min_refs:
             summary_refs = summary_refs + auto_refs
 
     if not summary_refs:
         summary_refs = [_ref_from_turn(seg_turns[-1], why="요약 근거")]
-    out["_summary_items"] = _normalize_summary_item_lines(summary_items)
+    out["_summary_items"] = _normalize_summary_item_lines(summary_items)[:AGENDA_SUMMARY_ITEM_TARGET]
     out["summary_references"] = summary_refs[:24]
     if not _safe_text(out.get("summary")):
-        out["summary"] = " • ".join(x.split("] ", 1)[-1] for x in out["_summary_items"][:10])
+        out["summary"] = " • ".join(x.split("] ", 1)[-1] for x in out["_summary_items"][:AGENDA_SUMMARY_ITEM_TARGET])
     out["agenda_title"] = _finalize_agenda_title(
         out.get("agenda_title"),
         rt.meeting_goal,
@@ -2010,9 +2011,9 @@ def _build_local_outcomes(rt: RuntimeStore, turns: list[dict[str, Any]]) -> list
 
         key_refs = _pick_key_refs(seg_turns, keywords, max_items=8)
         key_utterances = [f"[{_safe_text(r.get('timestamp'))}] {_safe_text(r.get('quote'))}" for r in key_refs]
-        summary_refs = key_refs[:10] if key_refs else [_ref_from_turn(seg_turns[-1])]
+        summary_refs = key_refs[:AGENDA_SUMMARY_ITEM_TARGET] if key_refs else [_ref_from_turn(seg_turns[-1])]
         summary_items = [f"[{_safe_text(r.get('timestamp'))}] {_to_summary_point(_safe_text(r.get('quote')))}" for r in summary_refs]
-        summary_items = _normalize_summary_item_lines(summary_items)
+        summary_items = _normalize_summary_item_lines(summary_items)[:AGENDA_SUMMARY_ITEM_TARGET]
 
         seed_candidates = [t.get("text") for t in seg_turns[:6]] + [t.get("text") for t in seg_turns[-6:]]
         seed_title = _extractive_title_from_candidates([_safe_text(x) for x in seed_candidates], rt.meeting_goal)
@@ -2023,7 +2024,7 @@ def _build_local_outcomes(rt: RuntimeStore, turns: list[dict[str, Any]]) -> list
             title = f"{title} #{seg_idx + 1}"
         used_titles.add(title)
 
-        summary = " • ".join(item.split("] ", 1)[-1] for item in summary_items[:10])
+        summary = " • ".join(item.split("] ", 1)[-1] for item in summary_items[:AGENDA_SUMMARY_ITEM_TARGET])
         decisions = _extract_decisions_from_turns(seg_turns, max_items=4)
         actions = _extract_actions_from_turns(seg_turns, max_items=6)
 
@@ -2039,7 +2040,7 @@ def _build_local_outcomes(rt: RuntimeStore, turns: list[dict[str, Any]]) -> list
                 "agenda_state": "ACTIVE" if seg_idx == len(segments) - 1 else "CLOSED",
                 "flow_type": flow_type,
                 "key_utterances": _dedup_preserve(key_utterances, limit=20),
-                "_summary_items": _dedup_preserve(summary_items, limit=20),
+                "_summary_items": _dedup_preserve(summary_items, limit=AGENDA_SUMMARY_ITEM_TARGET),
                 "summary_references": summary_refs,
                 "summary": _safe_text(summary),
                 "agenda_keywords": _dedup_preserve(keywords, limit=6),
@@ -2230,7 +2231,7 @@ def _apply_outcomes(rt: RuntimeStore, outcomes: list[dict[str, Any]]) -> None:
         created = _create_agenda(rt, _safe_text(row.get("agenda_title"), "안건 제목 미정"), _normalize_agenda_state(row.get("agenda_state")))
         created["flow_type"] = _safe_text(row.get("flow_type"))
         created["key_utterances"] = _dedup_preserve(list(row.get("key_utterances") or []), limit=10)
-        created["_summary_items"] = _dedup_preserve(list(row.get("_summary_items") or []), limit=8)
+        created["_summary_items"] = _dedup_preserve(list(row.get("_summary_items") or []), limit=AGENDA_SUMMARY_ITEM_TARGET)
         created["summary_references"] = list(row.get("summary_references") or [])[:12]
         created["summary"] = _safe_text(row.get("summary"))
         created["agenda_keywords"] = _dedup_preserve(list(row.get("agenda_keywords") or []), limit=6)
@@ -2333,14 +2334,15 @@ def _build_agenda_detail_prompt(
 2) evidence_turn_ids, key_utterance_turn_ids는 반드시 입력 turn_id만 사용한다.
 3) agenda_keywords는 3~6개 핵심 용어로 작성한다.
 4) key_utterance_turn_ids는 핵심 발언 turn_id를 3~10개로 선택한다.
-5) agenda_summary_items는 2~4개만 작성하고, 각 항목에 evidence_turn_ids를 포함한다.
-6) summary는 위 summary_items를 1~3문장으로 종합한 안건 요약이다.
-7) decision_results는 확정된 결론만 포함한다. 없으면 빈 배열.
-8) action_items는 누가/무엇/기한/근거를 포함한다. 없으면 빈 배열.
-9) 원문 장문 인용은 금지하고, 요약 문장으로 작성한다.
-10) opinion_groups를 반드시 작성한다. 안건 내 유사 의견을 묶어 2~8개 그룹으로 정리한다.
-11) 각 opinion_groups 항목은 type, summary, evidence_turn_ids를 포함해야 한다.
-12) type은 proposal|concern|question|agree|disagree|info 중 하나만 사용한다.
+5) agenda_summary_items는 기본 3개로 작성한다. 정말 정보가 부족한 경우만 2개까지 허용한다.
+6) 각 agenda_summary_items는 해당 안건 구간 발화 여러 개를 재구성한 "핵심 흐름 요약"이어야 한다. 원문 한 문장을 거의 그대로 복사하지 말고, 해당 안건을 이루는 발언들을 종합해 작성한다.
+7) summary는 위 summary_items 3개 안팎을 1~3문장으로 종합한 안건 요약이다.
+8) decision_results는 확정된 결론만 포함한다. 없으면 빈 배열.
+9) action_items는 누가/무엇/기한/근거를 포함한다. 없으면 빈 배열.
+10) 원문 장문 인용은 금지하고, 요약 문장으로 작성한다.
+11) opinion_groups를 반드시 작성한다. 안건 내 유사 의견을 묶어 2~8개 그룹으로 정리한다.
+12) 각 opinion_groups 항목은 type, summary, evidence_turn_ids를 포함해야 한다.
+13) type은 proposal|concern|question|agree|disagree|info 중 하나만 사용한다.
 
 [출력 JSON 스키마]
 {{
@@ -2462,7 +2464,7 @@ def _extract_detail_fields_from_parsed(
                 )
         else:
             summary_items.append(txt)
-        if len(summary_items) >= 4:
+        if len(summary_items) >= AGENDA_SUMMARY_ITEM_TARGET:
             break
 
     if not summary_items:
@@ -2471,16 +2473,16 @@ def _extract_detail_fields_from_parsed(
             summary_items.append(parsed_summary)
     if not summary_items:
         from_keys: list[str] = []
-        for line in key_utterances[:6]:
+        for line in key_utterances[:8]:
             ts, body = _split_ts_prefix(line)
             point = _normalize_summary_item_quality(body)
             if not point:
                 continue
             from_keys.append(f"[{ts}] {point}" if ts else point)
-            if len(from_keys) >= 2:
+            if len(from_keys) >= AGENDA_SUMMARY_ITEM_TARGET:
                 break
         summary_items = from_keys
-    summary_items = _dedup_preserve(_normalize_summary_item_lines(summary_items), limit=4)
+    summary_items = _dedup_preserve(_normalize_summary_item_lines(summary_items), limit=AGENDA_SUMMARY_ITEM_TARGET)
 
     if not summary_references:
         for ref in key_refs[:8]:
@@ -2563,12 +2565,12 @@ def _extract_detail_fields_from_parsed(
 
     summary = _to_summary_point(_safe_text(detail_parsed.get("summary")), max_len=None)
     if not summary:
-        summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:4])
+        summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:AGENDA_SUMMARY_ITEM_TARGET])
 
     return {
         "agenda_keywords": _dedup_preserve(keywords, limit=6),
         "key_utterances": _dedup_preserve(key_utterances, limit=10),
-        "_summary_items": _dedup_preserve(summary_items, limit=6),
+        "_summary_items": _dedup_preserve(summary_items, limit=AGENDA_SUMMARY_ITEM_TARGET),
         "summary_references": summary_references[:12],
         "summary": _safe_text(summary),
         "opinion_groups": opinion_groups[:12],
@@ -2588,7 +2590,7 @@ def _merge_agenda_fields(target: dict[str, Any], fields: dict[str, Any]) -> None
     )
     target["_summary_items"] = _dedup_preserve(
         list(fields.get("_summary_items") or []) + list(target.get("_summary_items") or []),
-        limit=8,
+        limit=AGENDA_SUMMARY_ITEM_TARGET,
     )
     refs = [dict(x) for x in (fields.get("summary_references") or []) if isinstance(x, dict)] + [
         dict(x) for x in (target.get("summary_references") or []) if isinstance(x, dict)
@@ -3190,7 +3192,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed",
                     continue
                 from_keys.append(f"[{ts}] {point}" if ts else point)
             summary_items = from_keys
-        summary_items = _normalize_summary_item_lines(summary_items)
+        summary_items = _normalize_summary_item_lines(summary_items)[:AGENDA_SUMMARY_ITEM_TARGET]
         if not summary_references:
             for ref in key_refs[:10]:
                 summary_references.append(
@@ -3321,7 +3323,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed",
 
         summary = _to_summary_point(_safe_text(detail_parsed.get("summary")), max_len=None)
         if not summary:
-            summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:10])
+            summary = " • ".join(x.split("] ", 1)[-1] for x in summary_items[:AGENDA_SUMMARY_ITEM_TARGET])
 
         outcomes.append(
             {
@@ -3329,7 +3331,7 @@ def _run_analysis(rt: RuntimeStore, force: bool = False, mode: str = "windowed",
                 "agenda_state": state,
                 "flow_type": flow_type,
                 "key_utterances": _dedup_preserve(key_utterances, limit=20),
-                "_summary_items": _dedup_preserve(summary_items, limit=20),
+                "_summary_items": _dedup_preserve(summary_items, limit=AGENDA_SUMMARY_ITEM_TARGET),
                 "summary_references": summary_references[:24],
                 "summary": _safe_text(summary),
                 "agenda_keywords": _dedup_preserve(keywords, limit=6),

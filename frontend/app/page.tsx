@@ -1,7 +1,7 @@
 "use client";
 
 import "@xyflow/react/dist/style.css";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import {
   addEdge,
   applyEdgeChanges,
@@ -157,13 +157,6 @@ type CanvasLane = {
   timeLabel: string;
   keywordLabel: string;
   transcriptCount: number;
-  summaryNodes: Array<{
-    pointId: string;
-    pointText: string;
-    rangeLabel: string;
-    utteranceCount: number;
-    opinionCount: number;
-  }>;
   ideaNodes: CanvasIdea[];
 };
 
@@ -291,6 +284,239 @@ function renderCanvasFlowLabel(data: {
     </div>
   );
 }
+
+function buildCanvasFlowNodes(
+  canvasNodes: CanvasGraphNode[],
+  selectedAgendaId?: string,
+): Node<CanvasFlowNodeData>[] {
+  return canvasNodes.map((node) => {
+    const linkedMeta = node.linkedPointText ? [...node.meta, stripLeadingTimestamp(node.linkedPointText)] : node.meta;
+    return {
+      id: node.id,
+      position: { x: node.x, y: node.y },
+      sourcePosition: Position.Right,
+      targetPosition: Position.Left,
+      className: `rfNode rfNode${node.kind === "agenda" ? "Agenda" : node.kind === "summary" ? "Summary" : "Idea"} ${selectedAgendaId === node.agendaId ? "rfNodeEmphasized" : ""}`,
+      data: {
+        label: renderCanvasFlowLabel({
+          kind: node.kind,
+          subtitle: node.subtitle,
+          title: node.title,
+          body: node.body,
+          meta: linkedMeta,
+        }),
+        nodeId: node.id,
+        agendaId: node.agendaId,
+        kind: node.kind,
+        title: node.title,
+        body: node.body,
+        subtitle: node.subtitle,
+        meta: linkedMeta,
+        pointId: node.pointId,
+        linkedPointText: node.linkedPointText,
+      },
+      draggable: true,
+      selectable: true,
+    };
+  });
+}
+
+function buildCanvasFlowEdges(canvasEdges: CanvasGraphEdge[]): Edge[] {
+  return canvasEdges.map((edge) => ({
+    id: `base-${edge.id}`,
+    source: edge.fromId,
+    target: edge.toId,
+    type: "step",
+    deletable: false,
+    selectable: true,
+    reconnectable: true,
+  }));
+}
+
+type CanvasFlowSurfaceProps = {
+  nodeSeed: Node<CanvasFlowNodeData>[];
+  edgeSeed: Edge[];
+  hasNodes: boolean;
+  canvasComposerOpen: boolean;
+  canvasLanesCount: number;
+  canvasIdeasCount: number;
+  selectedAgendaLabel: string;
+  selectedSummaryText: string;
+  analysisUiDisabled: boolean;
+  canvasIdeaTitle: string;
+  canvasIdeaBody: string;
+  onCanvasIdeaTitleChange: (value: string) => void;
+  onCanvasIdeaBodyChange: (value: string) => void;
+  onAddCanvasIdea: () => void;
+  onClearCanvasIdea: () => void;
+  onNodeClick: (_: unknown, node: Node<CanvasFlowNodeData>) => void;
+  onPaneClick: () => void;
+  onNodeDragStop: (_: unknown, node: Node<CanvasFlowNodeData>) => void;
+};
+
+const CanvasFlowSurface = memo(function CanvasFlowSurface({
+  nodeSeed,
+  edgeSeed,
+  hasNodes,
+  canvasComposerOpen,
+  canvasLanesCount,
+  canvasIdeasCount,
+  selectedAgendaLabel,
+  selectedSummaryText,
+  analysisUiDisabled,
+  canvasIdeaTitle,
+  canvasIdeaBody,
+  onCanvasIdeaTitleChange,
+  onCanvasIdeaBodyChange,
+  onAddCanvasIdea,
+  onClearCanvasIdea,
+  onNodeClick,
+  onPaneClick,
+  onNodeDragStop,
+}: CanvasFlowSurfaceProps) {
+  const [nodes, setNodes] = useState<Node<CanvasFlowNodeData>[]>(nodeSeed);
+  const [edges, setEdges] = useState<Edge[]>(edgeSeed);
+
+  useEffect(() => {
+    setNodes(nodeSeed);
+  }, [nodeSeed]);
+
+  useEffect(() => {
+    setEdges((prev) => {
+      const customEdges = prev.filter((edge) => !String(edge.id).startsWith("base-"));
+      return [...edgeSeed, ...customEdges];
+    });
+  }, [edgeSeed]);
+
+  const onNodesChange = useCallback((changes: NodeChange<Node<CanvasFlowNodeData>>[]) => {
+    setNodes((current) => applyNodeChanges(changes, current));
+  }, []);
+
+  const onEdgesChange = useCallback((changes: EdgeChange<Edge>[]) => {
+    setEdges((current) => applyEdgeChanges(changes, current));
+  }, []);
+
+  const onConnect = useCallback((connection: Connection) => {
+    setEdges((current) =>
+      addEdge(
+        {
+          ...connection,
+          id: `user-edge-${Date.now()}`,
+          type: "step",
+          reconnectable: true,
+        },
+        current,
+      ),
+    );
+  }, []);
+
+  if (!hasNodes) {
+    return <p className="emptyState">안건이 아직 없어 공용 캔버스를 구성할 수 없습니다.</p>;
+  }
+
+  return (
+    <div className="reactFlowCanvas">
+      <ReactFlow
+        className="reactFlowStage"
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        onNodeClick={onNodeClick}
+        onPaneClick={onPaneClick}
+        onNodeDragStop={onNodeDragStop}
+        defaultEdgeOptions={{ reconnectable: true, type: "step" }}
+        fitView
+        fitViewOptions={{ padding: 0.18, duration: 480 }}
+        minZoom={0.35}
+        maxZoom={1.8}
+        zoomOnDoubleClick={false}
+        nodesConnectable
+        elementsSelectable
+        selectNodesOnDrag={false}
+        selectionOnDrag
+        panOnDrag={[1, 2]}
+        panOnScroll
+        zoomOnPinch
+        zoomOnScroll
+        snapToGrid
+        snapGrid={[16, 16]}
+        deleteKeyCode={["Backspace", "Delete"]}
+        elevateEdgesOnSelect
+        proOptions={{ hideAttribution: true }}
+      >
+        <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#e5e7eb" />
+        <MiniMap
+          zoomable
+          pannable
+          nodeColor={(node) => {
+            const kind = (node.data as CanvasFlowNodeData | undefined)?.kind;
+            if (kind === "agenda") return "#1f2937";
+            if (kind === "summary") return "#64748b";
+            return "#d97706";
+          }}
+        />
+        <Controls />
+        <Panel position="top-left" className="rfExamplePanel">
+          <div className="rfExamplePanelCard">
+            <strong>Shared Canvas</strong>
+            <p>{selectedAgendaLabel}</p>
+            <span>안건 {canvasLanesCount} · 메모 {canvasIdeasCount}</span>
+          </div>
+        </Panel>
+
+        {canvasComposerOpen ? (
+          <Panel position="top-right" className="rfPanelShell rfComposerPanel">
+            <section className="canvasQuickComposer">
+              <div className="canvasComposerHeader">
+                <div>
+                  <p className="canvasEyebrow">Note</p>
+                  <h3>캔버스 메모 추가</h3>
+                  <p className="mutedLabel">
+                    {selectedAgendaLabel !== "선택된 안건 없음" ? `${selectedAgendaLabel}에 바로 배치됩니다.` : "먼저 안건을 선택한 뒤 메모를 추가하세요."}
+                    {selectedSummaryText ? ` 현재 요약 "${selectedSummaryText}"와 연결됩니다.` : ""}
+                  </p>
+                </div>
+              </div>
+              <div className="canvasComposerGrid">
+                <input
+                  aria-label="아이디어 제목"
+                  placeholder="짧은 제목"
+                  value={canvasIdeaTitle}
+                  onChange={(event) => onCanvasIdeaTitleChange(event.target.value)}
+                />
+                <textarea
+                  aria-label="아이디어 메모"
+                  placeholder="노트 내용, 질문, 다음 실험 아이디어를 입력"
+                  value={canvasIdeaBody}
+                  onChange={(event) => onCanvasIdeaBodyChange(event.target.value)}
+                />
+              </div>
+              <div className="panelActions">
+                <button
+                  type="button"
+                  onClick={onAddCanvasIdea}
+                  disabled={analysisUiDisabled || (!safeText(canvasIdeaTitle) && !safeText(canvasIdeaBody))}
+                >
+                  보드에 놓기
+                </button>
+                <button
+                  type="button"
+                  className="ghostButton"
+                  onClick={onClearCanvasIdea}
+                  disabled={analysisUiDisabled}
+                >
+                  입력 지우기
+                </button>
+              </div>
+            </section>
+          </Panel>
+        ) : null}
+      </ReactFlow>
+    </div>
+  );
+});
 
 function decisionStatusClass(status: DecisionItem["finalStatus"]): string {
   if (status === "Approved") return "statusChip statusChipDone";
@@ -761,8 +987,6 @@ export default function Home() {
   const [canvasIdeas, setCanvasIdeas] = useState<CanvasIdea[]>([]);
   const [canvasNodeDetail, setCanvasNodeDetail] = useState<CanvasNodeDetail | null>(null);
   const [canvasNodePositions, setCanvasNodePositions] = useState<Record<string, CanvasNodePosition>>({});
-  const [flowNodes, setFlowNodes] = useState<Node<CanvasFlowNodeData>[]>([]);
-  const [flowEdges, setFlowEdges] = useState<Edge[]>([]);
 
   const [datasetFolder, setDatasetFolder] = useState("dataset/economy");
   const [datasetFiles, setDatasetFiles] = useState<File[]>([]);
@@ -1360,9 +1584,9 @@ export default function Home() {
       const title = safeText(row.agenda_title, `안건 ${idx + 1}`);
       const agendaState = normalizeAgendaState(row.agenda_state);
       const status = toAgendaStatus(agendaState);
-      const summaryPoints = (row.agenda_summary_items || []).map((s) => safeText(s)).filter(Boolean);
-      const keyPoints = (summaryPoints.length > 0 ? summaryPoints : (row.key_utterances || [])).filter(Boolean);
-      const summaries = (summaryPoints.length > 0 ? summaryPoints : [safeText(row.summary)]).filter(Boolean);
+      const summaryPoints = (row.agenda_summary_items || []).map((s) => safeText(s)).filter(Boolean).slice(0, 3);
+      const keyPoints = (summaryPoints.length > 0 ? summaryPoints : (row.key_utterances || [])).filter(Boolean).slice(0, 3);
+      const summaries = (summaryPoints.length > 0 ? summaryPoints : [safeText(row.summary)]).filter(Boolean).slice(0, 3);
       const keywords = (row.agenda_keywords || []).map((k) => safeText(k)).filter(Boolean);
       const decisionConclusions = (row.decision_results || []).map((d) => safeText(d.conclusion)).filter(Boolean);
       const actionNames = (row.action_items || []).map((a) => safeText(a.item)).filter(Boolean);
@@ -1465,8 +1689,8 @@ export default function Home() {
 
     sortedOutcomeRows.forEach((row, ridx) => {
       const agendaId = safeText(row.agenda_id, agendas[ridx]?.id || agendas[0]?.id || `agenda-${ridx + 1}`);
-      const summaryPoints = (row.agenda_summary_items || []).map((s) => safeText(s)).filter(Boolean);
-      const keyPoints = (summaryPoints.length > 0 ? summaryPoints : (row.key_utterances || [])).filter(Boolean);
+      const summaryPoints = (row.agenda_summary_items || []).map((s) => safeText(s)).filter(Boolean).slice(0, 3);
+      const keyPoints = (summaryPoints.length > 0 ? summaryPoints : (row.key_utterances || [])).filter(Boolean).slice(0, 3);
       const allRefs = (row.summary_references || []).filter(Boolean);
       const llmOpinionGroups = (row.opinion_groups || []).filter(Boolean);
 
@@ -1794,13 +2018,6 @@ export default function Home() {
   const canvasLanes = useMemo<CanvasLane[]>(() => {
     if (agendas.length === 0) return [];
 
-    const pointsByAgenda = new Map<string, SummaryPointMeta[]>();
-    summaryPointMetaMap.forEach((meta) => {
-      const current = pointsByAgenda.get(meta.agendaId);
-      if (current) current.push(meta);
-      else pointsByAgenda.set(meta.agendaId, [meta]);
-    });
-
     return agendas.map((agenda) => {
       const row = outcomeByAgendaMap.get(agenda.id);
       const startTurnId = Number(row?.start_turn_id || 0);
@@ -1808,20 +2025,6 @@ export default function Home() {
       const timeCandidates: string[] = [];
       if (startTurnId > 0 && transcript[startTurnId - 1]) timeCandidates.push(transcript[startTurnId - 1].timestamp);
       if (endTurnId > 0 && transcript[endTurnId - 1]) timeCandidates.push(transcript[endTurnId - 1].timestamp);
-      const groupedPoints = (pointsByAgenda.get(agenda.id) || [])
-        .slice()
-        .sort((a, b) => {
-          const aTurn = a.turnIds[0] || Number.MAX_SAFE_INTEGER;
-          const bTurn = b.turnIds[0] || Number.MAX_SAFE_INTEGER;
-          return aTurn - bTurn;
-        })
-        .map((meta) => ({
-          pointId: meta.pointId,
-          pointText: stripLeadingTimestamp(meta.pointText),
-          rangeLabel: meta.rangeLabel,
-          utteranceCount: Math.max(meta.turnIds.length, meta.references.length),
-          opinionCount: meta.opinionGroups.length,
-        }));
       const ideaNodes = canvasIdeas.filter((idea) => idea.agendaId === agenda.id);
       return {
         agendaId: agenda.id,
@@ -1832,11 +2035,10 @@ export default function Home() {
         timeLabel: buildTimeRangeLabel(timeCandidates),
         keywordLabel: (row?.agenda_keywords || []).slice(0, 3).join(" · "),
         transcriptCount: Number(transcriptCountByAgenda.get(agenda.id) || 0),
-        summaryNodes: groupedPoints,
         ideaNodes,
       };
     });
-  }, [agendas, summaryPointMetaMap, outcomeByAgendaMap, canvasIdeas, transcript, transcriptCountByAgenda]);
+  }, [agendas, outcomeByAgendaMap, canvasIdeas, transcript, transcriptCountByAgenda]);
 
   const canvasGraph = useMemo(() => {
     const nodes: CanvasGraphNode[] = [];
@@ -1847,10 +2049,8 @@ export default function Home() {
 
     const nodeMap = new Map<string, CanvasGraphNode>();
     const agendaColumnX = 96;
-    const summaryColumnX = 500;
-    const ideaColumnX = 904;
+    const ideaColumnX = 520;
     const laneGapY = 144;
-    const summaryGapY = 164;
     const ideaGapY = 152;
     const laneMinHeight = 240;
     let currentLaneY = 96;
@@ -1859,43 +2059,14 @@ export default function Home() {
 
     canvasLanes.forEach((lane) => {
       const agendaNodeId = `canvas-agenda-${lane.agendaId}`;
-      const summaryCount = Math.max(1, lane.summaryNodes.length);
-      const summarySlots = lane.summaryNodes.map((node, summaryIdx) => ({
-        pointId: node.pointId,
-        title: node.pointText,
-        rangeLabel: node.rangeLabel,
-        utteranceCount: node.utteranceCount,
-        opinionCount: node.opinionCount,
-        x: summaryColumnX,
-        y: currentLaneY + summaryIdx * summaryGapY,
+      const ideaSlots = lane.ideaNodes.map((idea, ideaIdx) => ({
+        idea,
+        x: ideaColumnX,
+        y: currentLaneY + ideaIdx * ideaGapY,
       }));
-      const summaryYByPointId = new Map(summarySlots.map((slot) => [slot.pointId, slot.y]));
-      const linkedIdeaCounts = new Map<string, number>();
-      let unlinkedIdeaCount = 0;
-      const ideaSlots = lane.ideaNodes.map((idea) => {
-        const linkedPointId = safeText(idea.linkedPointId);
-        if (linkedPointId && summaryYByPointId.has(linkedPointId)) {
-          const offset = linkedIdeaCounts.get(linkedPointId) || 0;
-          linkedIdeaCounts.set(linkedPointId, offset + 1);
-          return {
-            idea,
-            x: ideaColumnX,
-            y: Number(summaryYByPointId.get(linkedPointId)) + offset * ideaGapY,
-          };
-        }
-
-        const slot = {
-          idea,
-          x: ideaColumnX,
-          y: currentLaneY + summaryCount * summaryGapY + unlinkedIdeaCount * ideaGapY,
-        };
-        unlinkedIdeaCount += 1;
-        return slot;
-      });
 
       const laneBottom = Math.max(
         currentLaneY + laneMinHeight,
-        ...summarySlots.map((slot) => slot.y + 132),
         ...ideaSlots.map((slot) => slot.y + 148),
       );
       const laneHeight = laneBottom - currentLaneY;
@@ -1915,31 +2086,6 @@ export default function Home() {
       };
       nodeMap.set(agendaNodeId, agendaNode);
 
-      summarySlots.forEach((slot) => {
-        const summaryNodeId = `canvas-summary-${lane.agendaId}-${slot.pointId}`;
-        const summaryNode: CanvasGraphNode = {
-          id: summaryNodeId,
-          agendaId: lane.agendaId,
-          kind: "summary",
-          title: slot.title,
-          body: "",
-          subtitle: "Summary Node",
-          meta: [slot.rangeLabel, `원문 ${slot.utteranceCount}`, `의견 ${slot.opinionCount}`],
-          pointId: slot.pointId,
-          width: 240,
-          height: 132,
-          x: slot.x,
-          y: slot.y,
-        };
-        nodeMap.set(summaryNodeId, summaryNode);
-        edges.push({
-          id: `edge-${agendaNodeId}-${summaryNodeId}`,
-          fromId: agendaNodeId,
-          toId: summaryNodeId,
-          kind: "agenda-summary",
-        });
-      });
-
       ideaSlots.forEach(({ idea, x, y }) => {
         const ideaNodeId = idea.id;
         const ideaNode: CanvasGraphNode = {
@@ -1958,13 +2104,11 @@ export default function Home() {
           y,
         };
         nodeMap.set(ideaNodeId, ideaNode);
-
-        const linkedSummaryId = idea.linkedPointId ? `canvas-summary-${lane.agendaId}-${idea.linkedPointId}` : "";
         edges.push({
-          id: `edge-${linkedSummaryId || agendaNodeId}-${ideaNodeId}`,
-          fromId: linkedSummaryId || agendaNodeId,
+          id: `edge-${agendaNodeId}-${ideaNodeId}`,
+          fromId: agendaNodeId,
           toId: ideaNodeId,
-          kind: linkedSummaryId ? "summary-idea" : "agenda-idea",
+          kind: "agenda-idea",
         });
       });
 
@@ -1989,78 +2133,12 @@ export default function Home() {
     };
   }, [canvasLanes, canvasNodePositions]);
 
-  useEffect(() => {
-    setFlowNodes((prev) => {
-      const prevMap = new Map(prev.map((node) => [node.id, node]));
-      return canvasGraph.nodes.map((node) => {
-        const prevNode = prevMap.get(node.id);
-        const linkedMeta = node.linkedPointText ? [...node.meta, stripLeadingTimestamp(node.linkedPointText)] : node.meta;
-        return {
-          id: node.id,
-          position: prevNode?.position || { x: node.x, y: node.y },
-          sourcePosition: Position.Right,
-          targetPosition: Position.Left,
-          className: `rfNode rfNode${node.kind === "agenda" ? "Agenda" : node.kind === "summary" ? "Summary" : "Idea"} ${selectedAgenda?.id === node.agendaId ? "rfNodeEmphasized" : ""}`,
-          data: {
-            label: renderCanvasFlowLabel({
-              kind: node.kind,
-              subtitle: node.subtitle,
-              title: node.title,
-              body: node.body,
-              meta: linkedMeta,
-            }),
-            nodeId: node.id,
-            agendaId: node.agendaId,
-            kind: node.kind,
-            title: node.title,
-            body: node.body,
-            subtitle: node.subtitle,
-            meta: linkedMeta,
-            pointId: node.pointId,
-            linkedPointText: node.linkedPointText,
-          },
-          draggable: true,
-          selectable: true,
-          selected: prevNode?.selected || false,
-        };
-      });
-    });
-    setFlowEdges((prev) => {
-      const customEdges = prev.filter((edge) => !String(edge.id).startsWith("base-"));
-      const baseEdges = canvasGraph.edges.map((edge) => ({
-        id: `base-${edge.id}`,
-        source: edge.fromId,
-        target: edge.toId,
-        type: "step",
-        deletable: false,
-        selectable: true,
-        reconnectable: true,
-      }));
-      return [...baseEdges, ...customEdges];
-    });
-  }, [canvasGraph, selectedAgenda?.id]);
+  const flowNodeSeed = useMemo(
+    () => buildCanvasFlowNodes(canvasGraph.nodes, selectedAgenda?.id),
+    [canvasGraph.nodes, selectedAgenda?.id],
+  );
 
-  const onFlowNodesChange = useCallback((changes: NodeChange<Node<CanvasFlowNodeData>>[]) => {
-    setFlowNodes((nodes) => applyNodeChanges(changes, nodes));
-  }, []);
-
-  const onFlowEdgesChange = useCallback((changes: EdgeChange<Edge>[]) => {
-    setFlowEdges((edges) => applyEdgeChanges(changes, edges));
-  }, []);
-
-  const onFlowConnect = useCallback((connection: Connection) => {
-    setFlowEdges((edges) =>
-      addEdge(
-        {
-          ...connection,
-          id: `user-edge-${Date.now()}`,
-          type: "step",
-          reconnectable: true,
-        },
-        edges,
-      ),
-    );
-  }, []);
+  const flowEdgeSeed = useMemo(() => buildCanvasFlowEdges(canvasGraph.edges), [canvasGraph.edges]);
 
   const onFlowNodeDragStop = useCallback((_: unknown, node: Node<CanvasFlowNodeData>) => {
     setCanvasNodePositions((prev) => ({
@@ -2206,6 +2284,16 @@ export default function Home() {
     }, 160);
   }, [canvasRightRailOpen, clearCanvasRightPanelTimer]);
 
+  const clearCanvasIdeaInputs = useCallback(() => {
+    setCanvasIdeaTitle("");
+    setCanvasIdeaBody("");
+  }, []);
+
+  const handleCanvasPaneClick = useCallback(() => {
+    setCanvasNodeDetail(null);
+    swapCanvasRightPanelView("insights");
+  }, [swapCanvasRightPanelView]);
+
   const onSelectAgenda = useCallback((agendaId: string) => {
     if (analysisUiDisabled) return;
     setSelectedAgendaId(agendaId);
@@ -2338,7 +2426,7 @@ export default function Home() {
     const summaryLines = [
       ...((row?.agenda_summary_items || []).map((item) => safeText(item)).filter(Boolean)),
       ...((row?.summary ? [safeText(row.summary)] : []).filter(Boolean)),
-    ].filter(Boolean);
+    ].filter(Boolean).slice(0, 3);
     const utterances = (agendaUtterancesMap.get(agendaId) || []).slice();
     setSelectedAgendaId(agendaId);
     setSummaryScope("current");
@@ -2357,37 +2445,6 @@ export default function Home() {
       utterances,
     });
   }, [agendas, outcomeByAgendaMap, agendaUtterancesMap, swapCanvasRightPanelView]);
-
-  const openCanvasSummaryDetail = useCallback((agendaId: string, pointId: string, summaryText: string) => {
-    const meta = summaryPointMetaMap.get(`${agendaId}|${pointId}`);
-    if (!meta) return;
-    const utterances = resolveSummaryFocusUtterances(meta);
-    const focusState = {
-      ...meta,
-      pointText: stripLeadingTimestamp(summaryText) || stripLeadingTimestamp(meta.pointText),
-      utterances,
-    };
-    setSelectedAgendaId(agendaId);
-    setSummaryScope("current");
-    setSelectedSummaryFocus(focusState);
-    swapCanvasRightPanelView("detail");
-    setCanvasNodeDetail({
-      id: `detail-${agendaId}-${pointId}`,
-      kind: "summary",
-      agendaId,
-      pointId,
-      title: focusState.pointText,
-      subtitle: "요약 노드",
-      badges: [focusState.rangeLabel, `원문 ${utterances.length}문장`],
-      keywords: [
-        ...((outcomeByAgendaMap.get(agendaId)?.agenda_keywords || []).map((item) => safeText(item)).filter(Boolean).slice(0, 6)),
-        stripLeadingTimestamp(focusState.pointText),
-      ].filter(Boolean).slice(0, 8),
-      summaryLines: [focusState.pointText],
-      opinionGroups: meta.opinionGroups,
-      utterances,
-    });
-  }, [resolveSummaryFocusUtterances, summaryPointMetaMap, outcomeByAgendaMap, swapCanvasRightPanelView]);
 
   const openCanvasIdeaDetail = useCallback((idea: CanvasIdea) => {
     const utterances =
@@ -2471,15 +2528,11 @@ export default function Home() {
       openCanvasAgendaDetail(node.data.agendaId);
       return;
     }
-    if (node.data.kind === "summary" && node.data.pointId) {
-      openCanvasSummaryDetail(node.data.agendaId, node.data.pointId, node.data.title);
-      return;
-    }
     if (node.data.kind === "idea") {
       const sourceIdea = canvasIdeas.find((idea) => idea.id === node.id);
       if (sourceIdea) openCanvasIdeaDetail(sourceIdea);
     }
-  }, [analysisUiDisabled, canvasIdeas, openCanvasAgendaDetail, openCanvasSummaryDetail, openCanvasIdeaDetail]);
+  }, [analysisUiDisabled, canvasIdeas, openCanvasAgendaDetail, openCanvasIdeaDetail]);
 
   const onFlowNodeClick = useCallback((_: unknown, node: Node<CanvasFlowNodeData>) => {
     openCanvasNode(node);
@@ -2804,7 +2857,7 @@ export default function Home() {
               <h4>요약본</h4>
               <div className="canvasNodeDetailSummaryList">
                 {canvasNodeDetail.summaryLines.map((line, idx) => (
-                  <p key={`${canvasNodeDetail.id}-summary-${idx}`}>{line}</p>
+                  <p key={`${canvasNodeDetail.id}-summary-${idx}`}>{stripLeadingTimestamp(line)}</p>
                 ))}
               </div>
             </section>
@@ -3555,115 +3608,26 @@ export default function Home() {
             ) : (
               <div className="canvasWorkspace canvasWorkspaceImmersive">
                 <div className="canvasBoard canvasBoardImmersive">
-                  {flowNodes.length === 0 ? (
-                    <p className="emptyState">안건이 아직 없어 공용 캔버스를 구성할 수 없습니다.</p>
-                  ) : (
-                    <div className="reactFlowCanvas">
-                      <ReactFlow
-                        className="reactFlowStage"
-                        nodes={flowNodes}
-                        edges={flowEdges}
-                        onNodesChange={onFlowNodesChange}
-                        onEdgesChange={onFlowEdgesChange}
-                        onConnect={onFlowConnect}
-                        onNodeClick={onFlowNodeClick}
-                        onPaneClick={() => {
-                          setCanvasNodeDetail(null);
-                          swapCanvasRightPanelView("insights");
-                        }}
-                        onNodeDragStop={onFlowNodeDragStop}
-                        defaultEdgeOptions={{ reconnectable: true, type: "step" }}
-                        fitView
-                        fitViewOptions={{ padding: 0.18, duration: 480 }}
-                        minZoom={0.35}
-                        maxZoom={1.8}
-                        zoomOnDoubleClick={false}
-                        nodesConnectable
-                        elementsSelectable
-                        selectNodesOnDrag={false}
-                        selectionOnDrag
-                        panOnDrag={[1, 2]}
-                        panOnScroll
-                        zoomOnPinch
-                        zoomOnScroll
-                        snapToGrid
-                        snapGrid={[16, 16]}
-                        deleteKeyCode={["Backspace", "Delete"]}
-                        elevateEdgesOnSelect
-                        proOptions={{ hideAttribution: true }}
-                      >
-                        <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#e5e7eb" />
-                        <MiniMap
-                          zoomable
-                          pannable
-                          nodeColor={(node) => {
-                            if (node.type === "agenda") return "#1f2937";
-                            if (node.type === "summary") return "#64748b";
-                            return "#d97706";
-                          }}
-                        />
-                        <Controls />
-                        <Panel position="top-left" className="rfExamplePanel">
-                          <div className="rfExamplePanelCard">
-                            <strong>Shared Canvas</strong>
-                            <p>{selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}</p>
-                            <span>안건 {canvasLanes.length} · 메모 {canvasIdeas.length}</span>
-                          </div>
-                        </Panel>
-
-                        {canvasComposerOpen ? (
-                          <Panel position="top-right" className="rfPanelShell rfComposerPanel">
-                            <section className="canvasQuickComposer">
-                              <div className="canvasComposerHeader">
-                                <div>
-                                  <p className="canvasEyebrow">Note</p>
-                                  <h3>캔버스 메모 추가</h3>
-                                  <p className="mutedLabel">
-                                    {selectedAgenda ? `${agendaLabel(selectedAgenda)}에 바로 배치됩니다.` : "먼저 안건을 선택한 뒤 메모를 추가하세요."}
-                                    {selectedSummaryFocus ? ` 현재 요약 "${stripLeadingTimestamp(selectedSummaryFocus.pointText)}"와 연결됩니다.` : ""}
-                                  </p>
-                                </div>
-                              </div>
-                              <div className="canvasComposerGrid">
-                                <input
-                                  aria-label="아이디어 제목"
-                                  placeholder="짧은 제목"
-                                  value={canvasIdeaTitle}
-                                  onChange={(event) => setCanvasIdeaTitle(event.target.value)}
-                                />
-                                <textarea
-                                  aria-label="아이디어 메모"
-                                  placeholder="노트 내용, 질문, 다음 실험 아이디어를 입력"
-                                  value={canvasIdeaBody}
-                                  onChange={(event) => setCanvasIdeaBody(event.target.value)}
-                                />
-                              </div>
-                              <div className="panelActions">
-                                <button
-                                  type="button"
-                                  onClick={addCanvasIdea}
-                                  disabled={analysisUiDisabled || (!safeText(canvasIdeaTitle) && !safeText(canvasIdeaBody))}
-                                >
-                                  보드에 놓기
-                                </button>
-                                <button
-                                  type="button"
-                                  className="ghostButton"
-                                  onClick={() => {
-                                    setCanvasIdeaTitle("");
-                                    setCanvasIdeaBody("");
-                                  }}
-                                  disabled={analysisUiDisabled}
-                                >
-                                  입력 지우기
-                                </button>
-                              </div>
-                            </section>
-                          </Panel>
-                        ) : null}
-                      </ReactFlow>
-                    </div>
-                  )}
+                  <CanvasFlowSurface
+                    nodeSeed={flowNodeSeed}
+                    edgeSeed={flowEdgeSeed}
+                    hasNodes={flowNodeSeed.length > 0}
+                    canvasComposerOpen={canvasComposerOpen}
+                    canvasLanesCount={canvasLanes.length}
+                    canvasIdeasCount={canvasIdeas.length}
+                    selectedAgendaLabel={selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}
+                    selectedSummaryText={selectedSummaryFocus ? stripLeadingTimestamp(selectedSummaryFocus.pointText) : ""}
+                    analysisUiDisabled={analysisUiDisabled}
+                    canvasIdeaTitle={canvasIdeaTitle}
+                    canvasIdeaBody={canvasIdeaBody}
+                    onCanvasIdeaTitleChange={setCanvasIdeaTitle}
+                    onCanvasIdeaBodyChange={setCanvasIdeaBody}
+                    onAddCanvasIdea={addCanvasIdea}
+                    onClearCanvasIdea={clearCanvasIdeaInputs}
+                    onNodeClick={onFlowNodeClick}
+                    onPaneClick={handleCanvasPaneClick}
+                    onNodeDragStop={onFlowNodeDragStop}
+                  />
                 </div>
               </div>
             )}
