@@ -23,9 +23,11 @@ import {
   connectLlm,
   disconnectLlm,
   exportAgendaMarkdown,
+  exportAgendaSnapshot,
   getLastLlmJson,
   getLlmStatus,
   getState,
+  importAgendaSnapshot,
   importJsonDir,
   importJsonFiles,
   importJsonFilesReplay,
@@ -106,6 +108,20 @@ type SummaryPointMeta = {
 
 type SummaryFocusState = SummaryPointMeta & {
   utterances: TranscriptUtterance[];
+};
+
+type CanvasNodeDetail = {
+  id: string;
+  kind: CanvasGraphNode["kind"];
+  agendaId: string;
+  pointId?: string;
+  title: string;
+  subtitle: string;
+  badges: string[];
+  summaryLines: string[];
+  opinionGroups: OpinionGroup[];
+  utterances: TranscriptUtterance[];
+  noteBody?: string;
 };
 
 type OpinionType = "proposal" | "concern" | "question" | "agree" | "disagree" | "info";
@@ -740,12 +756,14 @@ export default function Home() {
   const [canvasIdeaTitle, setCanvasIdeaTitle] = useState("");
   const [canvasIdeaBody, setCanvasIdeaBody] = useState("");
   const [canvasIdeas, setCanvasIdeas] = useState<CanvasIdea[]>([]);
+  const [canvasNodeDetail, setCanvasNodeDetail] = useState<CanvasNodeDetail | null>(null);
   const [canvasNodePositions, setCanvasNodePositions] = useState<Record<string, CanvasNodePosition>>({});
   const [flowNodes, setFlowNodes] = useState<Node<CanvasFlowNodeData>[]>([]);
   const [flowEdges, setFlowEdges] = useState<Edge[]>([]);
 
   const [datasetFolder, setDatasetFolder] = useState("dataset/economy");
   const [datasetFiles, setDatasetFiles] = useState<File[]>([]);
+  const [agendaSnapshotFile, setAgendaSnapshotFile] = useState<File | null>(null);
   const [datasetImportInfo, setDatasetImportInfo] = useState("");
   const [lineUploadMode, setLineUploadMode] = useState(false);
   const [replayLinesPerStep, setReplayLinesPerStep] = useState(1);
@@ -1750,6 +1768,25 @@ export default function Home() {
     return counts;
   }, [transcript]);
 
+  const agendaUtterancesMap = useMemo(() => {
+    const grouped = new Map<string, TranscriptUtterance[]>();
+    transcript.forEach((utterance) => {
+      const current = grouped.get(utterance.agendaId);
+      if (current) current.push(utterance);
+      else grouped.set(utterance.agendaId, [utterance]);
+    });
+    return grouped;
+  }, [transcript]);
+
+  const outcomeByAgendaMap = useMemo(() => {
+    const out = new Map<string, AgendaOutcome>();
+    sortedOutcomeRows.forEach((row, idx) => {
+      const fallbackId = agendas[idx]?.id || `agenda-${idx + 1}`;
+      out.set(safeText(row.agenda_id, fallbackId), row);
+    });
+    return out;
+  }, [sortedOutcomeRows, agendas]);
+
   const canvasLanes = useMemo<CanvasLane[]>(() => {
     if (agendas.length === 0) return [];
 
@@ -1760,14 +1797,8 @@ export default function Home() {
       else pointsByAgenda.set(meta.agendaId, [meta]);
     });
 
-    const outcomeByAgenda = new Map<string, AgendaOutcome>();
-    sortedOutcomeRows.forEach((row, idx) => {
-      const fallbackId = agendas[idx]?.id || `agenda-${idx + 1}`;
-      outcomeByAgenda.set(safeText(row.agenda_id, fallbackId), row);
-    });
-
     return agendas.map((agenda) => {
-      const row = outcomeByAgenda.get(agenda.id);
+      const row = outcomeByAgendaMap.get(agenda.id);
       const startTurnId = Number(row?.start_turn_id || 0);
       const endTurnId = Number(row?.end_turn_id || 0);
       const timeCandidates: string[] = [];
@@ -1801,7 +1832,7 @@ export default function Home() {
         ideaNodes,
       };
     });
-  }, [agendas, summaryPointMetaMap, sortedOutcomeRows, canvasIdeas, transcript, transcriptCountByAgenda]);
+  }, [agendas, summaryPointMetaMap, outcomeByAgendaMap, canvasIdeas, transcript, transcriptCountByAgenda]);
 
   const canvasGraph = useMemo(() => {
     const nodes: CanvasGraphNode[] = [];
@@ -2239,6 +2270,122 @@ export default function Home() {
     });
   };
 
+  const focusCanvasOpinionGroup = useCallback((agendaId: string, pointId: string, groupId: string) => {
+    const meta = summaryPointMetaMap.get(`${agendaId}|${pointId}`);
+    if (!meta) return;
+    const group = meta.opinionGroups.find((item) => item.id === groupId);
+    if (!group) return;
+
+    setSelectedAgendaId(agendaId);
+    setSummaryScope("current");
+    setSelectedSummaryFocus({
+      ...meta,
+      pointText: `[${group.typeLabel}] ${group.summary}`,
+      rangeLabel: group.rangeLabel,
+      turnIds: group.utterances
+        .map((u) => Number(u.id.replace("utt-", "")))
+        .filter((n) => !Number.isNaN(n) && n > 0)
+        .sort((a, b) => a - b),
+      utterances: group.utterances,
+    });
+    setCanvasNodeDetail((prev) => {
+      if (!prev || prev.agendaId !== agendaId || prev.pointId !== pointId) return prev;
+      return {
+        ...prev,
+        title: `[${group.typeLabel}] ${group.summary}`,
+        subtitle: "의견 요약",
+        badges: [group.rangeLabel, `원문 ${group.utterances.length}문장`],
+        summaryLines: [group.summary, ...(group.detail ? [group.detail] : [])],
+        utterances: group.utterances,
+      };
+    });
+  }, [summaryPointMetaMap]);
+
+  const openCanvasAgendaDetail = useCallback((agendaId: string) => {
+    const agenda = agendas.find((item) => item.id === agendaId);
+    if (!agenda) return;
+    const row = outcomeByAgendaMap.get(agendaId);
+    const summaryLines = [
+      ...((row?.agenda_summary_items || []).map((item) => safeText(item)).filter(Boolean)),
+      ...((row?.summary ? [safeText(row.summary)] : []).filter(Boolean)),
+    ].filter(Boolean);
+    const utterances = (agendaUtterancesMap.get(agendaId) || []).slice();
+    setSelectedAgendaId(agendaId);
+    setSummaryScope("current");
+    setSelectedSummaryFocus(null);
+    setCanvasRightRailOpen(true);
+    setCanvasNodeDetail({
+      id: `detail-${agendaId}`,
+      kind: "agenda",
+      agendaId,
+      title: agenda.title,
+      subtitle: `${agenda.label} · ${agendaStatusLabel[agenda.status]}`,
+      badges: [safeText(row?.flow_type, "discussion"), `${utterances.length}개 발화`],
+      summaryLines: summaryLines.length > 0 ? summaryLines : ["요약이 아직 없습니다."],
+      opinionGroups: [],
+      utterances,
+    });
+  }, [agendas, outcomeByAgendaMap, agendaUtterancesMap]);
+
+  const openCanvasSummaryDetail = useCallback((agendaId: string, pointId: string, summaryText: string) => {
+    const meta = summaryPointMetaMap.get(`${agendaId}|${pointId}`);
+    if (!meta) return;
+    const utterances = resolveSummaryFocusUtterances(meta);
+    const focusState = {
+      ...meta,
+      pointText: stripLeadingTimestamp(summaryText) || stripLeadingTimestamp(meta.pointText),
+      utterances,
+    };
+    setSelectedAgendaId(agendaId);
+    setSummaryScope("current");
+    setSelectedSummaryFocus(focusState);
+    setCanvasRightRailOpen(true);
+    setCanvasNodeDetail({
+      id: `detail-${agendaId}-${pointId}`,
+      kind: "summary",
+      agendaId,
+      pointId,
+      title: focusState.pointText,
+      subtitle: "요약 노드",
+      badges: [focusState.rangeLabel, `원문 ${utterances.length}문장`],
+      summaryLines: [focusState.pointText],
+      opinionGroups: meta.opinionGroups,
+      utterances,
+    });
+  }, [resolveSummaryFocusUtterances, summaryPointMetaMap]);
+
+  const openCanvasIdeaDetail = useCallback((idea: CanvasIdea) => {
+    const utterances =
+      idea.linkedPointId && summaryPointMetaMap.has(`${idea.agendaId}|${idea.linkedPointId}`)
+        ? resolveSummaryFocusUtterances(summaryPointMetaMap.get(`${idea.agendaId}|${idea.linkedPointId}`) as SummaryPointMeta)
+        : (agendaUtterancesMap.get(idea.agendaId) || []).slice(-10);
+    const linkedMeta = idea.linkedPointId ? summaryPointMetaMap.get(`${idea.agendaId}|${idea.linkedPointId}`) : undefined;
+    if (linkedMeta) {
+      setSelectedSummaryFocus({
+        ...linkedMeta,
+        utterances: resolveSummaryFocusUtterances(linkedMeta),
+      });
+    } else {
+      setSelectedSummaryFocus(null);
+    }
+    setSelectedAgendaId(idea.agendaId);
+    setSummaryScope("current");
+    setCanvasRightRailOpen(true);
+    setCanvasNodeDetail({
+      id: `detail-${idea.id}`,
+      kind: "idea",
+      agendaId: idea.agendaId,
+      pointId: idea.linkedPointId,
+      title: idea.title,
+      subtitle: `아이디어 메모 · ${idea.createdAt}`,
+      badges: [idea.linkedPointId ? "요약 연결" : "안건 메모"],
+      summaryLines: [safeText(idea.body, "메모 본문 없음"), ...(idea.linkedPointText ? [stripLeadingTimestamp(idea.linkedPointText)] : [])],
+      opinionGroups: [],
+      utterances,
+      noteBody: safeText(idea.body),
+    });
+  }, [agendaUtterancesMap, resolveSummaryFocusUtterances, summaryPointMetaMap]);
+
   const addCanvasIdea = () => {
     if (analysisUiDisabled) return;
     const agendaId = selectedAgenda?.id || agendas[0]?.id || "";
@@ -2279,35 +2426,21 @@ export default function Home() {
     setCanvasComposerOpen(false);
   };
 
-  const openCanvasIdeaSource = useCallback((idea: CanvasIdea) => {
-    if (analysisUiDisabled) return;
-    setSelectedAgendaId(idea.agendaId);
-    setSummaryScope("current");
-    if (idea.linkedPointId) {
-      jumpBySummary(idea.agendaId, idea.linkedPointText || idea.title, idea.linkedPointId);
-      return;
-    }
-    moveToWorkspaceFromCanvas("아이디어 원문 확인 중");
-    setSelectedSummaryFocus(null);
-    setQuery("");
-    setSpeakerFilter("전체");
-  }, [analysisUiDisabled, jumpBySummary, moveToWorkspaceFromCanvas]);
-
   const openCanvasNode = useCallback((node: Node<CanvasFlowNodeData>) => {
     if (analysisUiDisabled) return;
     if (node.data.kind === "agenda") {
-      onSelectAgenda(node.data.agendaId);
+      openCanvasAgendaDetail(node.data.agendaId);
       return;
     }
     if (node.data.kind === "summary" && node.data.pointId) {
-      jumpBySummary(node.data.agendaId, node.data.title, node.data.pointId);
+      openCanvasSummaryDetail(node.data.agendaId, node.data.pointId, node.data.title);
       return;
     }
     if (node.data.kind === "idea") {
       const sourceIdea = canvasIdeas.find((idea) => idea.id === node.id);
-      if (sourceIdea) openCanvasIdeaSource(sourceIdea);
+      if (sourceIdea) openCanvasIdeaDetail(sourceIdea);
     }
-  }, [analysisUiDisabled, canvasIdeas, jumpBySummary, onSelectAgenda, openCanvasIdeaSource]);
+  }, [analysisUiDisabled, canvasIdeas, openCanvasAgendaDetail, openCanvasSummaryDetail, openCanvasIdeaDetail]);
 
   const onFlowNodeClick = useCallback((_: unknown, node: Node<CanvasFlowNodeData>) => {
     openCanvasNode(node);
@@ -2359,6 +2492,7 @@ export default function Home() {
   useEffect(() => {
     if (!isCanvasMode) {
       setCanvasComposerOpen(false);
+      setCanvasNodeDetail(null);
     }
   }, [isCanvasMode]);
 
@@ -2508,6 +2642,53 @@ export default function Home() {
       setError("");
       setDebugEvents((rows) => [
         `${formatNowTime()} | Markdown 내보내기 완료: ${filename} (agenda=${res.agenda_count}, turns=${res.transcript_count})`,
+        ...rows,
+      ].slice(0, 80));
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      endTask();
+    }
+  };
+
+  const onExportAgendaSnapshot = async () => {
+    beginTask("안건 스냅샷 준비 중");
+    try {
+      const res = await exportAgendaSnapshot();
+      const filename = safeText(res.filename, `agenda_snapshot_${Date.now()}.json`);
+      const blob = new Blob([JSON.stringify(res.snapshot || {}, null, 2)], { type: "application/json;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setError("");
+      setDebugEvents((rows) => [
+        `${formatNowTime()} | 안건 스냅샷 내보내기 완료: ${filename} (agenda=${res.agenda_count}, turns=${res.transcript_count})`,
+        ...rows,
+      ].slice(0, 80));
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      endTask();
+    }
+  };
+
+  const onImportAgendaSnapshot = async () => {
+    if (!agendaSnapshotFile) return;
+    beginTask("안건 스냅샷 불러오는 중");
+    try {
+      const res = await importAgendaSnapshot({ file: agendaSnapshotFile, reset_state: true });
+      commitMeetingState(res.state);
+      setMeetingGoalDraft(res.state.meeting_goal || "");
+      setMeetingGoalDirty(false);
+      setDatasetImportInfo(`snapshot imported=${res.import_debug.agenda_count} agendas / ${res.import_debug.transcript_count} turns`);
+      setError("");
+      setDebugEvents((rows) => [
+        `${formatNowTime()} | 안건 스냅샷 불러오기 완료: ${res.import_debug.filename} (agenda=${res.import_debug.agenda_count}, turns=${res.import_debug.transcript_count})`,
         ...rows,
       ].slice(0, 80));
     } catch (err) {
@@ -2917,6 +3098,12 @@ export default function Home() {
                 multiple
                 onChange={(event) => setDatasetFiles(Array.from(event.target.files || []))}
               />
+              <input
+                aria-label="안건 스냅샷 업로드"
+                type="file"
+                accept=".json,application/json"
+                onChange={(event) => setAgendaSnapshotFile(event.target.files?.[0] || null)}
+              />
               <select
                 aria-label="전사 윈도우"
                 value={state.window_size}
@@ -2939,6 +3126,7 @@ export default function Home() {
               <button type="button" onClick={() => void onSaveConfig()} disabled={loading}>설정 저장</button>
               <button type="button" onClick={() => void onImportDataset()} disabled={loading}>JSON 폴더 로드</button>
               <button type="button" onClick={() => void onImportDatasetFiles()} disabled={loading || datasetFiles.length === 0}>JSON 업로드</button>
+              <button type="button" onClick={() => void onImportAgendaSnapshot()} disabled={loading || !agendaSnapshotFile}>안건 가져오기</button>
               {lineUploadMode ? (
                 <button type="button" onClick={() => void onQueueDatasetFilesLineMode()} disabled={loading || datasetFiles.length === 0}>
                   라인모드 큐 적재
@@ -2946,6 +3134,7 @@ export default function Home() {
               ) : null}
               <button type="button" onClick={() => void apply(() => tickAnalysis(), "전체 분석 실행 중", true)} disabled={loading || analysisUiDisabled}>분석 실행</button>
               <button type="button" onClick={() => void onExportAgendaMarkdown()} disabled={loading}>안건 MD 내보내기</button>
+              <button type="button" onClick={() => void onExportAgendaSnapshot()} disabled={loading}>안건 스냅샷 내보내기</button>
               <button type="button" onClick={() => { stopReplayAuto(); void apply(() => resetState(), "상태 초기화 중"); }} disabled={loading}>초기화</button>
               <button type="button" onClick={() => void onConnectLlm()} disabled={llmChecking}>{llmChecking ? "연결 중" : "LLM 연결"}</button>
               <button type="button" onClick={() => void onDisconnectLlm()} disabled={llmChecking || !llmEnabled}>연결 해제</button>
@@ -3215,6 +3404,7 @@ export default function Home() {
                         onEdgesChange={onFlowEdgesChange}
                         onConnect={onFlowConnect}
                         onNodeClick={onFlowNodeClick}
+                        onPaneClick={() => setCanvasNodeDetail(null)}
                         onNodeDragStop={onFlowNodeDragStop}
                         defaultEdgeOptions={{ reconnectable: true, type: "step" }}
                         fitView
@@ -3306,6 +3496,93 @@ export default function Home() {
                           </Panel>
                         ) : null}
                       </ReactFlow>
+                      {canvasNodeDetail ? (
+                        <aside className="canvasNodeDetailPanel">
+                          <div className="canvasNodeDetailCard">
+                            <div className="canvasNodeDetailHeader">
+                              <div>
+                                <p className="canvasEyebrow">Detail</p>
+                                <h3>{canvasNodeDetail.title}</h3>
+                                <p className="mutedLabel">{canvasNodeDetail.subtitle}</p>
+                              </div>
+                              <button
+                                type="button"
+                                className="ghostButton"
+                                onClick={() => setCanvasNodeDetail(null)}
+                              >
+                                닫기
+                              </button>
+                            </div>
+                            <div className="canvasNodeDetailMeta">
+                              {canvasNodeDetail.badges.map((badge) => (
+                                <span key={`${canvasNodeDetail.id}-${badge}`} className="chip chipSoft">{badge}</span>
+                              ))}
+                            </div>
+
+                            <section className="canvasNodeDetailSection">
+                              <h4>요약본</h4>
+                              <div className="canvasNodeDetailSummaryList">
+                                {canvasNodeDetail.summaryLines.map((line, idx) => (
+                                  <p key={`${canvasNodeDetail.id}-summary-${idx}`}>{line}</p>
+                                ))}
+                              </div>
+                            </section>
+
+                            {canvasNodeDetail.opinionGroups.length > 0 ? (
+                              <section className="canvasNodeDetailSection">
+                                <h4>의견 요약</h4>
+                                <div className="canvasNodeDetailOpinionList">
+                                  {canvasNodeDetail.opinionGroups.map((group) => (
+                                    <button
+                                      key={group.id}
+                                      type="button"
+                                      className="opinionGroupCard"
+                                      onClick={() => {
+                                        if (!canvasNodeDetail.pointId) return;
+                                        focusCanvasOpinionGroup(canvasNodeDetail.agendaId, canvasNodeDetail.pointId, group.id);
+                                      }}
+                                    >
+                                      <div className="opinionGroupHeader">
+                                        <strong>{group.typeLabel}</strong>
+                                        <span>{group.rangeLabel}</span>
+                                      </div>
+                                      <p>{group.summary}</p>
+                                    </button>
+                                  ))}
+                                </div>
+                              </section>
+                            ) : null}
+
+                            <section className="canvasNodeDetailSection canvasNodeDetailSectionFill">
+                              <div className="canvasNodeDetailSectionHeader">
+                                <h4>원본 발언</h4>
+                                <button
+                                  type="button"
+                                  className="ghostButton"
+                                  onClick={() => moveToWorkspaceFromCanvas("캔버스 상세 원문 확인 중")}
+                                >
+                                  워크스페이스에서 보기
+                                </button>
+                              </div>
+                              <div className="canvasNodeDetailTranscript">
+                                {canvasNodeDetail.utterances.length === 0 ? (
+                                  <p className="emptyState compact">연결된 원문 발언이 없습니다.</p>
+                                ) : (
+                                  canvasNodeDetail.utterances.map((utterance) => (
+                                    <article key={`${canvasNodeDetail.id}-${utterance.id}`} className="canvasDetailUtterance">
+                                      <div className="utteranceMeta">
+                                        <span className="timestamp">{utterance.timestamp}</span>
+                                        <span className="chip chipSpeaker">{utterance.speaker}</span>
+                                      </div>
+                                      <p>{utterance.text}</p>
+                                    </article>
+                                  ))
+                                )}
+                              </div>
+                            </section>
+                          </div>
+                        </aside>
+                      ) : null}
                     </div>
                   )}
                 </div>

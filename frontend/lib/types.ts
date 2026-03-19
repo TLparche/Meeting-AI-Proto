@@ -172,6 +172,26 @@ export interface AgendaMarkdownExportResponse {
   markdown: string;
 }
 
+export interface AgendaSnapshotExportResponse {
+  ok: boolean;
+  filename: string;
+  agenda_count: number;
+  transcript_count: number;
+  snapshot: Record<string, unknown>;
+}
+
+export interface AgendaSnapshotImportResponse {
+  ok: boolean;
+  state: MeetingState;
+  import_debug: {
+    filename: string;
+    meeting_goal: string;
+    transcript_count: number;
+    agenda_count: number;
+    reset_state: boolean;
+  };
+}
+
 export interface SttStepMark {
   step: string;
   t_ms: number;

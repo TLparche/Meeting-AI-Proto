@@ -1,5 +1,7 @@
 import type {
   AgendaMarkdownExportResponse,
+  AgendaSnapshotExportResponse,
+  AgendaSnapshotImportResponse,
   ImportJsonDirResponse,
   LastLlmJsonResponse,
   LlmConnectResponse,
@@ -148,6 +150,23 @@ export async function getLastLlmJson(): Promise<LastLlmJsonResponse> {
 
 export async function exportAgendaMarkdown(): Promise<AgendaMarkdownExportResponse> {
   return requestJson<AgendaMarkdownExportResponse>("/api/export/agenda-markdown", { cache: "no-store" });
+}
+
+export async function exportAgendaSnapshot(): Promise<AgendaSnapshotExportResponse> {
+  return requestJson<AgendaSnapshotExportResponse>("/api/export/agenda-snapshot", { cache: "no-store" });
+}
+
+export async function importAgendaSnapshot(payload: {
+  file: File;
+  reset_state?: boolean;
+}): Promise<AgendaSnapshotImportResponse> {
+  const form = new FormData();
+  form.append("file", payload.file, payload.file.name);
+  form.append("reset_state", String(payload.reset_state ?? true));
+  return requestJson<AgendaSnapshotImportResponse>("/api/import/agenda-snapshot", {
+    method: "POST",
+    body: form,
+  });
 }
 
 export async function resetState(): Promise<MeetingState> {

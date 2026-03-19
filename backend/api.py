@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -926,6 +926,106 @@ def _build_agenda_markdown(rt: RuntimeStore) -> str:
     lines.append("")
 
     return "\n".join(lines).strip() + "\n"
+
+
+def _build_agenda_snapshot(rt: RuntimeStore) -> dict[str, Any]:
+    return {
+        "snapshot_version": 1,
+        "exported_at": _now_ts(),
+        "meeting_goal": _safe_text(rt.meeting_goal),
+        "window_size": int(rt.window_size or 12),
+        "transcript": copy.deepcopy(list(rt.transcript)),
+        "agenda_outcomes": copy.deepcopy(list(rt.agenda_outcomes)),
+        "last_analyzed_count": int(rt.last_analyzed_count or len(rt.transcript)),
+        "analysis_runtime": {
+            "tick_mode": _safe_text(rt.last_tick_mode, "snapshot"),
+            "used_local_fallback": bool(rt.used_local_fallback),
+            "title_refine_attempts": int(rt.last_title_refine_attempts),
+            "title_refine_success": int(rt.last_title_refine_success),
+        },
+        "last_llm_json": copy.deepcopy(dict(rt.last_llm_parsed_json or {})),
+        "last_llm_parsed_at": _safe_text(rt.last_llm_parsed_at),
+    }
+
+
+def _load_agenda_snapshot(rt: RuntimeStore, payload: dict[str, Any], reset_state: bool = True) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("스냅샷 JSON 객체가 아닙니다.")
+
+    if reset_state:
+        rt.reset()
+    else:
+        rt.transcript = []
+        rt.agenda_outcomes = []
+        rt.last_analyzed_count = 0
+        rt.agenda_seq = 0
+        rt.used_local_fallback = False
+        rt.last_analysis_warning = ""
+        rt.last_tick_mode = "snapshot"
+        rt.last_title_refine_attempts = 0
+        rt.last_title_refine_success = 0
+        rt.last_llm_parsed_json = {}
+        rt.last_llm_parsed_at = ""
+        rt.replay_rows = []
+        rt.replay_index = 0
+        rt.replay_source = ""
+        rt.replay_loaded_at = ""
+        rt.analysis_task_seq = 0
+        rt.analysis_queued = 0
+        rt.analysis_inflight = False
+        rt.analysis_last_enqueued_at = ""
+        rt.analysis_last_started_at = ""
+        rt.analysis_last_done_at = ""
+        rt.analysis_last_error = ""
+        rt.analysis_last_enqueued_id = 0
+        rt.analysis_last_started_id = 0
+        rt.analysis_last_done_id = 0
+        rt.analysis_generation += 1
+        rt.transcript_version = 0
+        rt.analysis_next_windowed_target = 0
+        rt.analysis_last_enqueued_target_count = 0
+        rt.llm_io_seq = 0
+        rt.llm_io_logs = []
+
+    transcript = payload.get("transcript") or []
+    if not isinstance(transcript, list):
+        raise ValueError("transcript 필드가 배열이 아닙니다.")
+
+    outcomes = payload.get("agenda_outcomes") or []
+    if not isinstance(outcomes, list):
+        raise ValueError("agenda_outcomes 필드가 배열이 아닙니다.")
+
+    rt.meeting_goal = _safe_text(payload.get("meeting_goal"))
+    rt.window_size = max(1, int(payload.get("window_size") or 12))
+    rt.transcript = []
+    for item in transcript:
+        if not isinstance(item, dict):
+            continue
+        rt.transcript.append(
+            {
+                "speaker": _safe_text(item.get("speaker"), "화자"),
+                "text": _safe_text(item.get("text")),
+                "timestamp": _safe_text(item.get("timestamp"), _now_ts()),
+            }
+        )
+
+    rt.agenda_outcomes = copy.deepcopy(outcomes)
+    rt.last_analyzed_count = max(0, min(int(payload.get("last_analyzed_count") or len(rt.transcript)), len(rt.transcript)))
+    rt.agenda_seq = len(rt.agenda_outcomes)
+    rt.last_tick_mode = _safe_text((payload.get("analysis_runtime") or {}).get("tick_mode"), "snapshot")
+    rt.used_local_fallback = bool((payload.get("analysis_runtime") or {}).get("used_local_fallback"))
+    rt.last_title_refine_attempts = int((payload.get("analysis_runtime") or {}).get("title_refine_attempts") or 0)
+    rt.last_title_refine_success = int((payload.get("analysis_runtime") or {}).get("title_refine_success") or 0)
+    rt.last_llm_parsed_json = copy.deepcopy(payload.get("last_llm_json") or {})
+    rt.last_llm_parsed_at = _safe_text(payload.get("last_llm_parsed_at"))
+    rt.last_analysis_warning = "agenda_snapshot_import"
+    rt.transcript_version += 1
+
+    return {
+        "meeting_goal": rt.meeting_goal,
+        "transcript_count": len(rt.transcript),
+        "agenda_count": len(rt.agenda_outcomes),
+    }
 
 
 def _utterance_information_units(text: str) -> tuple[int, int]:
@@ -3791,6 +3891,49 @@ def get_export_agenda_markdown():
             "agenda_count": len(RT.agenda_outcomes),
             "transcript_count": len(RT.transcript),
             "markdown": markdown,
+        }
+
+
+@app.get("/api/export/agenda-snapshot")
+def get_export_agenda_snapshot():
+    with RT.lock:
+        snapshot = _build_agenda_snapshot(RT)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        return {
+            "ok": True,
+            "filename": f"agenda_snapshot_{stamp}.json",
+            "agenda_count": len(RT.agenda_outcomes),
+            "transcript_count": len(RT.transcript),
+            "snapshot": snapshot,
+        }
+
+
+@app.post("/api/import/agenda-snapshot")
+async def post_import_agenda_snapshot(
+    file: UploadFile = File(...),
+    reset_state: str = Form(default="true"),
+):
+    raw = await file.read()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"스냅샷 JSON 파싱 실패: {exc}") from exc
+
+    with RT.lock:
+        try:
+            loaded = _load_agenda_snapshot(RT, payload, reset_state=_boolify(reset_state, True))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"스냅샷 복원 실패: {exc}") from exc
+        return {
+            "ok": True,
+            "state": _state_response(RT),
+            "import_debug": {
+                "filename": _safe_text(getattr(file, "filename", ""), "agenda_snapshot.json"),
+                "meeting_goal": loaded["meeting_goal"],
+                "transcript_count": int(loaded["transcript_count"]),
+                "agenda_count": int(loaded["agenda_count"]),
+                "reset_state": _boolify(reset_state, True),
+            },
         }
 
 
