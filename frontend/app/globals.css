@@ -1541,6 +1541,7 @@ h4 {
   border-radius: 18px;
   background: linear-gradient(180deg, rgba(250, 252, 255, 0.98), rgba(244, 248, 255, 0.98));
   padding: 18px;
+  position: relative;
 }
 
 .reactFlowCanvas {
@@ -1548,6 +1549,102 @@ h4 {
   min-height: inherit;
   border-radius: inherit;
   overflow: hidden;
+}
+
+.canvasBoardImmersive {
+  padding-bottom: 112px;
+}
+
+.canvasBottomDock {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 7;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.18);
+  backdrop-filter: blur(14px);
+}
+
+.canvasDockTool {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background: transparent;
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease;
+}
+
+.canvasDockTool:hover {
+  background: #f8fafc;
+  border-color: #dbe3f0;
+}
+
+.canvasDockToolActive {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1d4ed8;
+}
+
+.canvasDockToolIcon {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #334155;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.canvasDockToolActive .canvasDockToolIcon {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.canvasDockComposer {
+  position: absolute;
+  left: 50%;
+  bottom: 86px;
+  transform: translateX(-50%);
+  z-index: 7;
+  width: min(520px, calc(100% - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 22px 48px rgba(15, 23, 42, 0.2);
+  backdrop-filter: blur(16px);
+}
+
+.canvasDockComposerHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.canvasDockComposerHeader h3 {
+  margin: 4px 0 0;
+  font-size: 16px;
+  line-height: 1.4;
 }
 
 .reactFlowStage {

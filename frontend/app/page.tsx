@@ -114,6 +114,8 @@ type CanvasNodeDetail = {
   id: string;
   kind: CanvasGraphNode["kind"];
   agendaId: string;
+  sourceIdeaId?: string;
+  visibility?: "private" | "public";
   pointId?: string;
   title: string;
   subtitle: string;
@@ -137,15 +139,26 @@ type OpinionGroup = {
   utterances: TranscriptUtterance[];
 };
 
+type CanvasComposerTool = "note" | "comment" | "topic" | "agenda";
+
 type CanvasIdea = {
   id: string;
   agendaId: string;
+  kind: Exclude<CanvasComposerTool, "agenda">;
+  visibility: "private" | "public";
   title: string;
   body: string;
   createdAt: string;
   linkedPointId?: string;
   linkedPointText?: string;
   colorTone: "blue" | "mint" | "amber" | "rose";
+};
+
+type CanvasManualAgenda = {
+  id: string;
+  title: string;
+  body: string;
+  createdAt: string;
 };
 
 type CanvasLane = {
@@ -285,6 +298,19 @@ function renderCanvasFlowLabel(data: {
   );
 }
 
+function canvasToolLabel(tool: CanvasComposerTool): string {
+  if (tool === "note") return "메모";
+  if (tool === "comment") return "코멘트";
+  if (tool === "topic") return "주제";
+  return "안건";
+}
+
+function canvasIdeaKindLabel(kind: CanvasIdea["kind"]): string {
+  if (kind === "note") return "메모";
+  if (kind === "comment") return "코멘트";
+  return "주제";
+}
+
 function buildCanvasFlowNodes(
   canvasNodes: CanvasGraphNode[],
   selectedAgendaId?: string,
@@ -337,18 +363,9 @@ type CanvasFlowSurfaceProps = {
   nodeSeed: Node<CanvasFlowNodeData>[];
   edgeSeed: Edge[];
   hasNodes: boolean;
-  canvasComposerOpen: boolean;
   canvasLanesCount: number;
   canvasIdeasCount: number;
   selectedAgendaLabel: string;
-  selectedSummaryText: string;
-  analysisUiDisabled: boolean;
-  canvasIdeaTitle: string;
-  canvasIdeaBody: string;
-  onCanvasIdeaTitleChange: (value: string) => void;
-  onCanvasIdeaBodyChange: (value: string) => void;
-  onAddCanvasIdea: () => void;
-  onClearCanvasIdea: () => void;
   onNodeClick: (_: unknown, node: Node<CanvasFlowNodeData>) => void;
   onPaneClick: () => void;
   onNodeDragStop: (_: unknown, node: Node<CanvasFlowNodeData>) => void;
@@ -358,18 +375,9 @@ const CanvasFlowSurface = memo(function CanvasFlowSurface({
   nodeSeed,
   edgeSeed,
   hasNodes,
-  canvasComposerOpen,
   canvasLanesCount,
   canvasIdeasCount,
   selectedAgendaLabel,
-  selectedSummaryText,
-  analysisUiDisabled,
-  canvasIdeaTitle,
-  canvasIdeaBody,
-  onCanvasIdeaTitleChange,
-  onCanvasIdeaBodyChange,
-  onAddCanvasIdea,
-  onClearCanvasIdea,
   onNodeClick,
   onPaneClick,
   onNodeDragStop,
@@ -465,54 +473,6 @@ const CanvasFlowSurface = memo(function CanvasFlowSurface({
             <span>안건 {canvasLanesCount} · 메모 {canvasIdeasCount}</span>
           </div>
         </Panel>
-
-        {canvasComposerOpen ? (
-          <Panel position="top-right" className="rfPanelShell rfComposerPanel">
-            <section className="canvasQuickComposer">
-              <div className="canvasComposerHeader">
-                <div>
-                  <p className="canvasEyebrow">Note</p>
-                  <h3>캔버스 메모 추가</h3>
-                  <p className="mutedLabel">
-                    {selectedAgendaLabel !== "선택된 안건 없음" ? `${selectedAgendaLabel}에 바로 배치됩니다.` : "먼저 안건을 선택한 뒤 메모를 추가하세요."}
-                    {selectedSummaryText ? ` 현재 요약 "${selectedSummaryText}"와 연결됩니다.` : ""}
-                  </p>
-                </div>
-              </div>
-              <div className="canvasComposerGrid">
-                <input
-                  aria-label="아이디어 제목"
-                  placeholder="짧은 제목"
-                  value={canvasIdeaTitle}
-                  onChange={(event) => onCanvasIdeaTitleChange(event.target.value)}
-                />
-                <textarea
-                  aria-label="아이디어 메모"
-                  placeholder="노트 내용, 질문, 다음 실험 아이디어를 입력"
-                  value={canvasIdeaBody}
-                  onChange={(event) => onCanvasIdeaBodyChange(event.target.value)}
-                />
-              </div>
-              <div className="panelActions">
-                <button
-                  type="button"
-                  onClick={onAddCanvasIdea}
-                  disabled={analysisUiDisabled || (!safeText(canvasIdeaTitle) && !safeText(canvasIdeaBody))}
-                >
-                  보드에 놓기
-                </button>
-                <button
-                  type="button"
-                  className="ghostButton"
-                  onClick={onClearCanvasIdea}
-                  disabled={analysisUiDisabled}
-                >
-                  입력 지우기
-                </button>
-              </div>
-            </section>
-          </Panel>
-        ) : null}
       </ReactFlow>
     </div>
   );
@@ -977,6 +937,7 @@ export default function Home() {
   const [canvasRightPanelView, setCanvasRightPanelView] = useState<"insights" | "detail">("insights");
   const [canvasRightPanelAnim, setCanvasRightPanelAnim] = useState<"idle" | "out" | "in">("idle");
   const [canvasComposerOpen, setCanvasComposerOpen] = useState(false);
+  const [canvasComposerTool, setCanvasComposerTool] = useState<CanvasComposerTool>("note");
   const [canvasReturnContext, setCanvasReturnContext] = useState("");
   const [transcriptAutoFollow, setTranscriptAutoFollow] = useState(true);
   const [pendingTranscriptCount, setPendingTranscriptCount] = useState(0);
@@ -985,6 +946,7 @@ export default function Home() {
   const [canvasIdeaTitle, setCanvasIdeaTitle] = useState("");
   const [canvasIdeaBody, setCanvasIdeaBody] = useState("");
   const [canvasIdeas, setCanvasIdeas] = useState<CanvasIdea[]>([]);
+  const [canvasManualAgendas, setCanvasManualAgendas] = useState<CanvasManualAgenda[]>([]);
   const [canvasNodeDetail, setCanvasNodeDetail] = useState<CanvasNodeDetail | null>(null);
   const [canvasNodePositions, setCanvasNodePositions] = useState<Record<string, CanvasNodePosition>>({});
 
@@ -1620,6 +1582,7 @@ export default function Home() {
   useEffect(() => {
     if ((state.transcript?.length || 0) === 0 && agendas.length === 0) {
       setCanvasIdeas([]);
+      setCanvasManualAgendas([]);
       setCanvasIdeaTitle("");
       setCanvasIdeaBody("");
       setCanvasNodePositions({});
@@ -2015,10 +1978,16 @@ export default function Home() {
     return out;
   }, [sortedOutcomeRows, agendas]);
 
-  const canvasLanes = useMemo<CanvasLane[]>(() => {
-    if (agendas.length === 0) return [];
+  const manualAgendaMap = useMemo(() => {
+    const out = new Map<string, CanvasManualAgenda>();
+    canvasManualAgendas.forEach((agenda) => {
+      out.set(agenda.id, agenda);
+    });
+    return out;
+  }, [canvasManualAgendas]);
 
-    return agendas.map((agenda) => {
+  const canvasLanes = useMemo<CanvasLane[]>(() => {
+    const derivedLanes = agendas.map((agenda) => {
       const row = outcomeByAgendaMap.get(agenda.id);
       const startTurnId = Number(row?.start_turn_id || 0);
       const endTurnId = Number(row?.end_turn_id || 0);
@@ -2038,7 +2007,22 @@ export default function Home() {
         ideaNodes,
       };
     });
-  }, [agendas, outcomeByAgendaMap, canvasIdeas, transcript, transcriptCountByAgenda]);
+    const manualLanes = canvasManualAgendas.map((agenda, idx) => {
+      const ideaNodes = canvasIdeas.filter((idea) => idea.agendaId === agenda.id);
+      return {
+        agendaId: agenda.id,
+        agendaLabel: `수동 안건 ${idx + 1}`,
+        agendaTitle: agenda.title,
+        status: "Not started" as AgendaStatus,
+        flowType: "manual",
+        timeLabel: agenda.createdAt,
+        keywordLabel: safeText(agenda.body).slice(0, 42),
+        transcriptCount: 0,
+        ideaNodes,
+      };
+    });
+    return [...derivedLanes, ...manualLanes];
+  }, [agendas, outcomeByAgendaMap, canvasIdeas, transcript, transcriptCountByAgenda, canvasManualAgendas]);
 
   const canvasGraph = useMemo(() => {
     const nodes: CanvasGraphNode[] = [];
@@ -2094,8 +2078,8 @@ export default function Home() {
           kind: "idea",
           title: idea.title,
           body: idea.body,
-          subtitle: `Idea Note · ${idea.createdAt}`,
-          meta: [idea.linkedPointId ? "요약 노드 연결" : "안건 메모"],
+          subtitle: `${canvasIdeaKindLabel(idea.kind)} · ${idea.createdAt}`,
+          meta: [idea.visibility === "public" ? "공개" : "비공개", idea.linkedPointId ? "요약 연결" : "안건 연결"],
           linkedPointText: idea.linkedPointText,
           pointId: idea.linkedPointId,
           width: 248,
@@ -2289,6 +2273,19 @@ export default function Home() {
     setCanvasIdeaBody("");
   }, []);
 
+  const selectCanvasTool = useCallback((tool: CanvasComposerTool) => {
+    setCanvasComposerTool((current) => {
+      if (current === tool && canvasComposerOpen) {
+        setCanvasComposerOpen(false);
+        return current;
+      }
+      return tool;
+    });
+    if (!canvasComposerOpen || canvasComposerTool !== tool) {
+      setCanvasComposerOpen(true);
+    }
+  }, [canvasComposerOpen, canvasComposerTool]);
+
   const handleCanvasPaneClick = useCallback(() => {
     setCanvasNodeDetail(null);
     swapCanvasRightPanelView("insights");
@@ -2421,14 +2418,16 @@ export default function Home() {
 
   const openCanvasAgendaDetail = useCallback((agendaId: string) => {
     const agenda = agendas.find((item) => item.id === agendaId);
-    if (!agenda) return;
+    const manualAgenda = manualAgendaMap.get(agendaId);
+    if (!agenda && !manualAgenda) return;
     const row = outcomeByAgendaMap.get(agendaId);
     const summaryLines = [
       ...((row?.agenda_summary_items || []).map((item) => safeText(item)).filter(Boolean)),
       ...((row?.summary ? [safeText(row.summary)] : []).filter(Boolean)),
+      ...(manualAgenda?.body ? [manualAgenda.body] : []),
     ].filter(Boolean).slice(0, 3);
     const utterances = (agendaUtterancesMap.get(agendaId) || []).slice();
-    setSelectedAgendaId(agendaId);
+    if (agenda) setSelectedAgendaId(agendaId);
     setSummaryScope("current");
     setSelectedSummaryFocus(null);
     swapCanvasRightPanelView("detail");
@@ -2436,15 +2435,15 @@ export default function Home() {
       id: `detail-${agendaId}`,
       kind: "agenda",
       agendaId,
-      title: agenda.title,
-      subtitle: `${agenda.label} · ${agendaStatusLabel[agenda.status]}`,
-      badges: [safeText(row?.flow_type, "discussion"), `${utterances.length}개 발화`],
+      title: agenda?.title || manualAgenda?.title || "안건",
+      subtitle: agenda ? `${agenda.label} · ${agendaStatusLabel[agenda.status]}` : `수동 안건 · ${manualAgenda?.createdAt || ""}`,
+      badges: [safeText(row?.flow_type, manualAgenda ? "manual" : "discussion"), `${utterances.length}개 발화`],
       keywords: (row?.agenda_keywords || []).map((item) => safeText(item)).filter(Boolean).slice(0, 8),
       summaryLines: summaryLines.length > 0 ? summaryLines : ["요약이 아직 없습니다."],
       opinionGroups: [],
       utterances,
     });
-  }, [agendas, outcomeByAgendaMap, agendaUtterancesMap, swapCanvasRightPanelView]);
+  }, [agendas, manualAgendaMap, outcomeByAgendaMap, agendaUtterancesMap, swapCanvasRightPanelView]);
 
   const openCanvasIdeaDetail = useCallback((idea: CanvasIdea) => {
     const utterances =
@@ -2467,10 +2466,12 @@ export default function Home() {
       id: `detail-${idea.id}`,
       kind: "idea",
       agendaId: idea.agendaId,
+      sourceIdeaId: idea.id,
+      visibility: idea.visibility,
       pointId: idea.linkedPointId,
       title: idea.title,
-      subtitle: `아이디어 메모 · ${idea.createdAt}`,
-      badges: [idea.linkedPointId ? "요약 연결" : "안건 메모"],
+      subtitle: `${canvasIdeaKindLabel(idea.kind)} · ${idea.createdAt}`,
+      badges: [canvasIdeaKindLabel(idea.kind), idea.visibility === "public" ? "공개" : "비공개", idea.linkedPointId ? "요약 연결" : "안건 연결"],
       keywords: [
         ...((outcomeByAgendaMap.get(idea.agendaId)?.agenda_keywords || []).map((item) => safeText(item)).filter(Boolean).slice(0, 6)),
         safeText(idea.title),
@@ -2482,28 +2483,55 @@ export default function Home() {
     });
   }, [agendaUtterancesMap, resolveSummaryFocusUtterances, summaryPointMetaMap, outcomeByAgendaMap, swapCanvasRightPanelView]);
 
-  const addCanvasIdea = () => {
+  const addCanvasItem = useCallback(() => {
     if (analysisUiDisabled) return;
-    const agendaId = selectedAgenda?.id || agendas[0]?.id || "";
-    if (!agendaId) return;
 
     const body = safeText(canvasIdeaBody);
-    const title = safeText(canvasIdeaTitle, body.slice(0, 42));
+    const title = safeText(canvasIdeaTitle, body.slice(0, canvasComposerTool === "agenda" ? 30 : 42));
     if (!title && !body) return;
+
+    if (canvasComposerTool === "agenda") {
+      const nextId = `manual-agenda-${Date.now()}`;
+      setCanvasManualAgendas((prev) => [
+        ...prev,
+        {
+          id: nextId,
+          title: title || "새 안건",
+          body,
+          createdAt: formatNowTime(),
+        },
+      ]);
+      setCanvasNodePositions((prev) => ({
+        ...prev,
+        [`canvas-agenda-${nextId}`]: {
+          x: 96,
+          y: 96 + canvasLanes.length * 236,
+        },
+      }));
+      setCanvasIdeaTitle("");
+      setCanvasIdeaBody("");
+      setCanvasComposerOpen(false);
+      return;
+    }
+
+    const agendaId = selectedAgenda?.id || agendas[0]?.id || "";
+    if (!agendaId) return;
 
     const toneCycle: CanvasIdea["colorTone"][] = ["blue", "mint", "amber", "rose"];
     const tone = toneCycle[canvasIdeas.length % toneCycle.length];
     const linkedPointId = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointId : undefined;
     const linkedPointText = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointText : undefined;
-    const agendaIndex = Math.max(0, agendas.findIndex((agenda) => agenda.id === agendaId));
+    const agendaIndex = Math.max(0, canvasLanes.findIndex((lane) => lane.agendaId === agendaId));
     const agendaIdeaCount = canvasIdeas.filter((idea) => idea.agendaId === agendaId).length;
     const nextId = `canvas-idea-${Date.now()}`;
-    const baseX = 240 + agendaIndex * 430 + (linkedPointId ? 250 : 120) + (agendaIdeaCount % 2) * 24;
-    const baseY = 260 + agendaIdeaCount * 152;
+    const baseX = 640 + (agendaIdeaCount % 2) * 28;
+    const baseY = 164 + agendaIndex * 384 + agendaIdeaCount * 152;
     setCanvasIdeas((prev) => [
       {
         id: nextId,
         agendaId,
+        kind: canvasComposerTool,
+        visibility: "private",
         title,
         body,
         createdAt: formatNowTime(),
@@ -2520,7 +2548,17 @@ export default function Home() {
     setCanvasIdeaTitle("");
     setCanvasIdeaBody("");
     setCanvasComposerOpen(false);
-  };
+  }, [
+    agendas,
+    analysisUiDisabled,
+    canvasComposerTool,
+    canvasIdeaBody,
+    canvasIdeaTitle,
+    canvasIdeas,
+    canvasLanes,
+    selectedAgenda?.id,
+    selectedSummaryFocus,
+  ]);
 
   const openCanvasNode = useCallback((node: Node<CanvasFlowNodeData>) => {
     if (analysisUiDisabled) return;
@@ -2537,6 +2575,28 @@ export default function Home() {
   const onFlowNodeClick = useCallback((_: unknown, node: Node<CanvasFlowNodeData>) => {
     openCanvasNode(node);
   }, [openCanvasNode]);
+
+  const toggleCanvasIdeaVisibility = useCallback((ideaId: string) => {
+    setCanvasIdeas((prev) =>
+      prev.map((idea) =>
+        idea.id === ideaId
+          ? {
+              ...idea,
+              visibility: idea.visibility === "public" ? "private" : "public",
+            }
+          : idea,
+      ),
+    );
+    setCanvasNodeDetail((prev) => {
+      if (!prev || prev.sourceIdeaId !== ideaId) return prev;
+      const nextVisibility = prev.visibility === "public" ? "private" : "public";
+      return {
+        ...prev,
+        visibility: nextVisibility,
+        badges: prev.badges.map((badge) => (badge === "공개" || badge === "비공개" ? (nextVisibility === "public" ? "공개" : "비공개") : badge)),
+      };
+    });
+  }, []);
 
   const focusTargetCard = (agendaId: string, targetId: string) => {
     if (analysisUiDisabled) return;
@@ -2814,6 +2874,15 @@ export default function Home() {
               <p className="mutedLabel">{canvasNodeDetail.subtitle}</p>
             </div>
             <div className="canvasNodeDetailHeaderActions">
+              {canvasNodeDetail.kind === "idea" && canvasNodeDetail.sourceIdeaId ? (
+                <button
+                  type="button"
+                  className="ghostButton"
+                  onClick={() => toggleCanvasIdeaVisibility(canvasNodeDetail.sourceIdeaId as string)}
+                >
+                  {canvasNodeDetail.visibility === "public" ? "비공개로 전환" : "공개로 전환"}
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="ghostButton"
@@ -3273,13 +3342,6 @@ export default function Home() {
               </div>
               <div className="canvasCanvasToolbar">
                 <span className="canvasToolbarMeta">{meeting.title}</span>
-                <button
-                  type="button"
-                  className={`canvasToolbarButton ${canvasComposerOpen ? "canvasToolbarButtonActive" : ""}`}
-                  onClick={() => setCanvasComposerOpen((open) => !open)}
-                >
-                  노트 추가
-                </button>
               </div>
             </header>
           )}
@@ -3612,22 +3674,84 @@ export default function Home() {
                     nodeSeed={flowNodeSeed}
                     edgeSeed={flowEdgeSeed}
                     hasNodes={flowNodeSeed.length > 0}
-                    canvasComposerOpen={canvasComposerOpen}
                     canvasLanesCount={canvasLanes.length}
                     canvasIdeasCount={canvasIdeas.length}
                     selectedAgendaLabel={selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}
-                    selectedSummaryText={selectedSummaryFocus ? stripLeadingTimestamp(selectedSummaryFocus.pointText) : ""}
-                    analysisUiDisabled={analysisUiDisabled}
-                    canvasIdeaTitle={canvasIdeaTitle}
-                    canvasIdeaBody={canvasIdeaBody}
-                    onCanvasIdeaTitleChange={setCanvasIdeaTitle}
-                    onCanvasIdeaBodyChange={setCanvasIdeaBody}
-                    onAddCanvasIdea={addCanvasIdea}
-                    onClearCanvasIdea={clearCanvasIdeaInputs}
                     onNodeClick={onFlowNodeClick}
                     onPaneClick={handleCanvasPaneClick}
                     onNodeDragStop={onFlowNodeDragStop}
                   />
+                  {canvasComposerOpen ? (
+                    <div className="canvasDockComposer" aria-label="캔버스 작성 패널">
+                      <div className="canvasDockComposerHeader">
+                        <div>
+                          <p className="canvasEyebrow">{canvasToolLabel(canvasComposerTool)}</p>
+                          <h3>{canvasToolLabel(canvasComposerTool)} 추가</h3>
+                          <p className="mutedLabel">
+                            {canvasComposerTool === "agenda"
+                              ? "새 안건 레인을 캔버스에 직접 추가합니다."
+                              : `${selectedAgenda ? agendaLabel(selectedAgenda) : "현재 안건"}에 ${canvasToolLabel(canvasComposerTool)}를 배치합니다. 기본 상태는 비공개입니다.`}
+                            {selectedSummaryFocus && canvasComposerTool !== "agenda" ? " 현재 선택 요약과 연결됩니다." : ""}
+                          </p>
+                        </div>
+                        <button type="button" className="ghostButton" onClick={() => setCanvasComposerOpen(false)}>
+                          닫기
+                        </button>
+                      </div>
+                      <div className="canvasComposerGrid">
+                        <input
+                          aria-label={`${canvasToolLabel(canvasComposerTool)} 제목`}
+                          placeholder={canvasComposerTool === "agenda" ? "안건 제목" : "짧은 제목"}
+                          value={canvasIdeaTitle}
+                          onChange={(event) => setCanvasIdeaTitle(event.target.value)}
+                        />
+                        <textarea
+                          aria-label={`${canvasToolLabel(canvasComposerTool)} 내용`}
+                          placeholder={
+                            canvasComposerTool === "note"
+                              ? "메모할 내용을 입력"
+                              : canvasComposerTool === "comment"
+                                ? "코멘트나 피드백을 입력"
+                                : canvasComposerTool === "topic"
+                                  ? "새 주제 설명을 입력"
+                                  : "안건 설명을 입력"
+                          }
+                          value={canvasIdeaBody}
+                          onChange={(event) => setCanvasIdeaBody(event.target.value)}
+                        />
+                      </div>
+                      <div className="panelActions">
+                        <button
+                          type="button"
+                          onClick={addCanvasItem}
+                          disabled={analysisUiDisabled || (!safeText(canvasIdeaTitle) && !safeText(canvasIdeaBody))}
+                        >
+                          {canvasToolLabel(canvasComposerTool)} 추가
+                        </button>
+                        <button type="button" className="ghostButton" onClick={clearCanvasIdeaInputs} disabled={analysisUiDisabled}>
+                          입력 지우기
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  <div className="canvasBottomDock" aria-label="캔버스 도구 모음">
+                    {([
+                      ["note", "메모 입력"],
+                      ["comment", "코멘트 입력"],
+                      ["topic", "주제 추가"],
+                      ["agenda", "Agenda 추가"],
+                    ] as const).map(([tool, label]) => (
+                      <button
+                        key={tool}
+                        type="button"
+                        className={`canvasDockTool ${canvasComposerOpen && canvasComposerTool === tool ? "canvasDockToolActive" : ""}`}
+                        onClick={() => selectCanvasTool(tool)}
+                      >
+                        <span className="canvasDockToolIcon">{tool === "note" ? "N" : tool === "comment" ? "C" : tool === "topic" ? "T" : "A"}</span>
+                        <span>{label}</span>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             )}
