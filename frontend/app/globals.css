@@ -2,6 +2,9 @@
   --workspace-sidebar-width: 280px;
   --canvas-left-drawer-width: 332px;
   --canvas-right-drawer-width: 360px;
+  --canvas-surface-top: 144px;
+  --canvas-surface-bottom: 12px;
+  --canvas-surface-height: calc(100vh - 144px - 12px);
   --bg-start: #f8fbff;
   --bg-end: #f6f8fb;
   --surface: #ffffff;
@@ -418,9 +421,9 @@ textarea {
 
 .canvasDrawerLeft {
   position: fixed;
-  top: 70px;
+  top: var(--canvas-surface-top);
   left: calc(var(--workspace-sidebar-width) + 16px);
-  bottom: 12px;
+  bottom: var(--canvas-surface-bottom);
   width: min(var(--canvas-left-drawer-width), calc(100vw - var(--workspace-sidebar-width) - 64px));
   z-index: 18;
   overflow: auto;
@@ -432,9 +435,9 @@ textarea {
 
 .canvasDrawerRight {
   position: fixed;
-  top: 70px;
+  top: var(--canvas-surface-top);
   right: 12px;
-  bottom: 12px;
+  bottom: var(--canvas-surface-bottom);
   width: min(var(--canvas-right-drawer-width), calc(100vw - var(--workspace-sidebar-width) - 64px));
   z-index: 18;
   overflow: auto;
@@ -1638,12 +1641,15 @@ h4 {
 .canvasBoardImmersive {
   position: relative;
   flex: 1 1 auto;
-  min-height: calc(100vh - 88px);
+  height: var(--canvas-surface-height);
+  min-height: var(--canvas-surface-height);
+  max-height: var(--canvas-surface-height);
   padding: 0;
   border-radius: 0;
   border: none;
   background: #ffffff;
   box-shadow: none;
+  overflow: hidden;
 }
 
 .canvasHud {
@@ -1809,10 +1815,15 @@ h4 {
 }
 
 .reactFlowCanvas {
+  position: relative;
   height: 100%;
   min-height: inherit;
   border-radius: inherit;
   overflow: hidden;
+}
+
+.reactFlowCanvasToolArmed {
+  cursor: crosshair;
 }
 
 .canvasBoardImmersive {
@@ -1898,6 +1909,61 @@ h4 {
   backdrop-filter: blur(16px);
 }
 
+.canvasInlineComposerWrap {
+  position: absolute;
+  z-index: 8;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.canvasInlineComposerRange {
+  position: absolute;
+  left: -56px;
+  top: -40px;
+  width: 112px;
+  height: 80px;
+  border: 1px dashed #60a5fa;
+  border-radius: 16px;
+  background: rgba(219, 234, 254, 0.22);
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.08);
+}
+
+.canvasInlineComposer {
+  left: 18px;
+  top: -18px;
+  bottom: auto;
+  transform: none;
+  width: min(380px, calc(100vw - 96px));
+  pointer-events: auto;
+}
+
+.canvasPreviewGhost {
+  position: absolute;
+  z-index: 8;
+  margin: 0;
+  pointer-events: none;
+}
+
+.canvasPreviewGhostBox {
+  width: 112px;
+  height: 80px;
+  border: 1px dashed rgba(37, 99, 235, 0.72);
+  border-radius: 16px;
+  background: rgba(191, 219, 254, 0.28);
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.08);
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 8px 10px;
+}
+
+.canvasPreviewGhostBox span {
+  font-size: 11px;
+  font-weight: 700;
+  color: #1d4ed8;
+}
+
 .canvasDockComposerHeader {
   display: flex;
   align-items: flex-start;
@@ -1926,6 +1992,12 @@ h4 {
 .reactFlowStage .react-flow__pane:active,
 .reactFlowStage .react-flow__viewport:active {
   cursor: grabbing;
+}
+
+.reactFlowCanvasToolArmed .react-flow__pane,
+.reactFlowCanvasToolArmed .react-flow__viewport,
+.reactFlowCanvasToolArmed .react-flow__renderer {
+  cursor: crosshair;
 }
 
 .reactFlowStage .react-flow__background {
@@ -3314,7 +3386,9 @@ th {
   }
 
   .canvasBoardImmersive {
-    min-height: 720px;
+    min-height: var(--canvas-surface-height);
+    height: var(--canvas-surface-height);
+    max-height: var(--canvas-surface-height);
   }
 
   .canvasHudRight {
@@ -3323,8 +3397,8 @@ th {
 
   .canvasDrawerLeft,
   .canvasDrawerRight {
-    top: 96px;
-    bottom: 12px;
+    top: var(--canvas-surface-top);
+    bottom: var(--canvas-surface-bottom);
     width: min(360px, calc(100vw - 24px));
   }
 
@@ -3399,7 +3473,7 @@ th {
 
   .canvasDrawerLeft,
   .canvasDrawerRight {
-    top: 88px;
+    top: var(--canvas-surface-top);
     width: calc(100vw - 32px);
   }
 
@@ -3413,7 +3487,9 @@ th {
   }
 
   .canvasBoardImmersive {
-    min-height: 760px;
+    min-height: var(--canvas-surface-height);
+    height: var(--canvas-surface-height);
+    max-height: var(--canvas-surface-height);
     padding-top: 12px;
   }
 

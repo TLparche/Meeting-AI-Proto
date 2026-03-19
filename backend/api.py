@@ -679,6 +679,18 @@ class ReplayStepInput(BaseModel):
     auto_analyze: bool = True
 
 
+class CanvasPlacementConfirmInput(BaseModel):
+    tool: str = "note"
+    ui_x: float = 0.0
+    ui_y: float = 0.0
+    flow_x: float = 0.0
+    flow_y: float = 0.0
+    agenda_id: str = ""
+    point_id: str = ""
+    title: str = ""
+    body: str = ""
+
+
 class ProblemDefinitionAgendaInput(BaseModel):
     agenda_id: str
     title: str
@@ -750,6 +762,7 @@ class RuntimeStore:
     analysis_last_enqueued_target_count: int = 0
     llm_io_seq: int = 0
     llm_io_logs: list[dict[str, Any]] = field(default_factory=list)
+    canvas_last_placement: dict[str, Any] = field(default_factory=dict)
 
     def reset(self) -> None:
         self.meeting_goal = ""
@@ -786,6 +799,7 @@ class RuntimeStore:
         self.analysis_last_enqueued_target_count = 0
         self.llm_io_seq = 0
         self.llm_io_logs = []
+        self.canvas_last_placement = {}
 
 
 RT = RuntimeStore()
@@ -4088,6 +4102,30 @@ def post_analysis_tick():
         else:
             RT.last_analysis_warning = f"분석 요청 큐 적재 완료: #{task_id}"
         return _state_response(RT)
+
+
+@app.post("/api/canvas/placement-confirm")
+def post_canvas_placement_confirm(payload: CanvasPlacementConfirmInput):
+    with RT.lock:
+        saved_at = _now_ts()
+        RT.canvas_last_placement = {
+            "tool": _safe_text(payload.tool, "note"),
+            "ui_x": float(payload.ui_x or 0.0),
+            "ui_y": float(payload.ui_y or 0.0),
+            "flow_x": float(payload.flow_x or 0.0),
+            "flow_y": float(payload.flow_y or 0.0),
+            "agenda_id": _safe_text(payload.agenda_id),
+            "point_id": _safe_text(payload.point_id),
+            "title": _safe_text(payload.title),
+            "body": _safe_text(payload.body),
+            "saved_at": saved_at,
+        }
+        return {
+            "ok": True,
+            "saved_at": saved_at,
+            "draft": copy.deepcopy(RT.canvas_last_placement),
+            "state": _state_response(RT),
+        }
 
 
 @app.get("/api/analysis/last-llm-json")

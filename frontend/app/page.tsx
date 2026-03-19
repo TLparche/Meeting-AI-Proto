@@ -1,7 +1,7 @@
 "use client";
 
 import "@xyflow/react/dist/style.css";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import {
   addEdge,
   applyEdgeChanges,
@@ -18,9 +18,11 @@ import {
   type EdgeChange,
   type Node,
   type NodeChange,
+  type ReactFlowInstance,
 } from "@xyflow/react";
 import {
   connectLlm,
+  confirmCanvasPlacement,
   disconnectLlm,
   exportAgendaMarkdown,
   exportAgendaSnapshot,
@@ -162,6 +164,13 @@ type CanvasManualAgenda = {
   title: string;
   body: string;
   createdAt: string;
+};
+
+type CanvasComposerPlacement = {
+  uiX: number;
+  uiY: number;
+  flowX: number;
+  flowY: number;
 };
 
 type CanvasLane = {
@@ -387,8 +396,11 @@ type CanvasFlowSurfaceProps = {
   canvasLanesCount: number;
   canvasIdeasCount: number;
   selectedAgendaLabel: string;
+  composerTool: CanvasComposerTool | null;
   onNodeClick: (_: unknown, node: Node<CanvasFlowNodeData>) => void;
   onPaneClick: () => void;
+  onToolCancel: () => void;
+  onToolPlacement: (placement: CanvasComposerPlacement) => void;
   onNodeDragStop: (_: unknown, node: Node<CanvasFlowNodeData>) => void;
 };
 
@@ -399,12 +411,18 @@ const CanvasFlowSurface = memo(function CanvasFlowSurface({
   canvasLanesCount,
   canvasIdeasCount,
   selectedAgendaLabel,
+  composerTool,
   onNodeClick,
   onPaneClick,
+  onToolCancel,
+  onToolPlacement,
   onNodeDragStop,
 }: CanvasFlowSurfaceProps) {
   const [nodes, setNodes] = useState<Node<CanvasFlowNodeData>[]>(nodeSeed);
   const [edges, setEdges] = useState<Edge[]>(edgeSeed);
+  const [rfInstance, setRfInstance] = useState<ReactFlowInstance<Node<CanvasFlowNodeData>, Edge> | null>(null);
+  const [placementPreview, setPlacementPreview] = useState<CanvasComposerPlacement | null>(null);
+  const previewFrameRef = useRef<number | null>(null);
 
   useEffect(() => {
     setNodes(nodeSeed);
@@ -416,6 +434,18 @@ const CanvasFlowSurface = memo(function CanvasFlowSurface({
       return [...edgeSeed, ...customEdges];
     });
   }, [edgeSeed]);
+
+  useEffect(() => {
+    if (!composerTool) {
+      setPlacementPreview(null);
+    }
+  }, [composerTool]);
+
+  useEffect(() => () => {
+    if (previewFrameRef.current !== null) {
+      window.cancelAnimationFrame(previewFrameRef.current);
+    }
+  }, []);
 
   const onNodesChange = useCallback((changes: NodeChange<Node<CanvasFlowNodeData>>[]) => {
     setNodes((current) => applyNodeChanges(changes, current));
@@ -439,21 +469,86 @@ const CanvasFlowSurface = memo(function CanvasFlowSurface({
     );
   }, []);
 
+  const updatePreviewFromEvent = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!composerTool || !rfInstance) {
+      setPlacementPreview(null);
+      return;
+    }
+    const bounds = (event.currentTarget as HTMLDivElement).getBoundingClientRect();
+    const flowPosition = rfInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+    const nextPlacement = {
+      uiX: Math.max(24, event.clientX - bounds.left),
+      uiY: Math.max(24, event.clientY - bounds.top),
+      flowX: flowPosition.x,
+      flowY: flowPosition.y,
+    };
+    if (previewFrameRef.current !== null) {
+      window.cancelAnimationFrame(previewFrameRef.current);
+    }
+    previewFrameRef.current = window.requestAnimationFrame(() => {
+      setPlacementPreview(nextPlacement);
+      previewFrameRef.current = null;
+    });
+  }, [composerTool, rfInstance]);
+
+  const handleCanvasMouseMove = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    updatePreviewFromEvent(event);
+  }, [updatePreviewFromEvent]);
+
+  const handleCanvasMouseLeave = useCallback(() => {
+    if (previewFrameRef.current !== null) {
+      window.cancelAnimationFrame(previewFrameRef.current);
+      previewFrameRef.current = null;
+    }
+    setPlacementPreview(null);
+  }, []);
+
+  const handleCanvasClick = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    if (!composerTool || !rfInstance) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest(".react-flow__node, .react-flow__controls, .react-flow__minimap, .react-flow__panel, button, input, textarea, label, select")) {
+      return;
+    }
+    const bounds = (event.currentTarget as HTMLDivElement).getBoundingClientRect();
+    const flowPosition = rfInstance.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+    onToolPlacement({
+      uiX: Math.max(24, event.clientX - bounds.left),
+      uiY: Math.max(24, event.clientY - bounds.top),
+      flowX: flowPosition.x,
+      flowY: flowPosition.y,
+    });
+  }, [composerTool, onToolPlacement, rfInstance]);
+
+  const handleCanvasContextMenu = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!composerTool) return;
+    event.preventDefault();
+    setPlacementPreview(null);
+    onToolCancel();
+  }, [composerTool, onToolCancel]);
+
   if (!hasNodes) {
     return <p className="emptyState">안건이 아직 없어 공용 캔버스를 구성할 수 없습니다.</p>;
   }
 
   return (
-    <div className="reactFlowCanvas">
+    <div
+      className={`reactFlowCanvas ${composerTool ? "reactFlowCanvasToolArmed" : ""}`}
+      onMouseMove={handleCanvasMouseMove}
+      onMouseLeave={handleCanvasMouseLeave}
+      onClick={handleCanvasClick}
+      onContextMenu={handleCanvasContextMenu}
+    >
       <ReactFlow
         className="reactFlowStage"
         nodes={nodes}
         edges={edges}
+        onInit={setRfInstance}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onNodeClick={onNodeClick}
-        onPaneClick={onPaneClick}
+        onPaneClick={composerTool ? undefined : onPaneClick}
         onNodeDragStop={onNodeDragStop}
         defaultEdgeOptions={{ reconnectable: true, type: "step" }}
         fitView
@@ -495,6 +590,16 @@ const CanvasFlowSurface = memo(function CanvasFlowSurface({
           </div>
         </Panel>
       </ReactFlow>
+      {composerTool && placementPreview ? (
+        <div
+          className="canvasPreviewGhost"
+          style={{ left: `${placementPreview.uiX - 56}px`, top: `${placementPreview.uiY - 40}px` }}
+        >
+          <div className="canvasPreviewGhostBox">
+            <span>{canvasToolLabel(composerTool)}</span>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 });
@@ -955,10 +1060,12 @@ export default function Home() {
   const [canvasRightRailOpen, setCanvasRightRailOpen] = useState(true);
   const [canvasLeftRailWidth, setCanvasLeftRailWidth] = useState(332);
   const [canvasRightRailWidth, setCanvasRightRailWidth] = useState(360);
+  const [canvasSurfaceTop, setCanvasSurfaceTop] = useState(144);
   const [canvasRightPanelView, setCanvasRightPanelView] = useState<"insights" | "detail">("insights");
   const [canvasRightPanelAnim, setCanvasRightPanelAnim] = useState<"idle" | "out" | "in">("idle");
-  const [canvasComposerOpen, setCanvasComposerOpen] = useState(false);
-  const [canvasComposerTool, setCanvasComposerTool] = useState<CanvasComposerTool>("note");
+  const [canvasComposerTool, setCanvasComposerTool] = useState<CanvasComposerTool | null>(null);
+  const [canvasComposerPlacement, setCanvasComposerPlacement] = useState<CanvasComposerPlacement | null>(null);
+  const [canvasPlacementPending, setCanvasPlacementPending] = useState(false);
   const [canvasStage, setCanvasStage] = useState<CanvasStage>("ideation");
   const [canvasReturnContext, setCanvasReturnContext] = useState("");
   const [transcriptAutoFollow, setTranscriptAutoFollow] = useState(true);
@@ -1018,6 +1125,7 @@ export default function Home() {
   const transcriptListRef = useRef<HTMLDivElement | null>(null);
   const transcriptPrevCountRef = useRef(0);
   const transcriptInitRef = useRef(false);
+  const canvasHeaderRef = useRef<HTMLElement | null>(null);
   const resizeRef = useRef<{
     target: ResizeTarget;
     startX: number;
@@ -1617,6 +1725,8 @@ export default function Home() {
       setSolutionStageMeta("");
       setCanvasIdeaTitle("");
       setCanvasIdeaBody("");
+      setCanvasComposerTool(null);
+      setCanvasComposerPlacement(null);
       setCanvasNodePositions({});
     }
   }, [state.transcript?.length, agendas.length]);
@@ -1632,6 +1742,30 @@ export default function Home() {
       setSelectedAgendaId(active.id);
     }
   }, [agendas, selectedAgendaId]);
+
+  useEffect(() => {
+    if (!isCanvasMode) return;
+    const el = canvasHeaderRef.current;
+    if (!el) return;
+
+    const update = () => {
+      const rect = el.getBoundingClientRect();
+      const nextTop = Math.max(96, Math.round(rect.height + 12));
+      setCanvasSurfaceTop((prev) => (prev === nextTop ? prev : nextTop));
+    };
+
+    update();
+
+    const win = window;
+    win.addEventListener("resize", update);
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(update) : null;
+    observer?.observe(el);
+
+    return () => {
+      win.removeEventListener("resize", update);
+      observer?.disconnect();
+    };
+  }, [isCanvasMode, canvasStage, sidebarOpen]);
 
   const selectedAgenda = agendas.find((agenda) => agenda.id === selectedAgendaId) || agendas[0] || null;
   const canvasTopicLabel = selectedAgenda?.title || safeText(meetingGoalDraft) || safeText(state.meeting_goal) || "공용 캔버스";
@@ -2423,23 +2557,35 @@ export default function Home() {
     setCanvasIdeaBody("");
   }, []);
 
+  const clearCanvasComposer = useCallback(() => {
+    if (canvasPlacementPending) return;
+    setCanvasComposerPlacement(null);
+    setCanvasComposerTool(null);
+    setCanvasIdeaTitle("");
+    setCanvasIdeaBody("");
+  }, [canvasPlacementPending]);
+
   const selectCanvasTool = useCallback((tool: CanvasComposerTool) => {
-    setCanvasComposerTool((current) => {
-      if (current === tool && canvasComposerOpen) {
-        setCanvasComposerOpen(false);
-        return current;
-      }
-      return tool;
-    });
-    if (!canvasComposerOpen || canvasComposerTool !== tool) {
-      setCanvasComposerOpen(true);
-    }
-  }, [canvasComposerOpen, canvasComposerTool]);
+    if (canvasPlacementPending) return;
+    setCanvasComposerPlacement(null);
+    setCanvasIdeaTitle("");
+    setCanvasIdeaBody("");
+    setCanvasComposerTool((current) => (current === tool ? null : tool));
+  }, [canvasPlacementPending]);
 
   const handleCanvasPaneClick = useCallback(() => {
     setCanvasNodeDetail(null);
+    setCanvasRightRailOpen(false);
     swapCanvasRightPanelView("insights");
+    setCanvasComposerPlacement(null);
   }, [swapCanvasRightPanelView]);
+
+  const handleCanvasToolPlacement = useCallback(async (placement: CanvasComposerPlacement) => {
+    if (!canvasComposerTool) return;
+    setCanvasComposerPlacement(placement);
+    setCanvasNodeDetail(null);
+    setError("");
+  }, [canvasComposerTool]);
 
   const onSelectAgenda = useCallback((agendaId: string) => {
     if (analysisUiDisabled) return;
@@ -2580,6 +2726,7 @@ export default function Home() {
     if (agenda) setSelectedAgendaId(agendaId);
     setSummaryScope("current");
     setSelectedSummaryFocus(null);
+    setCanvasRightRailOpen(true);
     swapCanvasRightPanelView("detail");
     setCanvasNodeDetail({
       id: `detail-${agendaId}`,
@@ -2611,6 +2758,7 @@ export default function Home() {
     }
     setSelectedAgendaId(idea.agendaId);
     setSummaryScope("current");
+    setCanvasRightRailOpen(true);
     swapCanvasRightPanelView("detail");
     setCanvasNodeDetail({
       id: `detail-${idea.id}`,
@@ -2633,80 +2781,106 @@ export default function Home() {
     });
   }, [agendaUtterancesMap, resolveSummaryFocusUtterances, summaryPointMetaMap, outcomeByAgendaMap, swapCanvasRightPanelView]);
 
-  const addCanvasItem = useCallback(() => {
-    if (analysisUiDisabled) return;
+  const addCanvasItem = useCallback(async (placement?: CanvasComposerPlacement | null) => {
+    if (analysisUiDisabled || canvasPlacementPending) return;
 
     const body = safeText(canvasIdeaBody);
-    const title = safeText(canvasIdeaTitle, body.slice(0, canvasComposerTool === "agenda" ? 30 : 42));
+    const tool = canvasComposerTool;
+    if (!tool) return;
+    const title = safeText(canvasIdeaTitle, body.slice(0, tool === "agenda" ? 30 : 42));
     if (!title && !body) return;
 
-    if (canvasComposerTool === "agenda") {
-      const nextId = `manual-agenda-${Date.now()}`;
-      setCanvasManualAgendas((prev) => [
-        ...prev,
+    setCanvasPlacementPending(true);
+
+    try {
+      const response = await confirmCanvasPlacement({
+        tool,
+        ui_x: placement?.uiX ?? 0,
+        ui_y: placement?.uiY ?? 0,
+        flow_x: placement?.flowX ?? 0,
+        flow_y: placement?.flowY ?? 0,
+        agenda_id: selectedAgenda?.id || "",
+        point_id: selectedSummaryFocus?.pointId || "",
+        title,
+        body,
+      });
+      commitMeetingState(response.state);
+      setError("");
+
+      if (tool === "agenda") {
+        const nextId = `manual-agenda-${Date.now()}`;
+        setCanvasManualAgendas((prev) => [
+          ...prev,
+          {
+            id: nextId,
+            title: title || "새 안건",
+            body,
+            createdAt: formatNowTime(),
+          },
+        ]);
+        setCanvasNodePositions((prev) => ({
+          ...prev,
+          [`canvas-agenda-${nextId}`]: {
+            x: placement?.flowX ?? 96,
+            y: placement?.flowY ?? 96 + canvasLanes.length * 236,
+          },
+        }));
+        clearCanvasComposer();
+        return;
+      }
+
+      const agendaId = selectedAgenda?.id || agendas[0]?.id || "";
+      if (!agendaId) return;
+
+      const toneCycle: CanvasIdea["colorTone"][] = ["blue", "mint", "amber", "rose"];
+      const tone = toneCycle[canvasIdeas.length % toneCycle.length];
+      const linkedPointId = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointId : undefined;
+      const linkedPointText = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointText : undefined;
+      const agendaIndex = Math.max(0, canvasLanes.findIndex((lane) => lane.agendaId === agendaId));
+      const agendaIdeaCount = canvasIdeas.filter((idea) => idea.agendaId === agendaId).length;
+      const nextId = `canvas-idea-${Date.now()}`;
+      const baseX = 640 + (agendaIdeaCount % 2) * 28;
+      const baseY = 164 + agendaIndex * 384 + agendaIdeaCount * 152;
+      setCanvasIdeas((prev) => [
         {
           id: nextId,
-          title: title || "새 안건",
+          agendaId,
+          kind: tool,
+          visibility: "private",
+          title,
           body,
           createdAt: formatNowTime(),
+          linkedPointId,
+          linkedPointText,
+          colorTone: tone,
         },
+        ...prev,
       ]);
       setCanvasNodePositions((prev) => ({
         ...prev,
-        [`canvas-agenda-${nextId}`]: {
-          x: 96,
-          y: 96 + canvasLanes.length * 236,
+        [nextId]: {
+          x: placement?.flowX ?? baseX,
+          y: placement?.flowY ?? baseY,
         },
       }));
-      setCanvasIdeaTitle("");
-      setCanvasIdeaBody("");
-      setCanvasComposerOpen(false);
-      return;
+      clearCanvasComposer();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setCanvasPlacementPending(false);
     }
-
-    const agendaId = selectedAgenda?.id || agendas[0]?.id || "";
-    if (!agendaId) return;
-
-    const toneCycle: CanvasIdea["colorTone"][] = ["blue", "mint", "amber", "rose"];
-    const tone = toneCycle[canvasIdeas.length % toneCycle.length];
-    const linkedPointId = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointId : undefined;
-    const linkedPointText = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointText : undefined;
-    const agendaIndex = Math.max(0, canvasLanes.findIndex((lane) => lane.agendaId === agendaId));
-    const agendaIdeaCount = canvasIdeas.filter((idea) => idea.agendaId === agendaId).length;
-    const nextId = `canvas-idea-${Date.now()}`;
-    const baseX = 640 + (agendaIdeaCount % 2) * 28;
-    const baseY = 164 + agendaIndex * 384 + agendaIdeaCount * 152;
-    setCanvasIdeas((prev) => [
-      {
-        id: nextId,
-        agendaId,
-        kind: canvasComposerTool,
-        visibility: "private",
-        title,
-        body,
-        createdAt: formatNowTime(),
-        linkedPointId,
-        linkedPointText,
-        colorTone: tone,
-      },
-      ...prev,
-    ]);
-    setCanvasNodePositions((prev) => ({
-      ...prev,
-      [nextId]: { x: baseX, y: baseY },
-    }));
-    setCanvasIdeaTitle("");
-    setCanvasIdeaBody("");
-    setCanvasComposerOpen(false);
   }, [
     agendas,
     analysisUiDisabled,
+    canvasPlacementPending,
     canvasComposerTool,
     canvasIdeaBody,
     canvasIdeaTitle,
     canvasIdeas,
     canvasLanes,
+    commitMeetingState,
     selectedAgenda?.id,
+    clearCanvasComposer,
     selectedSummaryFocus,
   ]);
 
@@ -2793,7 +2967,8 @@ export default function Home() {
 
   useEffect(() => {
     if (!isCanvasMode) {
-      setCanvasComposerOpen(false);
+      setCanvasComposerTool(null);
+      setCanvasComposerPlacement(null);
       setCanvasNodeDetail(null);
       setCanvasRightPanelView("insights");
       setCanvasRightPanelAnim("idle");
@@ -3376,6 +3551,9 @@ export default function Home() {
     ["--workspace-sidebar-width" as string]: `${sidebarOpen ? sidebarWidth : 0}px`,
     ["--canvas-left-drawer-width" as string]: `${canvasLeftRailWidth}px`,
     ["--canvas-right-drawer-width" as string]: `${canvasRightRailWidth}px`,
+    ["--canvas-surface-top" as string]: `${canvasSurfaceTop}px`,
+    ["--canvas-surface-bottom" as string]: "12px",
+    ["--canvas-surface-height" as string]: `calc(100vh - ${canvasSurfaceTop}px - 12px)`,
   } as CSSProperties;
 
   return (
@@ -3485,7 +3663,7 @@ export default function Home() {
             </nav>
           </>
           ) : (
-            <header className="canvasPageHeader">
+            <header ref={canvasHeaderRef} className="canvasPageHeader">
               <div className="canvasPageHeaderStack">
                 <div className="canvasPageHeaderLeft">
                   <span className="canvasPageBadge">Canvas</span>
@@ -3516,6 +3694,17 @@ export default function Home() {
                     ))}
                   </div>
                 </div>
+              </div>
+              <div className="canvasCanvasToolbar">
+                <span className="chip chipSoft">LLM {llmEnabled ? "연결됨" : "미연결"}</span>
+                <button
+                  type="button"
+                  className="canvasToolbarButton"
+                  onClick={() => void (llmEnabled ? onPingLlm() : onConnectLlm())}
+                  disabled={llmChecking}
+                >
+                  {llmChecking ? "확인 중" : llmEnabled ? "LLM 확인" : "LLM 연결"}
+                </button>
               </div>
             </header>
           )}
@@ -3862,12 +4051,24 @@ export default function Home() {
                         canvasLanesCount={canvasLanes.length}
                         canvasIdeasCount={canvasIdeas.length}
                         selectedAgendaLabel={selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}
+                        composerTool={canvasComposerTool}
                         onNodeClick={onFlowNodeClick}
                         onPaneClick={handleCanvasPaneClick}
+                        onToolCancel={clearCanvasComposer}
+                        onToolPlacement={handleCanvasToolPlacement}
                         onNodeDragStop={onFlowNodeDragStop}
                       />
-                      {canvasComposerOpen ? (
-                        <div className="canvasDockComposer" aria-label="캔버스 작성 패널">
+                      {canvasComposerTool && canvasComposerPlacement ? (
+                        <div
+                          className="canvasInlineComposerWrap"
+                          style={{
+                            left: `${canvasComposerPlacement.uiX}px`,
+                            top: `${canvasComposerPlacement.uiY}px`,
+                          }}
+                          aria-label="캔버스 인라인 작성 패널"
+                        >
+                          <div className="canvasInlineComposerRange" />
+                          <div className="canvasDockComposer canvasInlineComposer">
                           <div className="canvasDockComposerHeader">
                             <div>
                               <p className="canvasEyebrow">{canvasToolLabel(canvasComposerTool)}</p>
@@ -3879,7 +4080,7 @@ export default function Home() {
                                 {selectedSummaryFocus && canvasComposerTool !== "agenda" ? " 현재 선택 요약과 연결됩니다." : ""}
                               </p>
                             </div>
-                            <button type="button" className="ghostButton" onClick={() => setCanvasComposerOpen(false)}>
+                            <button type="button" className="ghostButton" onClick={clearCanvasComposer}>
                               닫기
                             </button>
                           </div>
@@ -3908,15 +4109,16 @@ export default function Home() {
                           <div className="panelActions">
                             <button
                               type="button"
-                              onClick={addCanvasItem}
-                              disabled={analysisUiDisabled || (!safeText(canvasIdeaTitle) && !safeText(canvasIdeaBody))}
+                              onClick={() => addCanvasItem(canvasComposerPlacement)}
+                              disabled={analysisUiDisabled || canvasPlacementPending || (!safeText(canvasIdeaTitle) && !safeText(canvasIdeaBody))}
                             >
                               {canvasToolLabel(canvasComposerTool)} 추가
                             </button>
-                            <button type="button" className="ghostButton" onClick={clearCanvasIdeaInputs} disabled={analysisUiDisabled}>
+                            <button type="button" className="ghostButton" onClick={clearCanvasIdeaInputs} disabled={analysisUiDisabled || canvasPlacementPending}>
                               입력 지우기
                             </button>
                           </div>
+                        </div>
                         </div>
                       ) : null}
                       <div className="canvasBottomDock" aria-label="캔버스 도구 모음">
@@ -3929,8 +4131,9 @@ export default function Home() {
                           <button
                             key={tool}
                             type="button"
-                            className={`canvasDockTool ${canvasComposerOpen && canvasComposerTool === tool ? "canvasDockToolActive" : ""}`}
+                            className={`canvasDockTool ${canvasComposerTool === tool ? "canvasDockToolActive" : ""}`}
                             onClick={() => selectCanvasTool(tool)}
+                            disabled={canvasPlacementPending}
                           >
                             <span className="canvasDockToolIcon">{tool === "note" ? "N" : tool === "comment" ? "C" : tool === "topic" ? "T" : "A"}</span>
                             <span>{label}</span>

@@ -2,6 +2,7 @@ import type {
   AgendaMarkdownExportResponse,
   AgendaSnapshotExportResponse,
   AgendaSnapshotImportResponse,
+  CanvasPlacementConfirmResponse,
   CanvasProblemDefinitionResponse,
   CanvasSolutionStageResponse,
   ImportJsonDirResponse,
@@ -167,6 +168,24 @@ export async function generateCanvasProblemDefinition(payload: {
   }>;
 }): Promise<CanvasProblemDefinitionResponse> {
   return requestJson<CanvasProblemDefinitionResponse>("/api/canvas/problem-definition", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function confirmCanvasPlacement(payload: {
+  tool: string;
+  ui_x: number;
+  ui_y: number;
+  flow_x: number;
+  flow_y: number;
+  agenda_id?: string;
+  point_id?: string;
+  title?: string;
+  body?: string;
+}): Promise<CanvasPlacementConfirmResponse> {
+  return requestJson<CanvasPlacementConfirmResponse>("/api/canvas/placement-confirm", {
     method: "POST",
     headers: JSON_HEADERS,
     body: JSON.stringify(payload),

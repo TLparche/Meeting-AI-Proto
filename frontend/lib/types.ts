@@ -297,6 +297,24 @@ export interface CanvasProblemDefinitionResponse {
   groups: CanvasProblemDefinitionGroup[];
 }
 
+export interface CanvasPlacementConfirmResponse {
+  ok: boolean;
+  saved_at: string;
+  draft: {
+    tool: string;
+    ui_x: number;
+    ui_y: number;
+    flow_x: number;
+    flow_y: number;
+    agenda_id?: string;
+    point_id?: string;
+    title?: string;
+    body?: string;
+    saved_at: string;
+  };
+  state: MeetingState;
+}
+
 export interface CanvasSolutionTopicResponse {
   group_id: string;
   topic_no: number;
