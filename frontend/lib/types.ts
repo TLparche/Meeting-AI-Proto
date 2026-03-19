@@ -272,3 +272,27 @@ export interface ReplayStepResponse {
     warning?: string;
   };
 }
+
+export interface CanvasProblemDefinitionGroup {
+  group_id: string;
+  topic: string;
+  keywords: string[];
+  agenda_ids: string[];
+  agenda_titles: string[];
+  ideas: Array<{
+    id: string;
+    kind: string;
+    title: string;
+    body: string;
+  }>;
+  source_summary_items: string[];
+  conclusion: string;
+}
+
+export interface CanvasProblemDefinitionResponse {
+  ok: boolean;
+  used_llm: boolean;
+  warning?: string;
+  generated_at: string;
+  groups: CanvasProblemDefinitionGroup[];
+}

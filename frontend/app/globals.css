@@ -1474,6 +1474,113 @@ h4 {
   line-height: 1.65;
 }
 
+.problemStageBoard {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px;
+}
+
+.problemStageHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.problemStageHeader h3 {
+  margin: 4px 0 6px;
+  font-size: 1rem;
+  line-height: 1.35;
+  color: #0f172a;
+}
+
+.problemGroupGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.problemGroupCard {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid #e5e7eb;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+}
+
+.problemGroupHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.problemGroupHeader h4 {
+  margin: 4px 0 0;
+  font-size: 1rem;
+  line-height: 1.35;
+  color: #111827;
+}
+
+.problemGroupKeywords {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.problemGroupSection {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.problemGroupSection h5 {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #475569;
+}
+
+.problemGroupIdeaList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.problemIdeaItem {
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.problemIdeaItem strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 0.86rem;
+  color: #0f172a;
+}
+
+.problemIdeaItem p {
+  margin: 0;
+  color: #475569;
+  line-height: 1.55;
+}
+
+.problemGroupConclusion {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1e3a8a;
+  line-height: 1.65;
+}
+
 .canvasToolbarButton {
   border: 1px solid #d1d5db;
   border-radius: 8px;

@@ -679,6 +679,27 @@ class ReplayStepInput(BaseModel):
     auto_analyze: bool = True
 
 
+class ProblemDefinitionAgendaInput(BaseModel):
+    agenda_id: str
+    title: str
+    keywords: list[str] = Field(default_factory=list)
+    summary_bullets: list[str] = Field(default_factory=list)
+
+
+class ProblemDefinitionIdeaInput(BaseModel):
+    id: str
+    agenda_id: str
+    kind: str = "note"
+    title: str = ""
+    body: str = ""
+
+
+class ProblemDefinitionGenerateInput(BaseModel):
+    topic: str = ""
+    agendas: list[ProblemDefinitionAgendaInput] = Field(default_factory=list)
+    ideas: list[ProblemDefinitionIdeaInput] = Field(default_factory=list)
+
+
 @dataclass
 class RuntimeStore:
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -833,6 +854,159 @@ def _call_llm_json(
 
 def _md_text(raw: Any) -> str:
     return re.sub(r"\s+", " ", _safe_text(raw)).strip()
+
+
+def _build_problem_definition_groups_local(payload: ProblemDefinitionGenerateInput) -> list[dict[str, Any]]:
+    agendas = payload.agendas or []
+    ideas = payload.ideas or []
+    if not agendas:
+        return []
+
+    groups: list[dict[str, Any]] = []
+    for agenda in agendas:
+        agenda_keywords = [
+            tok
+            for tok in (
+                [_normalize_keyword_token(x) for x in (agenda.keywords or [])]
+                + _keyword_tokens(agenda.title)
+            )
+            if tok and not _is_title_keyword_noise(tok)
+        ]
+        dedup_keywords = list(dict.fromkeys(agenda_keywords))
+
+        best_group_idx = -1
+        best_score = 0
+        for idx, group in enumerate(groups):
+            overlap = len(set(dedup_keywords) & set(group.get("keywords") or []))
+            if overlap > best_score:
+                best_score = overlap
+                best_group_idx = idx
+
+        if best_group_idx < 0 or best_score == 0:
+            groups.append(
+                {
+                    "group_id": f"problem-group-{len(groups) + 1}",
+                    "topic": _safe_text(dedup_keywords[0] if dedup_keywords else agenda.title, agenda.title),
+                    "keywords": dedup_keywords[:8],
+                    "agenda_ids": [_safe_text(agenda.agenda_id)],
+                    "agenda_titles": [_safe_text(agenda.title)],
+                    "source_summary_items": [_safe_text(x) for x in (agenda.summary_bullets or []) if _safe_text(x)],
+                }
+            )
+            continue
+
+        group = groups[best_group_idx]
+        group["agenda_ids"].append(_safe_text(agenda.agenda_id))
+        group["agenda_titles"].append(_safe_text(agenda.title))
+        merged_keywords = list(dict.fromkeys([*(group.get("keywords") or []), *dedup_keywords]))
+        group["keywords"] = merged_keywords[:8]
+        group["source_summary_items"] = [
+            *(group.get("source_summary_items") or []),
+            *[_safe_text(x) for x in (agenda.summary_bullets or []) if _safe_text(x)],
+        ][:12]
+
+    idea_by_agenda: dict[str, list[dict[str, Any]]] = {}
+    for idea in ideas:
+        agenda_id = _safe_text(idea.agenda_id)
+        if not agenda_id:
+            continue
+        idea_by_agenda.setdefault(agenda_id, []).append(
+            {
+                "id": _safe_text(idea.id),
+                "kind": _safe_text(idea.kind, "note"),
+                "title": _safe_text(idea.title),
+                "body": _safe_text(idea.body),
+            }
+        )
+
+    out: list[dict[str, Any]] = []
+    for idx, group in enumerate(groups, start=1):
+        linked_ideas: list[dict[str, Any]] = []
+        for agenda_id in group.get("agenda_ids") or []:
+            linked_ideas.extend(idea_by_agenda.get(_safe_text(agenda_id), []))
+
+        topic = _safe_text(group.get("topic"), f"주제 {idx}")
+        summaries = [_safe_text(x) for x in (group.get("source_summary_items") or []) if _safe_text(x)]
+        out.append(
+            {
+                "group_id": _safe_text(group.get("group_id"), f"problem-group-{idx}"),
+                "topic": _normalize_problem_topic_label(topic, f"주제 {idx}"),
+                "keywords": [_safe_text(x) for x in (group.get("keywords") or []) if _safe_text(x)][:6],
+                "agenda_ids": [_safe_text(x) for x in (group.get("agenda_ids") or []) if _safe_text(x)],
+                "agenda_titles": [_safe_text(x) for x in (group.get("agenda_titles") or []) if _safe_text(x)],
+                "ideas": linked_ideas[:24],
+                "source_summary_items": summaries[:8],
+                "conclusion": f"{topic} 관점에서 연결된 안건과 아이디어를 바탕으로 핵심 인사이트를 정리할 필요가 있습니다.",
+            }
+        )
+    return out
+
+
+def _normalize_problem_topic_label(raw: Any, fallback: str = "주제") -> str:
+    text = _safe_text(raw, fallback)
+    parts = re.findall(r"[A-Za-z0-9가-힣]+", text)
+    cleaned: list[str] = []
+    for part in parts:
+        tok = _safe_text(part)
+        if not tok:
+            continue
+        lowered = tok.lower()
+        if lowered in STOPWORDS or _is_title_keyword_noise(tok):
+            continue
+        cleaned.append(tok)
+        if len(cleaned) >= 2:
+            break
+    if cleaned:
+        return " ".join(cleaned)
+    return _safe_text(fallback, "주제")
+
+
+def _build_problem_definition_prompt(topic: str, groups: list[dict[str, Any]]) -> str:
+    prompt_groups: list[dict[str, Any]] = []
+    for group in groups:
+        prompt_groups.append(
+            {
+                "group_id": _safe_text(group.get("group_id")),
+                "draft_topic": _safe_text(group.get("topic")),
+                "keywords": [_safe_text(x) for x in (group.get("keywords") or []) if _safe_text(x)],
+                "agenda_titles": [_safe_text(x) for x in (group.get("agenda_titles") or []) if _safe_text(x)],
+                "ideas": group.get("ideas") or [],
+                "source_summary_items": [_safe_text(x) for x in (group.get("source_summary_items") or []) if _safe_text(x)],
+            }
+        )
+    payload = {
+        "meeting_topic": _safe_text(topic),
+        "groups": prompt_groups,
+    }
+    return (
+        "너는 회의 아이디어를 문제 정의 단계용 주제 묶음으로 정리하는 분석기다. 출력은 JSON 하나만 반환한다.\n\n"
+        "[목표]\n"
+        "- 각 묶음의 draft_topic은 초안일 뿐이다. 이를 그대로 복사하지 말고, 묶음 전체를 더 잘 설명하는 최종 topic을 다시 정제해 작성한다.\n"
+        "- 유사한 안건/아이디어 묶음마다 '주제 결론'을 새로 작성한다.\n"
+        "- 주제 결론은 기존 문장을 그대로 복사하지 말고, 입력 내용을 종합해서 새 한국어 문장 1개로 재작성한다.\n"
+        "- topic은 너무 길지 않은 키워드/짧은 구 형태로 유지한다.\n\n"
+        "[입력 JSON]\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        "[출력 JSON 스키마]\n"
+        "{\n"
+        '  "groups": [\n'
+        "    {\n"
+        '      "group_id": "problem-group-1",\n'
+        '      "topic": "트렌드",\n'
+        '      "conclusion": "키링을 통해 자신을 표현하려는 수요가 강하게 드러난다."\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "[규칙]\n"
+        "- group_id는 입력값을 그대로 유지한다.\n"
+        "- topic은 draft_topic 재사용이 아니라, 묶음의 안건/아이디어/요약을 보고 다시 정제한 최종 주제명이어야 한다.\n"
+        "- topic은 반드시 1~2단어만 사용한다.\n"
+        "- topic은 가급적 10자 이내의 짧은 명사구로 쓴다.\n"
+        "- topic은 너무 일반적인 표현(예: 기타, 논의, 안건, 주제)으로 쓰지 않는다.\n"
+        "- conclusion은 각 주제당 정확히 1문장.\n"
+        "- conclusion은 요약문 재인용이 아니라 새로 쓴 문장.\n"
+        "- 불필요한 설명 없이 JSON만 반환한다."
+    )
 
 
 def _build_agenda_markdown(rt: RuntimeStore) -> str:
@@ -3879,6 +4053,65 @@ def get_last_llm_json():
             "received_at": _safe_text(RT.last_llm_parsed_at),
             "has_json": bool(RT.last_llm_parsed_json),
             "json": RT.last_llm_parsed_json if isinstance(RT.last_llm_parsed_json, dict) else {},
+        }
+
+
+@app.post("/api/canvas/problem-definition")
+def post_canvas_problem_definition(payload: ProblemDefinitionGenerateInput):
+    with RT.lock:
+        groups = _build_problem_definition_groups_local(payload)
+        used_llm = False
+        warning = ""
+
+        if groups:
+            client = get_client()
+            if bool(RT.llm_enabled) and bool(client.connected):
+                try:
+                    prompt = _build_problem_definition_prompt(payload.topic, groups)
+                    parsed = _call_llm_json(
+                        RT,
+                        client,
+                        prompt=prompt,
+                        stage="canvas_problem_definition",
+                        temperature=0.2,
+                        max_tokens=1200,
+                    )
+                    parsed_groups = parsed.get("groups") if isinstance(parsed, dict) else None
+                    if isinstance(parsed_groups, list):
+                        by_id = {
+                            _safe_text(item.get("group_id")): item
+                            for item in parsed_groups
+                            if isinstance(item, dict) and _safe_text(item.get("group_id"))
+                        }
+                        for group in groups:
+                            llm_item = by_id.get(_safe_text(group.get("group_id")))
+                            if not llm_item:
+                                continue
+                            llm_topic = _normalize_problem_topic_label(llm_item.get("topic"), _safe_text(group.get("topic"), "주제"))
+                            llm_conclusion = _safe_text(llm_item.get("conclusion"))
+                            if llm_topic:
+                                group["topic"] = llm_topic
+                            if llm_conclusion:
+                                group["conclusion"] = llm_conclusion
+                        used_llm = True
+                        RT.last_llm_parsed_json = {
+                            "stage": "canvas_problem_definition",
+                            "groups": copy.deepcopy(groups),
+                        }
+                        RT.last_llm_parsed_at = _now_ts()
+                    else:
+                        warning = "LLM JSON 형식이 예상과 달라 로컬 결과를 사용했습니다."
+                except Exception as exc:
+                    warning = f"문제 정의 LLM 생성 실패: {exc}"
+            else:
+                warning = "LLM 미연결 상태로 로컬 문제 정의 묶음을 사용했습니다."
+
+        return {
+            "ok": True,
+            "used_llm": used_llm,
+            "warning": warning,
+            "generated_at": _now_ts(),
+            "groups": groups,
         }
 
 

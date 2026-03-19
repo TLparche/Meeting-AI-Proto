@@ -24,6 +24,7 @@ import {
   disconnectLlm,
   exportAgendaMarkdown,
   exportAgendaSnapshot,
+  generateCanvasProblemDefinition,
   getLastLlmJson,
   getLlmStatus,
   getState,
@@ -172,6 +173,16 @@ type CanvasLane = {
   keywordLabel: string;
   transcriptCount: number;
   ideaNodes: CanvasIdea[];
+};
+
+type CanvasProblemGroup = {
+  id: string;
+  topic: string;
+  agendaIds: string[];
+  agendas: Agenda[];
+  ideas: CanvasIdea[];
+  conclusion: string;
+  keywords: string[];
 };
 
 type CanvasNodePosition = {
@@ -949,6 +960,9 @@ export default function Home() {
   const [canvasIdeaBody, setCanvasIdeaBody] = useState("");
   const [canvasIdeas, setCanvasIdeas] = useState<CanvasIdea[]>([]);
   const [canvasManualAgendas, setCanvasManualAgendas] = useState<CanvasManualAgenda[]>([]);
+  const [problemDefinitionGroups, setProblemDefinitionGroups] = useState<CanvasProblemGroup[]>([]);
+  const [problemDefinitionLoading, setProblemDefinitionLoading] = useState(false);
+  const [problemDefinitionMeta, setProblemDefinitionMeta] = useState("");
   const [canvasNodeDetail, setCanvasNodeDetail] = useState<CanvasNodeDetail | null>(null);
   const [canvasNodePositions, setCanvasNodePositions] = useState<Record<string, CanvasNodePosition>>({});
 
@@ -992,6 +1006,7 @@ export default function Home() {
   const transcriptListRef = useRef<HTMLDivElement | null>(null);
   const transcriptPrevCountRef = useRef(0);
   const transcriptInitRef = useRef(false);
+  const canvasStagePrevRef = useRef<CanvasStage>("ideation");
   const resizeRef = useRef<{
     target: ResizeTarget;
     startX: number;
@@ -1585,6 +1600,8 @@ export default function Home() {
     if ((state.transcript?.length || 0) === 0 && agendas.length === 0) {
       setCanvasIdeas([]);
       setCanvasManualAgendas([]);
+      setProblemDefinitionGroups([]);
+      setProblemDefinitionMeta("");
       setCanvasIdeaTitle("");
       setCanvasIdeaBody("");
       setCanvasNodePositions({});
@@ -1606,6 +1623,67 @@ export default function Home() {
   const selectedAgenda = agendas.find((agenda) => agenda.id === selectedAgendaId) || agendas[0] || null;
   const canvasTopicLabel = selectedAgenda?.title || safeText(meetingGoalDraft) || safeText(state.meeting_goal) || "공용 캔버스";
   const isIdeationStage = canvasStage === "ideation";
+
+  const runProblemDefinitionGeneration = useCallback(async () => {
+    if (agendas.length === 0) {
+      setProblemDefinitionGroups([]);
+      setProblemDefinitionMeta("");
+      return;
+    }
+
+    setProblemDefinitionLoading(true);
+    try {
+      const res = await generateCanvasProblemDefinition({
+        topic: canvasTopicLabel,
+        agendas: agendas.map((agenda) => ({
+          agenda_id: agenda.id,
+          title: agenda.title,
+          keywords: agenda.keywords || [],
+          summary_bullets: (agenda.summaryBullets || []).map((item) => stripLeadingTimestamp(item)),
+        })),
+        ideas: canvasIdeas.map((idea) => ({
+          id: idea.id,
+          agenda_id: idea.agendaId,
+          kind: idea.kind,
+          title: idea.title,
+          body: idea.body,
+        })),
+      });
+
+      const agendaMap = new Map(agendas.map((agenda) => [agenda.id, agenda]));
+      const ideaMap = new Map(canvasIdeas.map((idea) => [idea.id, idea]));
+      const nextGroups: CanvasProblemGroup[] = (res.groups || []).map((group, idx) => ({
+        id: safeText(group.group_id, `problem-group-${idx + 1}`),
+        topic: safeText(group.topic, `주제 ${idx + 1}`),
+        agendaIds: (group.agenda_ids || []).map((id) => safeText(id)).filter(Boolean),
+        agendas: (group.agenda_ids || []).map((id) => agendaMap.get(id)).filter(Boolean) as Agenda[],
+        ideas: (group.ideas || []).map((item) => ideaMap.get(item.id)).filter(Boolean) as CanvasIdea[],
+        conclusion: safeText(group.conclusion, "주제 결론이 아직 없습니다."),
+        keywords: (group.keywords || []).map((item) => safeText(item)).filter(Boolean),
+      }));
+      setProblemDefinitionGroups(nextGroups);
+      setProblemDefinitionMeta(
+        res.warning
+          ? res.warning
+          : res.used_llm
+            ? `LLM 생성 완료 (${safeText(res.generated_at)})`
+            : `로컬 묶음 생성 완료 (${safeText(res.generated_at)})`,
+      );
+    } catch (err) {
+      setProblemDefinitionGroups([]);
+      setProblemDefinitionMeta(`문제 정의 생성 실패: ${(err as Error).message}`);
+    } finally {
+      setProblemDefinitionLoading(false);
+    }
+  }, [agendas, canvasIdeas, canvasTopicLabel]);
+
+  useEffect(() => {
+    const prevStage = canvasStagePrevRef.current;
+    if (prevStage === "ideation" && canvasStage === "problem-definition") {
+      void runProblemDefinitionGeneration();
+    }
+    canvasStagePrevRef.current = canvasStage;
+  }, [canvasStage, runProblemDefinitionGeneration]);
 
   const transcript = useMemo<TranscriptUtterance[]>(() => {
     const src = state.transcript || [];
@@ -3783,13 +3861,97 @@ export default function Home() {
                       </div>
                     </>
                   ) : (
-                    <div className="canvasStageEmpty">
-                      <div className="canvasStageEmptyCard">
-                        <p className="canvasEyebrow">{canvasTopicLabel}</p>
-                        <h3>{canvasStage === "problem-definition" ? "문제 정의 단계" : "해결책 단계"}</h3>
-                        <p>이 단계는 아직 비어 있습니다. 현재 아이디어 단계 작업 상태는 그대로 저장되어 있습니다.</p>
+                    canvasStage === "problem-definition" ? (
+                      <div className="problemStageBoard">
+                        <div className="problemStageHeader">
+                          <div>
+                            <p className="canvasEyebrow">Problem Definition</p>
+                            <h3>유사 키워드 기반 주제 묶음</h3>
+                            <p className="mutedLabel">
+                              아이디어 단계 안건과 메모를 키워드 단위로 묶어 주제별로 정리합니다.
+                              {problemDefinitionMeta ? ` ${problemDefinitionMeta}` : ""}
+                            </p>
+                          </div>
+                          <span className="chip chipSoft">{problemDefinitionLoading ? "생성 중" : `${problemDefinitionGroups.length}개 묶음`}</span>
+                        </div>
+                        {problemDefinitionLoading ? (
+                          <div className="canvasStageEmpty">
+                            <div className="canvasStageEmptyCard">
+                              <p className="canvasEyebrow">{canvasTopicLabel}</p>
+                              <h3>문제 정의 묶음 생성 중</h3>
+                              <p>아이디어 단계의 안건과 아이디어를 바탕으로 주제와 주제 결론을 만들고 있습니다.</p>
+                            </div>
+                          </div>
+                        ) : problemDefinitionGroups.length === 0 ? (
+                          <div className="canvasStageEmpty">
+                            <div className="canvasStageEmptyCard">
+                              <p className="canvasEyebrow">{canvasTopicLabel}</p>
+                              <h3>문제 정의 단계</h3>
+                              <p>묶을 안건이나 키워드가 아직 부족합니다. 아이디어 단계에서 안건과 메모를 먼저 쌓아주세요.</p>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="problemGroupGrid">
+                            {problemDefinitionGroups.map((group) => (
+                              <article key={group.id} className="problemGroupCard">
+                                <div className="problemGroupHeader">
+                                  <div>
+                                    <p className="canvasEyebrow">주제</p>
+                                    <h4>{group.topic}</h4>
+                                  </div>
+                                  <span className="chip chipSoft">안건 {group.agendas.length} · 아이디어 {group.ideas.length}</span>
+                                </div>
+                                <div className="problemGroupKeywords">
+                                  {group.keywords.map((keyword) => (
+                                    <span key={`${group.id}-${keyword}`} className="chip chipSoft">
+                                      {keyword}
+                                    </span>
+                                  ))}
+                                </div>
+                                <section className="problemGroupSection">
+                                  <h5>연결된 안건</h5>
+                                  <div className="problemGroupIdeaList">
+                                    {group.agendas.map((agenda) => (
+                                      <div key={`${group.id}-${agenda.id}`} className="problemIdeaItem">
+                                        <strong>{agenda.label}</strong>
+                                        <p>{agenda.title}</p>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </section>
+                                <section className="problemGroupSection">
+                                  <h5>연결된 아이디어</h5>
+                                  <div className="problemGroupIdeaList">
+                                    {group.ideas.length === 0 ? (
+                                      <p className="emptyState compact">연결된 아이디어가 아직 없습니다.</p>
+                                    ) : (
+                                      group.ideas.map((idea) => (
+                                        <div key={idea.id} className="problemIdeaItem">
+                                          <strong>{idea.title}</strong>
+                                          <p>{safeText(idea.body, "내용 없음")}</p>
+                                        </div>
+                                      ))
+                                    )}
+                                  </div>
+                                </section>
+                                <section className="problemGroupSection">
+                                  <h5>주제 결론</h5>
+                                  <p className="problemGroupConclusion">{group.conclusion}</p>
+                                </section>
+                              </article>
+                            ))}
+                          </div>
+                        )}
                       </div>
-                    </div>
+                    ) : (
+                      <div className="canvasStageEmpty">
+                        <div className="canvasStageEmptyCard">
+                          <p className="canvasEyebrow">{canvasTopicLabel}</p>
+                          <h3>해결책 단계</h3>
+                          <p>이 단계는 아직 비어 있습니다. 현재 아이디어 단계와 문제 정의 단계 상태는 그대로 저장되어 있습니다.</p>
+                        </div>
+                      </div>
+                    )
                   )}
                 </div>
               </div>

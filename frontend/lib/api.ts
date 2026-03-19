@@ -2,6 +2,7 @@ import type {
   AgendaMarkdownExportResponse,
   AgendaSnapshotExportResponse,
   AgendaSnapshotImportResponse,
+  CanvasProblemDefinitionResponse,
   ImportJsonDirResponse,
   LastLlmJsonResponse,
   LlmConnectResponse,
@@ -146,6 +147,29 @@ export async function tickAnalysis(): Promise<MeetingState> {
 
 export async function getLastLlmJson(): Promise<LastLlmJsonResponse> {
   return requestJson<LastLlmJsonResponse>("/api/analysis/last-llm-json", { cache: "no-store" });
+}
+
+export async function generateCanvasProblemDefinition(payload: {
+  topic: string;
+  agendas: Array<{
+    agenda_id: string;
+    title: string;
+    keywords: string[];
+    summary_bullets: string[];
+  }>;
+  ideas: Array<{
+    id: string;
+    agenda_id: string;
+    kind: string;
+    title: string;
+    body: string;
+  }>;
+}): Promise<CanvasProblemDefinitionResponse> {
+  return requestJson<CanvasProblemDefinitionResponse>("/api/canvas/problem-definition", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function exportAgendaMarkdown(): Promise<AgendaMarkdownExportResponse> {
