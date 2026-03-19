@@ -296,3 +296,19 @@ export interface CanvasProblemDefinitionResponse {
   generated_at: string;
   groups: CanvasProblemDefinitionGroup[];
 }
+
+export interface CanvasSolutionTopicResponse {
+  group_id: string;
+  topic_no: number;
+  topic: string;
+  conclusion: string;
+  ideas: string[];
+}
+
+export interface CanvasSolutionStageResponse {
+  ok: boolean;
+  used_llm: boolean;
+  warning?: string;
+  generated_at: string;
+  topics: CanvasSolutionTopicResponse[];
+}

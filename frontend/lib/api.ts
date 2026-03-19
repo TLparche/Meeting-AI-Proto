@@ -3,6 +3,7 @@ import type {
   AgendaSnapshotExportResponse,
   AgendaSnapshotImportResponse,
   CanvasProblemDefinitionResponse,
+  CanvasSolutionStageResponse,
   ImportJsonDirResponse,
   LastLlmJsonResponse,
   LlmConnectResponse,
@@ -166,6 +167,22 @@ export async function generateCanvasProblemDefinition(payload: {
   }>;
 }): Promise<CanvasProblemDefinitionResponse> {
   return requestJson<CanvasProblemDefinitionResponse>("/api/canvas/problem-definition", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function generateCanvasSolutionStage(payload: {
+  meeting_topic: string;
+  topics: Array<{
+    group_id: string;
+    topic_no: number;
+    topic: string;
+    conclusion: string;
+  }>;
+}): Promise<CanvasSolutionStageResponse> {
+  return requestJson<CanvasSolutionStageResponse>("/api/canvas/solution-stage", {
     method: "POST",
     headers: JSON_HEADERS,
     body: JSON.stringify(payload),

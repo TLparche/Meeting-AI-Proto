@@ -25,6 +25,7 @@ import {
   exportAgendaMarkdown,
   exportAgendaSnapshot,
   generateCanvasProblemDefinition,
+  generateCanvasSolutionStage,
   getLastLlmJson,
   getLlmStatus,
   getState,
@@ -183,6 +184,14 @@ type CanvasProblemGroup = {
   ideas: CanvasIdea[];
   conclusion: string;
   keywords: string[];
+};
+
+type CanvasSolutionTopic = {
+  id: string;
+  topicNo: number;
+  topic: string;
+  conclusion: string;
+  ideas: string[];
 };
 
 type CanvasNodePosition = {
@@ -963,6 +972,9 @@ export default function Home() {
   const [problemDefinitionGroups, setProblemDefinitionGroups] = useState<CanvasProblemGroup[]>([]);
   const [problemDefinitionLoading, setProblemDefinitionLoading] = useState(false);
   const [problemDefinitionMeta, setProblemDefinitionMeta] = useState("");
+  const [solutionTopics, setSolutionTopics] = useState<CanvasSolutionTopic[]>([]);
+  const [solutionStageLoading, setSolutionStageLoading] = useState(false);
+  const [solutionStageMeta, setSolutionStageMeta] = useState("");
   const [canvasNodeDetail, setCanvasNodeDetail] = useState<CanvasNodeDetail | null>(null);
   const [canvasNodePositions, setCanvasNodePositions] = useState<Record<string, CanvasNodePosition>>({});
 
@@ -1006,7 +1018,6 @@ export default function Home() {
   const transcriptListRef = useRef<HTMLDivElement | null>(null);
   const transcriptPrevCountRef = useRef(0);
   const transcriptInitRef = useRef(false);
-  const canvasStagePrevRef = useRef<CanvasStage>("ideation");
   const resizeRef = useRef<{
     target: ResizeTarget;
     startX: number;
@@ -1602,6 +1613,8 @@ export default function Home() {
       setCanvasManualAgendas([]);
       setProblemDefinitionGroups([]);
       setProblemDefinitionMeta("");
+      setSolutionTopics([]);
+      setSolutionStageMeta("");
       setCanvasIdeaTitle("");
       setCanvasIdeaBody("");
       setCanvasNodePositions({});
@@ -1623,12 +1636,18 @@ export default function Home() {
   const selectedAgenda = agendas.find((agenda) => agenda.id === selectedAgendaId) || agendas[0] || null;
   const canvasTopicLabel = selectedAgenda?.title || safeText(meetingGoalDraft) || safeText(state.meeting_goal) || "공용 캔버스";
   const isIdeationStage = canvasStage === "ideation";
+  const canvasStageLoading = problemDefinitionLoading || solutionStageLoading;
+  const canvasStageLoadingLabel = problemDefinitionLoading
+    ? "문제 정의 단계 생성 중"
+    : solutionStageLoading
+      ? "해결책 단계 생성 중"
+      : "";
 
-  const runProblemDefinitionGeneration = useCallback(async () => {
+  const runProblemDefinitionGeneration = useCallback(async (): Promise<CanvasProblemGroup[]> => {
     if (agendas.length === 0) {
       setProblemDefinitionGroups([]);
       setProblemDefinitionMeta("");
-      return;
+      return [];
     }
 
     setProblemDefinitionLoading(true);
@@ -1669,21 +1688,70 @@ export default function Home() {
             ? `LLM 생성 완료 (${safeText(res.generated_at)})`
             : `로컬 묶음 생성 완료 (${safeText(res.generated_at)})`,
       );
+      return nextGroups;
     } catch (err) {
       setProblemDefinitionGroups([]);
       setProblemDefinitionMeta(`문제 정의 생성 실패: ${(err as Error).message}`);
+      return [];
     } finally {
       setProblemDefinitionLoading(false);
     }
   }, [agendas, canvasIdeas, canvasTopicLabel]);
 
-  useEffect(() => {
-    const prevStage = canvasStagePrevRef.current;
-    if (prevStage === "ideation" && canvasStage === "problem-definition") {
-      void runProblemDefinitionGeneration();
+  const runSolutionStageGeneration = useCallback(async (sourceGroups?: CanvasProblemGroup[]): Promise<CanvasSolutionTopic[]> => {
+    const baseGroups = sourceGroups && sourceGroups.length > 0 ? sourceGroups : problemDefinitionGroups;
+    if (baseGroups.length === 0) {
+      setSolutionTopics([]);
+      setSolutionStageMeta("");
+      return [];
     }
-    canvasStagePrevRef.current = canvasStage;
-  }, [canvasStage, runProblemDefinitionGeneration]);
+
+    setSolutionStageLoading(true);
+    try {
+      const res = await generateCanvasSolutionStage({
+        meeting_topic: canvasTopicLabel,
+        topics: baseGroups.map((group, idx) => ({
+          group_id: group.id,
+          topic_no: idx + 1,
+          topic: group.topic,
+          conclusion: group.conclusion,
+        })),
+      });
+      const nextTopics: CanvasSolutionTopic[] = (res.topics || []).map((topic, idx) => ({
+        id: safeText(topic.group_id, `solution-topic-${idx + 1}`),
+        topicNo: Number(topic.topic_no || idx + 1),
+        topic: safeText(topic.topic, `주제 ${idx + 1}`),
+        conclusion: safeText(topic.conclusion),
+        ideas: (topic.ideas || []).map((item) => safeText(item)).filter(Boolean),
+      }));
+      setSolutionTopics(nextTopics);
+      setSolutionStageMeta(
+        res.warning
+          ? res.warning
+          : res.used_llm
+            ? `LLM 생성 완료 (${safeText(res.generated_at)})`
+            : `로컬 해결책 생성 완료 (${safeText(res.generated_at)})`,
+      );
+      return nextTopics;
+    } catch (err) {
+      setSolutionTopics([]);
+      setSolutionStageMeta(`해결책 단계 생성 실패: ${(err as Error).message}`);
+      return [];
+    } finally {
+      setSolutionStageLoading(false);
+    }
+  }, [canvasTopicLabel, problemDefinitionGroups]);
+
+  const handleCanvasStageChange = useCallback(async (nextStage: CanvasStage) => {
+    setCanvasStage(nextStage);
+    if (nextStage === "ideation") return;
+    if (nextStage === "problem-definition") {
+      await runProblemDefinitionGeneration();
+      return;
+    }
+    const groups = await runProblemDefinitionGeneration();
+    await runSolutionStageGeneration(groups);
+  }, [runProblemDefinitionGeneration, runSolutionStageGeneration]);
 
   const transcript = useMemo<TranscriptUtterance[]>(() => {
     const src = state.transcript || [];
@@ -3439,8 +3507,9 @@ export default function Home() {
                         type="button"
                         role="tab"
                         aria-selected={canvasStage === stage}
+                        disabled={canvasStageLoading}
                         className={`canvasStageTab ${canvasStage === stage ? "canvasStageTabActive" : ""}`}
-                        onClick={() => setCanvasStage(stage)}
+                        onClick={() => void handleCanvasStageChange(stage)}
                       >
                         {label}
                       </button>
@@ -3775,6 +3844,15 @@ export default function Home() {
             ) : (
               <div className="canvasWorkspace canvasWorkspaceImmersive">
                 <div className="canvasBoard canvasBoardImmersive">
+                  {canvasStageLoading ? (
+                    <div className="canvasStageLoadingOverlay" aria-live="polite" aria-busy="true">
+                      <div className="canvasStageLoadingCard">
+                        <div className="canvasStageLoadingSpinner" />
+                        <strong>{canvasStageLoadingLabel}</strong>
+                        <p>LLM 응답을 기다리는 중입니다. 완료되면 단계 화면이 자동으로 채워집니다.</p>
+                      </div>
+                    </div>
+                  ) : null}
                   {isIdeationStage ? (
                     <>
                       <CanvasFlowSurface
@@ -3944,12 +4022,63 @@ export default function Home() {
                         )}
                       </div>
                     ) : (
-                      <div className="canvasStageEmpty">
-                        <div className="canvasStageEmptyCard">
-                          <p className="canvasEyebrow">{canvasTopicLabel}</p>
-                          <h3>해결책 단계</h3>
-                          <p>이 단계는 아직 비어 있습니다. 현재 아이디어 단계와 문제 정의 단계 상태는 그대로 저장되어 있습니다.</p>
+                      <div className="problemStageBoard">
+                        <div className="problemStageHeader">
+                          <div>
+                            <p className="canvasEyebrow">Solution Stage</p>
+                            <h3>주제별 AI 해결책 아이디어</h3>
+                            <p className="mutedLabel">
+                              문제 정의 단계의 주제와 결론을 바탕으로 AI가 해결책 아이디어를 제안합니다.
+                              {solutionStageMeta ? ` ${solutionStageMeta}` : ""}
+                            </p>
+                          </div>
+                          <span className="chip chipSoft">{solutionStageLoading ? "생성 중" : `${solutionTopics.length}개 주제`}</span>
                         </div>
+                        {solutionStageLoading ? (
+                          <div className="canvasStageEmpty">
+                            <div className="canvasStageEmptyCard">
+                              <p className="canvasEyebrow">{canvasTopicLabel}</p>
+                              <h3>해결책 아이디어 생성 중</h3>
+                              <p>문제 정의 단계의 주제와 결론을 바탕으로 AI가 실행 가능한 해결책 아이디어를 만들고 있습니다.</p>
+                            </div>
+                          </div>
+                        ) : solutionTopics.length === 0 ? (
+                          <div className="canvasStageEmpty">
+                            <div className="canvasStageEmptyCard">
+                              <p className="canvasEyebrow">{canvasTopicLabel}</p>
+                              <h3>해결책 단계</h3>
+                              <p>문제 정의 단계에서 주제 묶음을 먼저 생성한 뒤 해결책 단계로 이동해주세요.</p>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="solutionTopicColumn">
+                            {solutionTopics.map((topic) => (
+                              <article key={topic.id} className="problemGroupCard">
+                                <div className="problemGroupHeader">
+                                  <div>
+                                    <p className="canvasEyebrow">주제 {topic.topicNo}</p>
+                                    <h4>{topic.topic}</h4>
+                                  </div>
+                                </div>
+                                <section className="problemGroupSection">
+                                  <h5>주제 결론</h5>
+                                  <p className="problemGroupConclusion">{topic.conclusion || "결론이 아직 없습니다."}</p>
+                                </section>
+                                <section className="problemGroupSection">
+                                  <h5>AI 해결책 아이디어</h5>
+                                  <div className="problemGroupIdeaList">
+                                    {topic.ideas.map((idea, idx) => (
+                                      <div key={`${topic.id}-idea-${idx}`} className="problemIdeaItem">
+                                        <strong>아이디어 {idx + 1}</strong>
+                                        <p>{idea}</p>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </section>
+                              </article>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )
                   )}

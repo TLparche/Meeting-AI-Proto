@@ -700,6 +700,18 @@ class ProblemDefinitionGenerateInput(BaseModel):
     ideas: list[ProblemDefinitionIdeaInput] = Field(default_factory=list)
 
 
+class SolutionStageTopicInput(BaseModel):
+    group_id: str
+    topic_no: int = 0
+    topic: str
+    conclusion: str = ""
+
+
+class SolutionStageGenerateInput(BaseModel):
+    meeting_topic: str = ""
+    topics: list[SolutionStageTopicInput] = Field(default_factory=list)
+
+
 @dataclass
 class RuntimeStore:
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -1005,6 +1017,39 @@ def _build_problem_definition_prompt(topic: str, groups: list[dict[str, Any]]) -
         "- topic은 너무 일반적인 표현(예: 기타, 논의, 안건, 주제)으로 쓰지 않는다.\n"
         "- conclusion은 각 주제당 정확히 1문장.\n"
         "- conclusion은 요약문 재인용이 아니라 새로 쓴 문장.\n"
+        "- 불필요한 설명 없이 JSON만 반환한다."
+    )
+
+
+def _build_solution_stage_prompt(meeting_topic: str, topics: list[dict[str, Any]]) -> str:
+    payload = {
+        "meeting_topic": _safe_text(meeting_topic),
+        "topics": topics,
+    }
+    return (
+        "너는 회의 해결책 단계용 AI 아이디어 생성기다. 출력은 JSON 하나만 반환한다.\n\n"
+        "[목표]\n"
+        "- 각 topic마다 실행 가능한 해결책 아이디어를 여러 개 제안한다.\n"
+        "- 아이디어는 topic과 conclusion을 바탕으로 새로 작성한다.\n"
+        "- 기존 conclusion 문장을 그대로 반복하지 말고, 실제 시도 가능한 해결 방향으로 제안한다.\n\n"
+        "[입력 JSON]\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+        "[출력 JSON 스키마]\n"
+        "{\n"
+        '  "topics": [\n'
+        "    {\n"
+        '      "group_id": "problem-group-1",\n'
+        '      "topic_no": 1,\n'
+        '      "topic": "트렌드",\n'
+        '      "ideas": ["아이디어 1", "아이디어 2", "아이디어 3"]\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "[규칙]\n"
+        "- group_id, topic_no, topic은 입력값을 그대로 유지한다.\n"
+        "- ideas는 topic마다 2~4개.\n"
+        "- 각 아이디어는 1문장 또는 짧은 명사구.\n"
+        "- 서로 중복되지 않게 작성한다.\n"
         "- 불필요한 설명 없이 JSON만 반환한다."
     )
 
@@ -4112,6 +4157,75 @@ def post_canvas_problem_definition(payload: ProblemDefinitionGenerateInput):
             "warning": warning,
             "generated_at": _now_ts(),
             "groups": groups,
+        }
+
+
+@app.post("/api/canvas/solution-stage")
+def post_canvas_solution_stage(payload: SolutionStageGenerateInput):
+    with RT.lock:
+        topics = [
+            {
+                "group_id": _safe_text(item.group_id),
+                "topic_no": int(item.topic_no or 0),
+                "topic": _safe_text(item.topic),
+                "conclusion": _safe_text(item.conclusion),
+                "ideas": [
+                    f"{_safe_text(item.topic, '주제')} 관련 핵심 가설을 빠르게 검증할 실험안을 설계한다.",
+                    f"{_safe_text(item.topic, '주제')}에 대한 사용자 반응을 비교할 시범안을 만든다.",
+                ],
+            }
+            for item in (payload.topics or [])
+            if _safe_text(item.topic)
+        ]
+        used_llm = False
+        warning = ""
+
+        if topics:
+            client = get_client()
+            if bool(RT.llm_enabled) and bool(client.connected):
+                try:
+                    prompt = _build_solution_stage_prompt(payload.meeting_topic, topics)
+                    parsed = _call_llm_json(
+                        RT,
+                        client,
+                        prompt=prompt,
+                        stage="canvas_solution_stage",
+                        temperature=0.3,
+                        max_tokens=1400,
+                    )
+                    parsed_topics = parsed.get("topics") if isinstance(parsed, dict) else None
+                    if isinstance(parsed_topics, list):
+                        by_id = {
+                            _safe_text(item.get("group_id")): item
+                            for item in parsed_topics
+                            if isinstance(item, dict) and _safe_text(item.get("group_id"))
+                        }
+                        for topic in topics:
+                            llm_item = by_id.get(_safe_text(topic.get("group_id")))
+                            if not llm_item:
+                                continue
+                            llm_ideas = llm_item.get("ideas")
+                            if isinstance(llm_ideas, list):
+                                topic["ideas"] = [_safe_text(x) for x in llm_ideas if _safe_text(x)][:4]
+                        used_llm = True
+                        RT.last_llm_parsed_json = {
+                            "stage": "canvas_solution_stage",
+                            "topics": copy.deepcopy(topics),
+                        }
+                        RT.last_llm_parsed_at = _now_ts()
+                    else:
+                        warning = "LLM JSON 형식이 예상과 달라 로컬 해결책을 사용했습니다."
+                except Exception as exc:
+                    warning = f"해결책 단계 LLM 생성 실패: {exc}"
+            else:
+                warning = "LLM 미연결 상태로 로컬 해결책 아이디어를 사용했습니다."
+
+        return {
+            "ok": True,
+            "used_llm": used_llm,
+            "warning": warning,
+            "generated_at": _now_ts(),
+            "topics": topics,
         }
 
 
