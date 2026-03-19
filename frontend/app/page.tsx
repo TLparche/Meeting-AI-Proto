@@ -118,6 +118,7 @@ type CanvasNodeDetail = {
   title: string;
   subtitle: string;
   badges: string[];
+  keywords: string[];
   summaryLines: string[];
   opinionGroups: OpinionGroup[];
   utterances: TranscriptUtterance[];
@@ -747,6 +748,8 @@ export default function Home() {
   const [canvasRightRailOpen, setCanvasRightRailOpen] = useState(true);
   const [canvasLeftRailWidth, setCanvasLeftRailWidth] = useState(332);
   const [canvasRightRailWidth, setCanvasRightRailWidth] = useState(360);
+  const [canvasRightPanelView, setCanvasRightPanelView] = useState<"insights" | "detail">("insights");
+  const [canvasRightPanelAnim, setCanvasRightPanelAnim] = useState<"idle" | "out" | "in">("idle");
   const [canvasComposerOpen, setCanvasComposerOpen] = useState(false);
   const [canvasReturnContext, setCanvasReturnContext] = useState("");
   const [transcriptAutoFollow, setTranscriptAutoFollow] = useState(true);
@@ -794,6 +797,7 @@ export default function Home() {
   const sttSessionRef = useRef(0);
   const sendQueueRef = useRef<Promise<void>>(Promise.resolve());
   const replayTimerRef = useRef<number | null>(null);
+  const canvasRightPanelTimerRef = useRef<number | null>(null);
   const replayBusyRef = useRef(false);
   const meetingStateSignatureRef = useRef("");
   const llmStatusSignatureRef = useRef("");
@@ -2177,6 +2181,31 @@ export default function Home() {
     setActiveSection("canvas");
   }, []);
 
+  const clearCanvasRightPanelTimer = useCallback(() => {
+    if (canvasRightPanelTimerRef.current !== null) {
+      window.clearTimeout(canvasRightPanelTimerRef.current);
+      canvasRightPanelTimerRef.current = null;
+    }
+  }, []);
+
+  const swapCanvasRightPanelView = useCallback((nextView: "insights" | "detail") => {
+    clearCanvasRightPanelTimer();
+    if (!canvasRightRailOpen) {
+      setCanvasRightPanelView(nextView);
+      setCanvasRightPanelAnim("idle");
+      return;
+    }
+    setCanvasRightPanelAnim("out");
+    canvasRightPanelTimerRef.current = window.setTimeout(() => {
+      setCanvasRightPanelView(nextView);
+      setCanvasRightPanelAnim("in");
+      canvasRightPanelTimerRef.current = window.setTimeout(() => {
+        setCanvasRightPanelAnim("idle");
+        canvasRightPanelTimerRef.current = null;
+      }, 220);
+    }, 160);
+  }, [canvasRightRailOpen, clearCanvasRightPanelTimer]);
+
   const onSelectAgenda = useCallback((agendaId: string) => {
     if (analysisUiDisabled) return;
     setSelectedAgendaId(agendaId);
@@ -2295,6 +2324,7 @@ export default function Home() {
         title: `[${group.typeLabel}] ${group.summary}`,
         subtitle: "의견 요약",
         badges: [group.rangeLabel, `원문 ${group.utterances.length}문장`],
+        keywords: [...prev.keywords],
         summaryLines: [group.summary, ...(group.detail ? [group.detail] : [])],
         utterances: group.utterances,
       };
@@ -2313,7 +2343,7 @@ export default function Home() {
     setSelectedAgendaId(agendaId);
     setSummaryScope("current");
     setSelectedSummaryFocus(null);
-    setCanvasRightRailOpen(true);
+    swapCanvasRightPanelView("detail");
     setCanvasNodeDetail({
       id: `detail-${agendaId}`,
       kind: "agenda",
@@ -2321,11 +2351,12 @@ export default function Home() {
       title: agenda.title,
       subtitle: `${agenda.label} · ${agendaStatusLabel[agenda.status]}`,
       badges: [safeText(row?.flow_type, "discussion"), `${utterances.length}개 발화`],
+      keywords: (row?.agenda_keywords || []).map((item) => safeText(item)).filter(Boolean).slice(0, 8),
       summaryLines: summaryLines.length > 0 ? summaryLines : ["요약이 아직 없습니다."],
       opinionGroups: [],
       utterances,
     });
-  }, [agendas, outcomeByAgendaMap, agendaUtterancesMap]);
+  }, [agendas, outcomeByAgendaMap, agendaUtterancesMap, swapCanvasRightPanelView]);
 
   const openCanvasSummaryDetail = useCallback((agendaId: string, pointId: string, summaryText: string) => {
     const meta = summaryPointMetaMap.get(`${agendaId}|${pointId}`);
@@ -2339,7 +2370,7 @@ export default function Home() {
     setSelectedAgendaId(agendaId);
     setSummaryScope("current");
     setSelectedSummaryFocus(focusState);
-    setCanvasRightRailOpen(true);
+    swapCanvasRightPanelView("detail");
     setCanvasNodeDetail({
       id: `detail-${agendaId}-${pointId}`,
       kind: "summary",
@@ -2348,11 +2379,15 @@ export default function Home() {
       title: focusState.pointText,
       subtitle: "요약 노드",
       badges: [focusState.rangeLabel, `원문 ${utterances.length}문장`],
+      keywords: [
+        ...((outcomeByAgendaMap.get(agendaId)?.agenda_keywords || []).map((item) => safeText(item)).filter(Boolean).slice(0, 6)),
+        stripLeadingTimestamp(focusState.pointText),
+      ].filter(Boolean).slice(0, 8),
       summaryLines: [focusState.pointText],
       opinionGroups: meta.opinionGroups,
       utterances,
     });
-  }, [resolveSummaryFocusUtterances, summaryPointMetaMap]);
+  }, [resolveSummaryFocusUtterances, summaryPointMetaMap, outcomeByAgendaMap, swapCanvasRightPanelView]);
 
   const openCanvasIdeaDetail = useCallback((idea: CanvasIdea) => {
     const utterances =
@@ -2370,7 +2405,7 @@ export default function Home() {
     }
     setSelectedAgendaId(idea.agendaId);
     setSummaryScope("current");
-    setCanvasRightRailOpen(true);
+    swapCanvasRightPanelView("detail");
     setCanvasNodeDetail({
       id: `detail-${idea.id}`,
       kind: "idea",
@@ -2379,12 +2414,16 @@ export default function Home() {
       title: idea.title,
       subtitle: `아이디어 메모 · ${idea.createdAt}`,
       badges: [idea.linkedPointId ? "요약 연결" : "안건 메모"],
+      keywords: [
+        ...((outcomeByAgendaMap.get(idea.agendaId)?.agenda_keywords || []).map((item) => safeText(item)).filter(Boolean).slice(0, 6)),
+        safeText(idea.title),
+      ].filter(Boolean).slice(0, 8),
       summaryLines: [safeText(idea.body, "메모 본문 없음"), ...(idea.linkedPointText ? [stripLeadingTimestamp(idea.linkedPointText)] : [])],
       opinionGroups: [],
       utterances,
       noteBody: safeText(idea.body),
     });
-  }, [agendaUtterancesMap, resolveSummaryFocusUtterances, summaryPointMetaMap]);
+  }, [agendaUtterancesMap, resolveSummaryFocusUtterances, summaryPointMetaMap, outcomeByAgendaMap, swapCanvasRightPanelView]);
 
   const addCanvasIdea = () => {
     if (analysisUiDisabled) return;
@@ -2493,8 +2532,13 @@ export default function Home() {
     if (!isCanvasMode) {
       setCanvasComposerOpen(false);
       setCanvasNodeDetail(null);
+      setCanvasRightPanelView("insights");
+      setCanvasRightPanelAnim("idle");
     }
-  }, [isCanvasMode]);
+    return () => {
+      clearCanvasRightPanelTimer();
+    };
+  }, [clearCanvasRightPanelTimer, isCanvasMode]);
 
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
@@ -2696,6 +2740,125 @@ export default function Home() {
     } finally {
       endTask();
     }
+  };
+
+  const renderCanvasDetailDrawer = () => {
+    if (!canvasNodeDetail) {
+      return (
+        <div className="canvasDrawerViewport canvasDrawerEmptyState">
+          <p className="emptyState">노드를 선택하면 여기에서 상세 내용을 확인할 수 있습니다.</p>
+        </div>
+      );
+    }
+
+    return (
+      <div className={`canvasDrawerViewport canvasDrawerViewport${canvasRightPanelAnim === "out" ? "SwapOut" : canvasRightPanelAnim === "in" ? "SwapIn" : ""}`}>
+        <div className="canvasNodeDetailCard canvasNodeDetailCardDrawer">
+          <div className="canvasNodeDetailHeader">
+            <div>
+              <p className="canvasEyebrow">Detail</p>
+              <h3>{canvasNodeDetail.title}</h3>
+              <p className="mutedLabel">{canvasNodeDetail.subtitle}</p>
+            </div>
+            <div className="canvasNodeDetailHeaderActions">
+              <button
+                type="button"
+                className="ghostButton"
+                onClick={() => moveToWorkspaceFromCanvas("캔버스 상세 원문 확인 중")}
+              >
+                워크스페이스에서 보기
+              </button>
+              <button
+                type="button"
+                className="ghostButton"
+                onClick={() => {
+                  setCanvasNodeDetail(null);
+                  swapCanvasRightPanelView("insights");
+                }}
+              >
+                닫기
+              </button>
+            </div>
+          </div>
+          <div className="canvasNodeDetailBody">
+            <div className="canvasNodeDetailMeta">
+              {canvasNodeDetail.badges.map((badge) => (
+                <span key={`${canvasNodeDetail.id}-${badge}`} className="chip chipSoft">{badge}</span>
+              ))}
+            </div>
+
+            {canvasNodeDetail.keywords.length > 0 ? (
+              <section className="canvasNodeDetailSection">
+                <h4>키워드</h4>
+                <div className="canvasNodeDetailKeywords">
+                  {canvasNodeDetail.keywords.map((keyword, idx) => (
+                    <span key={`${canvasNodeDetail.id}-kw-${idx}`} className="chip chipSoft">
+                      {keyword}
+                    </span>
+                  ))}
+                </div>
+              </section>
+            ) : null}
+
+            <section className="canvasNodeDetailSection">
+              <h4>요약본</h4>
+              <div className="canvasNodeDetailSummaryList">
+                {canvasNodeDetail.summaryLines.map((line, idx) => (
+                  <p key={`${canvasNodeDetail.id}-summary-${idx}`}>{line}</p>
+                ))}
+              </div>
+            </section>
+
+            {canvasNodeDetail.opinionGroups.length > 0 ? (
+              <section className="canvasNodeDetailSection">
+                <h4>의견 요약</h4>
+                <div className="canvasNodeDetailOpinionList">
+                  {canvasNodeDetail.opinionGroups.map((group) => (
+                    <button
+                      key={group.id}
+                      type="button"
+                      className="opinionGroupCard"
+                      onClick={() => {
+                        if (!canvasNodeDetail.pointId) return;
+                        focusCanvasOpinionGroup(canvasNodeDetail.agendaId, canvasNodeDetail.pointId, group.id);
+                      }}
+                    >
+                      <div className="opinionGroupHeader">
+                        <strong>{group.typeLabel}</strong>
+                        <span>{group.rangeLabel}</span>
+                      </div>
+                      <p>{group.summary}</p>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            ) : null}
+
+            <section className="canvasNodeDetailSection">
+              <div className="canvasNodeDetailSectionHeader">
+                <h4>원본 발언</h4>
+                <span className="mutedLabel">{canvasNodeDetail.utterances.length}문장</span>
+              </div>
+              <div className="canvasNodeDetailTranscript">
+                {canvasNodeDetail.utterances.length === 0 ? (
+                  <p className="emptyState compact">연결된 원문 발언이 없습니다.</p>
+                ) : (
+                  canvasNodeDetail.utterances.map((utterance) => (
+                    <article key={`${canvasNodeDetail.id}-${utterance.id}`} className="canvasDetailUtterance">
+                      <div className="utteranceMeta">
+                        <span className="timestamp">{utterance.timestamp}</span>
+                        <span className="chip chipSpeaker">{utterance.speaker}</span>
+                      </div>
+                      <p>{utterance.text}</p>
+                    </article>
+                  ))
+                )}
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+    );
   };
 
   const renderSummaryCard = () => (
@@ -3404,7 +3567,10 @@ export default function Home() {
                         onEdgesChange={onFlowEdgesChange}
                         onConnect={onFlowConnect}
                         onNodeClick={onFlowNodeClick}
-                        onPaneClick={() => setCanvasNodeDetail(null)}
+                        onPaneClick={() => {
+                          setCanvasNodeDetail(null);
+                          swapCanvasRightPanelView("insights");
+                        }}
                         onNodeDragStop={onFlowNodeDragStop}
                         defaultEdgeOptions={{ reconnectable: true, type: "step" }}
                         fitView
@@ -3496,93 +3662,6 @@ export default function Home() {
                           </Panel>
                         ) : null}
                       </ReactFlow>
-                      {canvasNodeDetail ? (
-                        <aside className="canvasNodeDetailPanel">
-                          <div className="canvasNodeDetailCard">
-                            <div className="canvasNodeDetailHeader">
-                              <div>
-                                <p className="canvasEyebrow">Detail</p>
-                                <h3>{canvasNodeDetail.title}</h3>
-                                <p className="mutedLabel">{canvasNodeDetail.subtitle}</p>
-                              </div>
-                              <button
-                                type="button"
-                                className="ghostButton"
-                                onClick={() => setCanvasNodeDetail(null)}
-                              >
-                                닫기
-                              </button>
-                            </div>
-                            <div className="canvasNodeDetailMeta">
-                              {canvasNodeDetail.badges.map((badge) => (
-                                <span key={`${canvasNodeDetail.id}-${badge}`} className="chip chipSoft">{badge}</span>
-                              ))}
-                            </div>
-
-                            <section className="canvasNodeDetailSection">
-                              <h4>요약본</h4>
-                              <div className="canvasNodeDetailSummaryList">
-                                {canvasNodeDetail.summaryLines.map((line, idx) => (
-                                  <p key={`${canvasNodeDetail.id}-summary-${idx}`}>{line}</p>
-                                ))}
-                              </div>
-                            </section>
-
-                            {canvasNodeDetail.opinionGroups.length > 0 ? (
-                              <section className="canvasNodeDetailSection">
-                                <h4>의견 요약</h4>
-                                <div className="canvasNodeDetailOpinionList">
-                                  {canvasNodeDetail.opinionGroups.map((group) => (
-                                    <button
-                                      key={group.id}
-                                      type="button"
-                                      className="opinionGroupCard"
-                                      onClick={() => {
-                                        if (!canvasNodeDetail.pointId) return;
-                                        focusCanvasOpinionGroup(canvasNodeDetail.agendaId, canvasNodeDetail.pointId, group.id);
-                                      }}
-                                    >
-                                      <div className="opinionGroupHeader">
-                                        <strong>{group.typeLabel}</strong>
-                                        <span>{group.rangeLabel}</span>
-                                      </div>
-                                      <p>{group.summary}</p>
-                                    </button>
-                                  ))}
-                                </div>
-                              </section>
-                            ) : null}
-
-                            <section className="canvasNodeDetailSection canvasNodeDetailSectionFill">
-                              <div className="canvasNodeDetailSectionHeader">
-                                <h4>원본 발언</h4>
-                                <button
-                                  type="button"
-                                  className="ghostButton"
-                                  onClick={() => moveToWorkspaceFromCanvas("캔버스 상세 원문 확인 중")}
-                                >
-                                  워크스페이스에서 보기
-                                </button>
-                              </div>
-                              <div className="canvasNodeDetailTranscript">
-                                {canvasNodeDetail.utterances.length === 0 ? (
-                                  <p className="emptyState compact">연결된 원문 발언이 없습니다.</p>
-                                ) : (
-                                  canvasNodeDetail.utterances.map((utterance) => (
-                                    <article key={`${canvasNodeDetail.id}-${utterance.id}`} className="canvasDetailUtterance">
-                                      <div className="utteranceMeta">
-                                        <span className="timestamp">{utterance.timestamp}</span>
-                                        <span className="chip chipSpeaker">{utterance.speaker}</span>
-                                      </div>
-                                      <p>{utterance.text}</p>
-                                    </article>
-                                  ))
-                                )}
-                              </div>
-                            </section>
-                          </div>
-                        </aside>
-                      ) : null}
                     </div>
                   )}
                 </div>
@@ -3594,7 +3673,19 @@ export default function Home() {
           <section className={`rightSection ${isCanvasMode ? `canvasDrawer canvasDrawerRight ${canvasRightRailOpen ? "canvasDrawerOpen" : "canvasDrawerClosed"}` : ""}`}>
           {isCanvasMode ? (
             <div className="canvasDrawerHeader">
-              <strong>인사이트</strong>
+              <strong>{canvasRightPanelView === "detail" && canvasNodeDetail ? "디테일" : "인사이트"}</strong>
+              {canvasRightPanelView === "detail" && canvasNodeDetail ? (
+                <button
+                  type="button"
+                  className="ghostButton"
+                  onClick={() => {
+                    setCanvasNodeDetail(null);
+                    swapCanvasRightPanelView("insights");
+                  }}
+                >
+                  인사이트로
+                </button>
+              ) : null}
             </div>
           ) : null}
           {isCanvasMode && canvasRightRailOpen ? (
@@ -3606,6 +3697,8 @@ export default function Home() {
               aria-label="오른쪽 패널 크기 조절"
             />
           ) : null}
+          {isCanvasMode && canvasRightPanelView === "detail" ? renderCanvasDetailDrawer() : (
+          <div className={`canvasDrawerViewport ${isCanvasMode ? `canvasDrawerViewport${canvasRightPanelAnim === "out" ? "SwapOut" : canvasRightPanelAnim === "in" ? "SwapIn" : ""}` : ""}`}>
           <section className="contentSignalGrid">
             <details className="card panelCard sidebarSection panelFold" open={false}>
               <summary className="panelHeader tight panelFoldHeader">
@@ -3879,6 +3972,8 @@ export default function Home() {
             <div className="stackColumn">{renderSummaryCard()}{renderDecisionCard()}</div>
             <div className="stackColumn">{renderActionCard()}{renderEvidenceCard()}</div>
           </section>
+          </div>
+          )}
           </section>
         </div>
       </main>

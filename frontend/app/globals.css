@@ -493,6 +493,42 @@ textarea {
   padding: 5px 10px;
 }
 
+.canvasDrawerViewport {
+  min-height: 0;
+  min-width: 0;
+  background: #ffffff;
+}
+
+.canvasDrawerViewportSwapOut {
+  animation: canvasDrawerSwapOut 160ms ease both;
+}
+
+.canvasDrawerViewportSwapIn {
+  animation: canvasDrawerSwapIn 220ms ease both;
+}
+
+@keyframes canvasDrawerSwapOut {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+}
+
+@keyframes canvasDrawerSwapIn {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
 .canvasDrawerResizeHandle {
   position: absolute;
   top: 0;
@@ -1588,7 +1624,8 @@ h4 {
   top: 16px;
   right: 16px;
   bottom: 16px;
-  width: min(380px, 34%);
+  width: min(420px, 38vw);
+  min-width: 320px;
   z-index: 8;
   pointer-events: none;
 }
@@ -1605,6 +1642,22 @@ h4 {
   padding: 14px;
   pointer-events: auto;
   backdrop-filter: blur(10px);
+  min-width: 0;
+  overflow: hidden;
+  container-type: inline-size;
+}
+
+.canvasNodeDetailBody {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-right: 4px;
 }
 
 .canvasNodeDetailHeader {
@@ -1612,34 +1665,49 @@ h4 {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
 }
 
 .canvasNodeDetailHeader h3 {
   margin: 2px 0 4px;
   font-size: 0.98rem;
   line-height: 1.35;
+  word-break: break-word;
+}
+
+.canvasNodeDetailHeader > div {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.canvasNodeDetailHeaderActions {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
 }
 
 .canvasNodeDetailMeta {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
 }
 
 .canvasNodeDetailSection {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  min-height: 0;
+  min-height: fit-content;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-self: stretch;
 }
 
 .canvasNodeDetailSection h4 {
   margin: 0;
   font-size: 0.82rem;
-}
-
-.canvasNodeDetailSectionFill {
-  flex: 1 1 auto;
 }
 
 .canvasNodeDetailSectionHeader {
@@ -1655,7 +1723,17 @@ h4 {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  min-height: 0;
+  min-height: fit-content;
+  min-width: 0;
+  width: 100%;
+  flex: 0 0 auto;
+}
+
+.canvasNodeDetailKeywords {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
 }
 
 .canvasNodeDetailSummaryList p {
@@ -1667,11 +1745,64 @@ h4 {
   font-size: 0.82rem;
   line-height: 1.55;
   color: #334155;
+  word-break: break-word;
 }
 
 .canvasNodeDetailTranscript {
-  overflow: auto;
-  padding-right: 4px;
+  overflow: visible;
+}
+
+.opinionGroupCard {
+  width: 100%;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.opinionGroupCard:hover {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+}
+
+.opinionGroupHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.opinionGroupHeader strong,
+.opinionGroupHeader span,
+.opinionGroupCard p {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.opinionGroupHeader strong {
+  font-size: 0.8rem;
+  color: #111827;
+}
+
+.opinionGroupHeader span {
+  flex: 0 1 auto;
+  font-size: 0.74rem;
+  color: #64748b;
+  text-align: right;
+}
+
+.opinionGroupCard p {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: #334155;
 }
 
 .canvasDetailUtterance {
@@ -1679,6 +1810,7 @@ h4 {
   border-radius: 10px;
   background: #ffffff;
   padding: 10px 12px;
+  min-width: 0;
 }
 
 .canvasDetailUtterance p {
@@ -1686,6 +1818,33 @@ h4 {
   font-size: 0.82rem;
   line-height: 1.55;
   color: #1f2937;
+  word-break: break-word;
+}
+
+.canvasDetailUtterance .utteranceMeta {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+@container (max-width: 360px) {
+  .canvasNodeDetailCard {
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .canvasNodeDetailHeader {
+    flex-direction: column;
+  }
+
+  .canvasNodeDetailHeaderActions,
+  .canvasNodeDetailHeaderActions .ghostButton,
+  .canvasNodeDetailSectionHeader .ghostButton {
+    width: 100%;
+  }
+
+  .opinionGroupHeader {
+    flex-direction: column;
+  }
 }
 
 .reactFlowStage .react-flow__node-default {
