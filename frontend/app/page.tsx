@@ -1,6 +1,24 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import "@xyflow/react/dist/style.css";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import {
+  addEdge,
+  applyEdgeChanges,
+  Background,
+  BackgroundVariant,
+  Controls,
+  MiniMap,
+  Panel,
+  Position,
+  ReactFlow,
+  applyNodeChanges,
+  type Connection,
+  type Edge,
+  type EdgeChange,
+  type Node,
+  type NodeChange,
+} from "@xyflow/react";
 import {
   connectLlm,
   disconnectLlm,
@@ -31,6 +49,7 @@ import type {
 
 type SummaryScope = "current" | "all";
 type AgendaState = "PROPOSED" | "ACTIVE" | "CLOSING" | "CLOSED";
+type AppSection = "workspace" | "canvas";
 
 type AgendaOutcomeReason = {
   turn_id?: number;
@@ -101,6 +120,79 @@ type OpinionGroup = {
   utterances: TranscriptUtterance[];
 };
 
+type CanvasIdea = {
+  id: string;
+  agendaId: string;
+  title: string;
+  body: string;
+  createdAt: string;
+  linkedPointId?: string;
+  linkedPointText?: string;
+  colorTone: "blue" | "mint" | "amber" | "rose";
+};
+
+type CanvasLane = {
+  agendaId: string;
+  agendaLabel: string;
+  agendaTitle: string;
+  status: AgendaStatus;
+  flowType: string;
+  timeLabel: string;
+  keywordLabel: string;
+  transcriptCount: number;
+  summaryNodes: Array<{
+    pointId: string;
+    pointText: string;
+    rangeLabel: string;
+    utteranceCount: number;
+    opinionCount: number;
+  }>;
+  ideaNodes: CanvasIdea[];
+};
+
+type CanvasNodePosition = {
+  x: number;
+  y: number;
+};
+
+type CanvasGraphNode = {
+  id: string;
+  agendaId: string;
+  kind: "agenda" | "summary" | "idea";
+  title: string;
+  body: string;
+  subtitle: string;
+  meta: string[];
+  pointId?: string;
+  linkedPointText?: string;
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+};
+
+type CanvasGraphEdge = {
+  id: string;
+  fromId: string;
+  toId: string;
+  kind: "agenda-summary" | "agenda-idea" | "summary-idea";
+};
+
+type CanvasFlowNodeData = {
+  label: ReactNode;
+  nodeId: string;
+  agendaId: string;
+  kind: CanvasGraphNode["kind"];
+  title: string;
+  body: string;
+  subtitle: string;
+  meta: string[];
+  pointId?: string;
+  linkedPointText?: string;
+};
+
+type ResizeTarget = "sidebar" | "canvas-left" | "canvas-right";
+
 const EMPTY_STATE: MeetingState = {
   meeting_goal: "",
   initial_context: "",
@@ -155,6 +247,32 @@ const evidenceSupportLabel: Record<EvidenceItem["supports"], string> = {
 
 function agendaLabel(agenda: Agenda): string {
   return `${agenda.label}: ${agenda.title}`;
+}
+
+function renderCanvasFlowLabel(data: {
+  kind: CanvasGraphNode["kind"];
+  subtitle: string;
+  title: string;
+  body: string;
+  meta: string[];
+}): ReactNode {
+  return (
+    <div className="rfDefaultNodeLabel">
+      <div className="rfDefaultNodeHeader">
+        <span className={`rfDefaultNodeKind rfDefaultNodeKind${data.kind === "agenda" ? "Agenda" : data.kind === "summary" ? "Summary" : "Idea"}`}>
+          {data.kind}
+        </span>
+        <span>{data.subtitle}</span>
+      </div>
+      <strong>{data.title}</strong>
+      {data.body ? <p>{data.body}</p> : null}
+      <div className="rfDefaultNodeMeta">
+        {data.meta.map((item) => (
+          <span key={`${data.title}-${item}`}>{item}</span>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function decisionStatusClass(status: DecisionItem["finalStatus"]): string {
@@ -213,6 +331,49 @@ function extractTimestampToken(text: string): string {
 
 function stripLeadingTimestamp(text: string): string {
   return safeText(text).replace(/^\[\d{2}:\d{2}(?::\d{2})?\]\s*/, "").trim();
+}
+
+function buildMeetingStateSignature(state: MeetingState): string {
+  const transcript = state.transcript || [];
+  const lastTranscript = transcript[transcript.length - 1];
+  const outcomes = state.analysis?.agenda_outcomes || [];
+  const worker = state.analysis_runtime?.analysis_worker;
+  return JSON.stringify({
+    meeting_goal: safeText(state.meeting_goal),
+    transcript_count: transcript.length,
+    last_transcript_ts: safeText(lastTranscript?.timestamp),
+    last_transcript_speaker: safeText(lastTranscript?.speaker),
+    last_transcript_text: safeText(lastTranscript?.text).slice(-48),
+    agenda_stack_count: state.agenda_stack?.length || 0,
+    outcome_count: outcomes.length,
+    active_agenda: safeText(state.analysis?.agenda?.active?.title),
+    active_confidence: Number(state.analysis?.agenda?.active?.confidence || 0),
+    llm_enabled: Boolean(state.llm_enabled),
+    replay_cursor: Number(state.replay?.queued_cursor || 0),
+    replay_remaining: Number(state.replay?.queued_remaining || 0),
+    replay_done: Boolean(state.replay?.done),
+    worker_inflight: Boolean(worker?.inflight),
+    worker_queued: Number(worker?.queued || 0),
+    worker_done: Number(worker?.last_done_id || 0),
+    llm_json_at: safeText(state.analysis_runtime?.last_llm_json_at),
+    control_reason: safeText(state.analysis_runtime?.control_plane_reason),
+    fallback: Boolean(state.analysis_runtime?.used_local_fallback),
+  });
+}
+
+function buildLlmStatusSignature(status: MeetingState["llm_status"]): string {
+  return JSON.stringify({
+    connected: Boolean(status?.connected),
+    request_count: Number(status?.request_count || 0),
+    success_count: Number(status?.success_count || 0),
+    error_count: Number(status?.error_count || 0),
+    last_request_at: safeText(status?.last_request_at),
+    last_success_at: safeText(status?.last_success_at),
+    last_error_at: safeText(status?.last_error_at),
+    last_error: safeText(status?.last_error),
+    last_finish_reason: safeText(status?.last_finish_reason),
+    last_raw_preview: safeText(status?.last_raw_preview).slice(0, 120),
+  });
 }
 
 function normalizeSummaryKey(text: string): string {
@@ -562,10 +723,26 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [speakerFilter, setSpeakerFilter] = useState("전체");
   const [highlightRelated, setHighlightRelated] = useState(true);
+  const [activeSection, setActiveSection] = useState<AppSection>("workspace");
+  const isCanvasMode = activeSection === "canvas";
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(280);
+  const [canvasLeftRailOpen, setCanvasLeftRailOpen] = useState(true);
+  const [canvasRightRailOpen, setCanvasRightRailOpen] = useState(true);
+  const [canvasLeftRailWidth, setCanvasLeftRailWidth] = useState(332);
+  const [canvasRightRailWidth, setCanvasRightRailWidth] = useState(360);
+  const [canvasComposerOpen, setCanvasComposerOpen] = useState(false);
+  const [canvasReturnContext, setCanvasReturnContext] = useState("");
   const [transcriptAutoFollow, setTranscriptAutoFollow] = useState(true);
   const [pendingTranscriptCount, setPendingTranscriptCount] = useState(0);
   const [summaryScope, setSummaryScope] = useState<SummaryScope>("current");
   const [selectedAgendaId, setSelectedAgendaId] = useState("");
+  const [canvasIdeaTitle, setCanvasIdeaTitle] = useState("");
+  const [canvasIdeaBody, setCanvasIdeaBody] = useState("");
+  const [canvasIdeas, setCanvasIdeas] = useState<CanvasIdea[]>([]);
+  const [canvasNodePositions, setCanvasNodePositions] = useState<Record<string, CanvasNodePosition>>({});
+  const [flowNodes, setFlowNodes] = useState<Node<CanvasFlowNodeData>[]>([]);
+  const [flowEdges, setFlowEdges] = useState<Edge[]>([]);
 
   const [datasetFolder, setDatasetFolder] = useState("dataset/economy");
   const [datasetFiles, setDatasetFiles] = useState<File[]>([]);
@@ -600,9 +777,16 @@ export default function Home() {
   const sendQueueRef = useRef<Promise<void>>(Promise.resolve());
   const replayTimerRef = useRef<number | null>(null);
   const replayBusyRef = useRef(false);
+  const meetingStateSignatureRef = useRef("");
+  const llmStatusSignatureRef = useRef("");
   const transcriptListRef = useRef<HTMLDivElement | null>(null);
   const transcriptPrevCountRef = useRef(0);
   const transcriptInitRef = useRef(false);
+  const resizeRef = useRef<{
+    target: ResizeTarget;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
   const debugSnapshotRef = useRef<{
     transcriptCount: number;
     outcomeCount: number;
@@ -619,6 +803,15 @@ export default function Home() {
   const loadState = useCallback(async () => {
     try {
       const next = await getState();
+      const nextSignature = buildMeetingStateSignature(next);
+      if (meetingStateSignatureRef.current === nextSignature) {
+        setError("");
+        return;
+      }
+      meetingStateSignatureRef.current = nextSignature;
+      if (next.llm_status) {
+        llmStatusSignatureRef.current = buildLlmStatusSignature(next.llm_status);
+      }
       setState(next);
       setError("");
     } catch (err) {
@@ -629,6 +822,9 @@ export default function Home() {
   const refreshLlmStatus = useCallback(async () => {
     try {
       const status = await getLlmStatus();
+      const nextSignature = buildLlmStatusSignature(status);
+      if (llmStatusSignatureRef.current === nextSignature) return;
+      llmStatusSignatureRef.current = nextSignature;
       setState((prev) => ({ ...prev, llm_status: status }));
     } catch {
       // noop
@@ -654,12 +850,18 @@ export default function Home() {
     const worker = state.analysis_runtime?.analysis_worker;
     const queued = Number(worker?.queued || 0);
     const inflight = Boolean(worker?.inflight);
-    const pollMs = replayRunning || inflight || queued > 0 ? 200 : 1200;
+    const pollMs = replayRunning || inflight || queued > 0
+      ? isCanvasMode
+        ? 700
+        : 250
+      : isCanvasMode
+        ? 2200
+        : 1200;
     const id = window.setInterval(() => {
       void loadState();
     }, pollMs);
     return () => window.clearInterval(id);
-  }, [loadState, replayRunning, state.analysis_runtime?.analysis_worker?.inflight, state.analysis_runtime?.analysis_worker?.queued]);
+  }, [isCanvasMode, loadState, replayRunning, state.analysis_runtime?.analysis_worker?.inflight, state.analysis_runtime?.analysis_worker?.queued]);
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -715,6 +917,14 @@ export default function Home() {
     setTaskElapsedSec(0);
   }, []);
 
+  const commitMeetingState = useCallback((next: MeetingState) => {
+    meetingStateSignatureRef.current = buildMeetingStateSignature(next);
+    if (next.llm_status) {
+      llmStatusSignatureRef.current = buildLlmStatusSignature(next.llm_status);
+    }
+    setState(next);
+  }, []);
+
   const scrollTranscriptToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     const el = transcriptListRef.current;
     if (!el) return;
@@ -734,7 +944,7 @@ export default function Home() {
     if (lockAnalysis) setAnalysisPending(true);
     try {
       const next = await action();
-      setState(next);
+      commitMeetingState(next);
       setError("");
     } catch (err) {
       setError((err as Error).message);
@@ -751,7 +961,7 @@ export default function Home() {
         meeting_goal: meetingGoalDraft,
         window_size: state.window_size,
       });
-      setState(next);
+      commitMeetingState(next);
       setMeetingGoalDraft(next.meeting_goal || "");
       setMeetingGoalDirty(false);
       setError("");
@@ -773,7 +983,7 @@ export default function Home() {
         auto_tick: true,
         max_files: 500,
       });
-      setState(res.state);
+      commitMeetingState(res.state);
       setMeetingGoalDraft(res.state.meeting_goal || "");
       setMeetingGoalDirty(false);
       setError("");
@@ -808,7 +1018,7 @@ export default function Home() {
     setAnalysisPending(true);
     try {
       const res = await importJsonFiles({ files: datasetFiles, reset_state: true, auto_tick: true });
-      setState(res.state);
+      commitMeetingState(res.state);
       setMeetingGoalDraft(res.state.meeting_goal || "");
       setMeetingGoalDirty(false);
       setError("");
@@ -842,7 +1052,7 @@ export default function Home() {
     beginTask("라인모드 큐 적재 중");
     try {
       const res = await importJsonFilesReplay({ files: datasetFiles, reset_state: true, apply_goal: true });
-      setState(res.state);
+      commitMeetingState(res.state);
       setMeetingGoalDraft(res.state.meeting_goal || "");
       setMeetingGoalDirty(false);
       setError("");
@@ -872,7 +1082,7 @@ export default function Home() {
     try {
       const take = Math.max(1, Math.min(100, Number(lines || replayLinesPerStep) || 1));
       const res = await replayStep({ lines: take, auto_analyze: true });
-      setState(res.state);
+      commitMeetingState(res.state);
       setError("");
       const d = res.replay_debug;
       setDatasetImportInfo(
@@ -894,7 +1104,7 @@ export default function Home() {
     } finally {
       replayBusyRef.current = false;
     }
-  }, [replayLinesPerStep, stopReplayAuto]);
+  }, [commitMeetingState, replayLinesPerStep, stopReplayAuto]);
 
   const onStartReplayAuto = () => {
     const remaining = Number(state.replay?.queued_remaining || 0);
@@ -917,6 +1127,7 @@ export default function Home() {
     setLlmChecking(true);
     try {
       const res = await pingLlm();
+      llmStatusSignatureRef.current = buildLlmStatusSignature(res.llm_status);
       setState((prev) => ({ ...prev, llm_status: res.llm_status }));
       setLlmPingOk(Boolean(res.result.ok));
       setLlmPingMessage(res.result.message || (res.result.ok ? "LLM 응답 성공" : "LLM 응답 실패"));
@@ -935,7 +1146,7 @@ export default function Home() {
     setAnalysisPending(true);
     try {
       const res = await connectLlm();
-      setState(res.state);
+      commitMeetingState(res.state);
       setLlmPingOk(Boolean(res.enabled));
       setLlmPingMessage(res.enabled ? "LLM 연결 완료" : (res.result?.message || "LLM 연결 실패"));
       if (!res.enabled) setError(res.result?.message || "LLM 연결 실패");
@@ -954,7 +1165,7 @@ export default function Home() {
     setLlmChecking(true);
     try {
       const res = await disconnectLlm();
-      setState(res.state);
+      commitMeetingState(res.state);
       setLlmPingOk(null);
       setLlmPingMessage("LLM 연결 해제됨");
       setError("");
@@ -986,7 +1197,7 @@ export default function Home() {
       appendSttLog(`chunk #${seq} upload started (${Math.round(blob.size / 1024)} KB)`);
       const res = await transcribeChunk({ blob, filename, speaker: sttSpeaker || "시스템오디오", source });
       if (sessionId !== sttSessionRef.current) return;
-      setState(res.state);
+      commitMeetingState(res.state);
       setLastDebug(res.stt_debug);
       if (res.stt_debug.error) appendSttLog(`chunk #${res.stt_debug.chunk_id} error: ${res.stt_debug.error}`);
       if (res.stt_debug.transcript_preview) appendSttLog(`chunk #${res.stt_debug.chunk_id} text: ${res.stt_debug.transcript_preview}`);
@@ -999,7 +1210,7 @@ export default function Home() {
       setSttStatusDetail(`청크 업로드 실패: ${(err as Error).message}`);
       appendSttLog(`chunk #${seq} failed: ${(err as Error).message}`);
     }
-  }, [appendSttLog, sttSpeaker]);
+  }, [appendSttLog, commitMeetingState, sttSpeaker]);
 
   const startStt = async () => {
     if (!navigator.mediaDevices || typeof MediaRecorder === "undefined") {
@@ -1159,6 +1370,15 @@ export default function Home() {
       nextUp: items[idx + 1] ? `${items[idx + 1].label}: ${items[idx + 1].title}` : "마무리",
     }));
   }, [sortedOutcomeRows, state.agenda_stack, state.analysis?.agenda?.active?.confidence, state.analysis?.agenda?.active?.title]);
+
+  useEffect(() => {
+    if ((state.transcript?.length || 0) === 0 && agendas.length === 0) {
+      setCanvasIdeas([]);
+      setCanvasIdeaTitle("");
+      setCanvasIdeaBody("");
+      setCanvasNodePositions({});
+    }
+  }, [state.transcript?.length, agendas.length]);
 
   useEffect(() => {
     if (agendas.length === 0) {
@@ -1522,6 +1742,298 @@ export default function Home() {
     };
   }, [selectedAgenda, transcript, evidenceLog, actionItems, decisions]);
 
+  const transcriptCountByAgenda = useMemo(() => {
+    const counts = new Map<string, number>();
+    transcript.forEach((utterance) => {
+      counts.set(utterance.agendaId, (counts.get(utterance.agendaId) || 0) + 1);
+    });
+    return counts;
+  }, [transcript]);
+
+  const canvasLanes = useMemo<CanvasLane[]>(() => {
+    if (agendas.length === 0) return [];
+
+    const pointsByAgenda = new Map<string, SummaryPointMeta[]>();
+    summaryPointMetaMap.forEach((meta) => {
+      const current = pointsByAgenda.get(meta.agendaId);
+      if (current) current.push(meta);
+      else pointsByAgenda.set(meta.agendaId, [meta]);
+    });
+
+    const outcomeByAgenda = new Map<string, AgendaOutcome>();
+    sortedOutcomeRows.forEach((row, idx) => {
+      const fallbackId = agendas[idx]?.id || `agenda-${idx + 1}`;
+      outcomeByAgenda.set(safeText(row.agenda_id, fallbackId), row);
+    });
+
+    return agendas.map((agenda) => {
+      const row = outcomeByAgenda.get(agenda.id);
+      const startTurnId = Number(row?.start_turn_id || 0);
+      const endTurnId = Number(row?.end_turn_id || 0);
+      const timeCandidates: string[] = [];
+      if (startTurnId > 0 && transcript[startTurnId - 1]) timeCandidates.push(transcript[startTurnId - 1].timestamp);
+      if (endTurnId > 0 && transcript[endTurnId - 1]) timeCandidates.push(transcript[endTurnId - 1].timestamp);
+      const groupedPoints = (pointsByAgenda.get(agenda.id) || [])
+        .slice()
+        .sort((a, b) => {
+          const aTurn = a.turnIds[0] || Number.MAX_SAFE_INTEGER;
+          const bTurn = b.turnIds[0] || Number.MAX_SAFE_INTEGER;
+          return aTurn - bTurn;
+        })
+        .map((meta) => ({
+          pointId: meta.pointId,
+          pointText: stripLeadingTimestamp(meta.pointText),
+          rangeLabel: meta.rangeLabel,
+          utteranceCount: Math.max(meta.turnIds.length, meta.references.length),
+          opinionCount: meta.opinionGroups.length,
+        }));
+      const ideaNodes = canvasIdeas.filter((idea) => idea.agendaId === agenda.id);
+      return {
+        agendaId: agenda.id,
+        agendaLabel: agenda.label,
+        agendaTitle: agenda.title,
+        status: agenda.status,
+        flowType: safeText(row?.flow_type, "discussion"),
+        timeLabel: buildTimeRangeLabel(timeCandidates),
+        keywordLabel: (row?.agenda_keywords || []).slice(0, 3).join(" · "),
+        transcriptCount: Number(transcriptCountByAgenda.get(agenda.id) || 0),
+        summaryNodes: groupedPoints,
+        ideaNodes,
+      };
+    });
+  }, [agendas, summaryPointMetaMap, sortedOutcomeRows, canvasIdeas, transcript, transcriptCountByAgenda]);
+
+  const canvasGraph = useMemo(() => {
+    const nodes: CanvasGraphNode[] = [];
+    const edges: CanvasGraphEdge[] = [];
+    if (canvasLanes.length === 0) {
+      return { nodes, edges, width: 1800, height: 960 };
+    }
+
+    const nodeMap = new Map<string, CanvasGraphNode>();
+    const agendaColumnX = 96;
+    const summaryColumnX = 500;
+    const ideaColumnX = 904;
+    const laneGapY = 144;
+    const summaryGapY = 164;
+    const ideaGapY = 152;
+    const laneMinHeight = 240;
+    let currentLaneY = 96;
+    let maxX = 1500;
+    let maxY = 860;
+
+    canvasLanes.forEach((lane) => {
+      const agendaNodeId = `canvas-agenda-${lane.agendaId}`;
+      const summaryCount = Math.max(1, lane.summaryNodes.length);
+      const summarySlots = lane.summaryNodes.map((node, summaryIdx) => ({
+        pointId: node.pointId,
+        title: node.pointText,
+        rangeLabel: node.rangeLabel,
+        utteranceCount: node.utteranceCount,
+        opinionCount: node.opinionCount,
+        x: summaryColumnX,
+        y: currentLaneY + summaryIdx * summaryGapY,
+      }));
+      const summaryYByPointId = new Map(summarySlots.map((slot) => [slot.pointId, slot.y]));
+      const linkedIdeaCounts = new Map<string, number>();
+      let unlinkedIdeaCount = 0;
+      const ideaSlots = lane.ideaNodes.map((idea) => {
+        const linkedPointId = safeText(idea.linkedPointId);
+        if (linkedPointId && summaryYByPointId.has(linkedPointId)) {
+          const offset = linkedIdeaCounts.get(linkedPointId) || 0;
+          linkedIdeaCounts.set(linkedPointId, offset + 1);
+          return {
+            idea,
+            x: ideaColumnX,
+            y: Number(summaryYByPointId.get(linkedPointId)) + offset * ideaGapY,
+          };
+        }
+
+        const slot = {
+          idea,
+          x: ideaColumnX,
+          y: currentLaneY + summaryCount * summaryGapY + unlinkedIdeaCount * ideaGapY,
+        };
+        unlinkedIdeaCount += 1;
+        return slot;
+      });
+
+      const laneBottom = Math.max(
+        currentLaneY + laneMinHeight,
+        ...summarySlots.map((slot) => slot.y + 132),
+        ...ideaSlots.map((slot) => slot.y + 148),
+      );
+      const laneHeight = laneBottom - currentLaneY;
+
+      const agendaNode: CanvasGraphNode = {
+        id: agendaNodeId,
+        agendaId: lane.agendaId,
+        kind: "agenda",
+        title: lane.agendaTitle,
+        body: lane.keywordLabel,
+        subtitle: `${lane.agendaLabel} · ${agendaStatusLabel[lane.status]}`,
+        meta: [lane.timeLabel, `${lane.transcriptCount}개 발화`, lane.flowType],
+        width: 300,
+        height: 156,
+        x: agendaColumnX,
+        y: currentLaneY + Math.max(0, (laneHeight - 156) / 2),
+      };
+      nodeMap.set(agendaNodeId, agendaNode);
+
+      summarySlots.forEach((slot) => {
+        const summaryNodeId = `canvas-summary-${lane.agendaId}-${slot.pointId}`;
+        const summaryNode: CanvasGraphNode = {
+          id: summaryNodeId,
+          agendaId: lane.agendaId,
+          kind: "summary",
+          title: slot.title,
+          body: "",
+          subtitle: "Summary Node",
+          meta: [slot.rangeLabel, `원문 ${slot.utteranceCount}`, `의견 ${slot.opinionCount}`],
+          pointId: slot.pointId,
+          width: 240,
+          height: 132,
+          x: slot.x,
+          y: slot.y,
+        };
+        nodeMap.set(summaryNodeId, summaryNode);
+        edges.push({
+          id: `edge-${agendaNodeId}-${summaryNodeId}`,
+          fromId: agendaNodeId,
+          toId: summaryNodeId,
+          kind: "agenda-summary",
+        });
+      });
+
+      ideaSlots.forEach(({ idea, x, y }) => {
+        const ideaNodeId = idea.id;
+        const ideaNode: CanvasGraphNode = {
+          id: ideaNodeId,
+          agendaId: lane.agendaId,
+          kind: "idea",
+          title: idea.title,
+          body: idea.body,
+          subtitle: `Idea Note · ${idea.createdAt}`,
+          meta: [idea.linkedPointId ? "요약 노드 연결" : "안건 메모"],
+          linkedPointText: idea.linkedPointText,
+          pointId: idea.linkedPointId,
+          width: 248,
+          height: 148,
+          x,
+          y,
+        };
+        nodeMap.set(ideaNodeId, ideaNode);
+
+        const linkedSummaryId = idea.linkedPointId ? `canvas-summary-${lane.agendaId}-${idea.linkedPointId}` : "";
+        edges.push({
+          id: `edge-${linkedSummaryId || agendaNodeId}-${ideaNodeId}`,
+          fromId: linkedSummaryId || agendaNodeId,
+          toId: ideaNodeId,
+          kind: linkedSummaryId ? "summary-idea" : "agenda-idea",
+        });
+      });
+
+      currentLaneY = laneBottom + laneGapY;
+      maxX = Math.max(maxX, ideaColumnX + 248 + 180);
+      maxY = Math.max(maxY, laneBottom + laneGapY);
+    });
+
+    nodeMap.forEach((node, id) => {
+      const override = canvasNodePositions[id];
+      const nextNode = override ? { ...node, x: override.x, y: override.y } : node;
+      nodes.push(nextNode);
+      maxX = Math.max(maxX, nextNode.x + nextNode.width + 160);
+      maxY = Math.max(maxY, nextNode.y + nextNode.height + 180);
+    });
+
+    return {
+      nodes,
+      edges,
+      width: Math.max(1800, maxX),
+      height: Math.max(960, maxY),
+    };
+  }, [canvasLanes, canvasNodePositions]);
+
+  useEffect(() => {
+    setFlowNodes((prev) => {
+      const prevMap = new Map(prev.map((node) => [node.id, node]));
+      return canvasGraph.nodes.map((node) => {
+        const prevNode = prevMap.get(node.id);
+        const linkedMeta = node.linkedPointText ? [...node.meta, stripLeadingTimestamp(node.linkedPointText)] : node.meta;
+        return {
+          id: node.id,
+          position: prevNode?.position || { x: node.x, y: node.y },
+          sourcePosition: Position.Right,
+          targetPosition: Position.Left,
+          className: `rfNode rfNode${node.kind === "agenda" ? "Agenda" : node.kind === "summary" ? "Summary" : "Idea"} ${selectedAgenda?.id === node.agendaId ? "rfNodeEmphasized" : ""}`,
+          data: {
+            label: renderCanvasFlowLabel({
+              kind: node.kind,
+              subtitle: node.subtitle,
+              title: node.title,
+              body: node.body,
+              meta: linkedMeta,
+            }),
+            nodeId: node.id,
+            agendaId: node.agendaId,
+            kind: node.kind,
+            title: node.title,
+            body: node.body,
+            subtitle: node.subtitle,
+            meta: linkedMeta,
+            pointId: node.pointId,
+            linkedPointText: node.linkedPointText,
+          },
+          draggable: true,
+          selectable: true,
+          selected: prevNode?.selected || false,
+        };
+      });
+    });
+    setFlowEdges((prev) => {
+      const customEdges = prev.filter((edge) => !String(edge.id).startsWith("base-"));
+      const baseEdges = canvasGraph.edges.map((edge) => ({
+        id: `base-${edge.id}`,
+        source: edge.fromId,
+        target: edge.toId,
+        type: "step",
+        deletable: false,
+        selectable: true,
+        reconnectable: true,
+      }));
+      return [...baseEdges, ...customEdges];
+    });
+  }, [canvasGraph, selectedAgenda?.id]);
+
+  const onFlowNodesChange = useCallback((changes: NodeChange<Node<CanvasFlowNodeData>>[]) => {
+    setFlowNodes((nodes) => applyNodeChanges(changes, nodes));
+  }, []);
+
+  const onFlowEdgesChange = useCallback((changes: EdgeChange<Edge>[]) => {
+    setFlowEdges((edges) => applyEdgeChanges(changes, edges));
+  }, []);
+
+  const onFlowConnect = useCallback((connection: Connection) => {
+    setFlowEdges((edges) =>
+      addEdge(
+        {
+          ...connection,
+          id: `user-edge-${Date.now()}`,
+          type: "step",
+          reconnectable: true,
+        },
+        edges,
+      ),
+    );
+  }, []);
+
+  const onFlowNodeDragStop = useCallback((_: unknown, node: Node<CanvasFlowNodeData>) => {
+    setCanvasNodePositions((prev) => ({
+      ...prev,
+      [node.id]: { x: node.position.x, y: node.position.y },
+    }));
+  }, []);
+
   const filteredTranscript = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     const baseTranscript = selectedSummaryFocus ? selectedSummaryFocus.utterances : transcript;
@@ -1622,15 +2134,28 @@ export default function Home() {
     return rows;
   }, [bottomEvidence, agendas]);
 
-  const onSelectAgenda = (agendaId: string) => {
+  const llmEnabled = Boolean(state.llm_enabled);
+  const analysisUiDisabled = analysisPending;
+
+  const moveToWorkspaceFromCanvas = useCallback((reason: string) => {
+    setCanvasReturnContext(reason);
+    setActiveSection("workspace");
+  }, []);
+
+  const returnToCanvas = useCallback(() => {
+    setActiveSection("canvas");
+  }, []);
+
+  const onSelectAgenda = useCallback((agendaId: string) => {
     if (analysisUiDisabled) return;
     setSelectedAgendaId(agendaId);
     setSummaryScope("current");
     setSelectedSummaryFocus(null);
-  };
+  }, [analysisUiDisabled]);
 
   const jumpToTranscript = (agendaId: string, timestamp: string) => {
     if (analysisUiDisabled) return;
+    moveToWorkspaceFromCanvas("전사 원문 확인 중");
     setSelectedSummaryFocus(null);
     setSelectedAgendaId(agendaId);
     setQuery(timestamp);
@@ -1663,8 +2188,9 @@ export default function Home() {
     return ordered;
   }, [transcript]);
 
-  const jumpBySummary = (agendaId: string, summaryText: string, pointId: string) => {
+  const jumpBySummary = useCallback((agendaId: string, summaryText: string, pointId: string) => {
     if (analysisUiDisabled) return;
+    moveToWorkspaceFromCanvas("요약 근거 확인 중");
     setSelectedAgendaId(agendaId);
     setSummaryScope("current");
     setQuery("");
@@ -1684,11 +2210,12 @@ export default function Home() {
     setSelectedSummaryFocus(null);
     const ts = extractTimestampToken(summaryText);
     if (ts) setQuery(ts);
-  };
+  }, [analysisUiDisabled, moveToWorkspaceFromCanvas, resolveSummaryFocusUtterances, summaryPointMetaMap]);
 
   const focusByOpinionGroup = (agendaId: string, pointId: string, groupId: string) => {
     if (analysisUiDisabled) return;
     setSelectedAgendaId(agendaId);
+    setActiveSection("workspace");
     setSummaryScope("current");
     setQuery("");
     setSpeakerFilter("전체");
@@ -1712,11 +2239,86 @@ export default function Home() {
     });
   };
 
+  const addCanvasIdea = () => {
+    if (analysisUiDisabled) return;
+    const agendaId = selectedAgenda?.id || agendas[0]?.id || "";
+    if (!agendaId) return;
+
+    const body = safeText(canvasIdeaBody);
+    const title = safeText(canvasIdeaTitle, body.slice(0, 42));
+    if (!title && !body) return;
+
+    const toneCycle: CanvasIdea["colorTone"][] = ["blue", "mint", "amber", "rose"];
+    const tone = toneCycle[canvasIdeas.length % toneCycle.length];
+    const linkedPointId = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointId : undefined;
+    const linkedPointText = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointText : undefined;
+    const agendaIndex = Math.max(0, agendas.findIndex((agenda) => agenda.id === agendaId));
+    const agendaIdeaCount = canvasIdeas.filter((idea) => idea.agendaId === agendaId).length;
+    const nextId = `canvas-idea-${Date.now()}`;
+    const baseX = 240 + agendaIndex * 430 + (linkedPointId ? 250 : 120) + (agendaIdeaCount % 2) * 24;
+    const baseY = 260 + agendaIdeaCount * 152;
+    setCanvasIdeas((prev) => [
+      {
+        id: nextId,
+        agendaId,
+        title,
+        body,
+        createdAt: formatNowTime(),
+        linkedPointId,
+        linkedPointText,
+        colorTone: tone,
+      },
+      ...prev,
+    ]);
+    setCanvasNodePositions((prev) => ({
+      ...prev,
+      [nextId]: { x: baseX, y: baseY },
+    }));
+    setCanvasIdeaTitle("");
+    setCanvasIdeaBody("");
+    setCanvasComposerOpen(false);
+  };
+
+  const openCanvasIdeaSource = useCallback((idea: CanvasIdea) => {
+    if (analysisUiDisabled) return;
+    setSelectedAgendaId(idea.agendaId);
+    setSummaryScope("current");
+    if (idea.linkedPointId) {
+      jumpBySummary(idea.agendaId, idea.linkedPointText || idea.title, idea.linkedPointId);
+      return;
+    }
+    moveToWorkspaceFromCanvas("아이디어 원문 확인 중");
+    setSelectedSummaryFocus(null);
+    setQuery("");
+    setSpeakerFilter("전체");
+  }, [analysisUiDisabled, jumpBySummary, moveToWorkspaceFromCanvas]);
+
+  const openCanvasNode = useCallback((node: Node<CanvasFlowNodeData>) => {
+    if (analysisUiDisabled) return;
+    if (node.data.kind === "agenda") {
+      onSelectAgenda(node.data.agendaId);
+      return;
+    }
+    if (node.data.kind === "summary" && node.data.pointId) {
+      jumpBySummary(node.data.agendaId, node.data.title, node.data.pointId);
+      return;
+    }
+    if (node.data.kind === "idea") {
+      const sourceIdea = canvasIdeas.find((idea) => idea.id === node.id);
+      if (sourceIdea) openCanvasIdeaSource(sourceIdea);
+    }
+  }, [analysisUiDisabled, canvasIdeas, jumpBySummary, onSelectAgenda, openCanvasIdeaSource]);
+
+  const onFlowNodeClick = useCallback((_: unknown, node: Node<CanvasFlowNodeData>) => {
+    openCanvasNode(node);
+  }, [openCanvasNode]);
+
   const focusTargetCard = (agendaId: string, targetId: string) => {
     if (analysisUiDisabled) return;
     const cleanTarget = safeText(targetId);
     if (!cleanTarget) return;
 
+    moveToWorkspaceFromCanvas("근거 카드 확인 중");
     setSelectedAgendaId(agendaId);
     setSummaryScope("current");
 
@@ -1742,8 +2344,6 @@ export default function Home() {
     }
   };
 
-  const llmEnabled = Boolean(state.llm_enabled);
-  const analysisUiDisabled = analysisPending;
   const replayQueuedTotal = Number(state.replay?.queued_total || 0);
   const replayQueuedCursor = Number(state.replay?.queued_cursor || 0);
   const replayQueuedRemaining = Number(state.replay?.queued_remaining || 0);
@@ -1755,6 +2355,55 @@ export default function Home() {
   const llmReqCount = llmIoLogs.filter((x) => safeText(x?.direction).toLowerCase() === "request").length;
   const llmResCount = llmIoLogs.filter((x) => safeText(x?.direction).toLowerCase() === "response").length;
   const llmErrCount = llmIoLogs.filter((x) => safeText(x?.direction).toLowerCase() === "error").length;
+
+  useEffect(() => {
+    if (!isCanvasMode) {
+      setCanvasComposerOpen(false);
+    }
+  }, [isCanvasMode]);
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = resizeRef.current;
+      if (!drag) return;
+      const deltaX = event.clientX - drag.startX;
+      if (drag.target === "sidebar") {
+        setSidebarWidth(Math.max(220, Math.min(420, drag.startWidth + deltaX)));
+        return;
+      }
+      if (drag.target === "canvas-left") {
+        setCanvasLeftRailWidth(Math.max(280, Math.min(520, drag.startWidth + deltaX)));
+        return;
+      }
+      setCanvasRightRailWidth(Math.max(300, Math.min(560, drag.startWidth - deltaX)));
+    };
+
+    const stopResize = () => {
+      resizeRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", stopResize);
+    window.addEventListener("pointercancel", stopResize);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", stopResize);
+      window.removeEventListener("pointercancel", stopResize);
+    };
+  }, []);
+
+  const startResize = useCallback((target: ResizeTarget, startWidth: number, event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    resizeRef.current = {
+      target,
+      startX: event.clientX,
+      startWidth,
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, []);
 
   useEffect(() => {
     const current = {
@@ -2107,9 +2756,15 @@ export default function Home() {
     </details>
   );
 
+  const layoutStyle = {
+    ["--workspace-sidebar-width" as string]: `${sidebarOpen ? sidebarWidth : 0}px`,
+    ["--canvas-left-drawer-width" as string]: `${canvasLeftRailWidth}px`,
+    ["--canvas-right-drawer-width" as string]: `${canvasRightRailWidth}px`,
+  } as CSSProperties;
+
   return (
-    <div className="workspaceShell">
-      <aside className="sidebar">
+    <div className={`workspaceShell ${isCanvasMode ? "workspaceShellCanvasMode" : ""}`} style={layoutStyle}>
+      <aside className={`sidebar ${sidebarOpen ? "sidebarOpen" : "sidebarClosed"}`} style={{ width: `${sidebarWidth}px` }}>
         <div className="sidebarInner">
           <div>
             <p className="brand">파르체</p>
@@ -2117,67 +2772,127 @@ export default function Home() {
           </div>
           <nav className="sidebarNav">
             <button className="navItem" type="button">대시보드</button>
-            <button className="navItem navItemActive" type="button">회의 워크스페이스</button>
+            <button
+              className={`navItem ${activeSection === "workspace" ? "navItemActive" : ""}`}
+              type="button"
+              onClick={() => {
+                setCanvasReturnContext("");
+                setActiveSection("workspace");
+              }}
+            >
+              회의 워크스페이스
+            </button>
+            <button
+              className={`navItem ${activeSection === "canvas" ? "navItemActive" : ""}`}
+              type="button"
+              onClick={() => setActiveSection("canvas")}
+            >
+              공용 캔버스
+            </button>
             <button className="navItem" type="button">리포트</button>
             <button className="navItem" type="button">팀 노트</button>
           </nav>
 
         </div>
+        <div
+          className="sidebarResizeHandle"
+          onPointerDown={(event) => startResize("sidebar", sidebarWidth, event)}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="왼쪽 패널 크기 조절"
+        />
       </aside>
+      <button
+        type="button"
+        className={`edgeNudge edgeNudgeSidebar ${sidebarOpen ? "edgeNudgeOpen" : "edgeNudgeClosed"}`}
+        onClick={() => setSidebarOpen((open) => !open)}
+        aria-label={sidebarOpen ? "왼쪽 메뉴 접기" : "왼쪽 메뉴 펼치기"}
+        style={{ left: sidebarOpen ? `${Math.max(10, sidebarWidth - 14)}px` : "8px" }}
+      >
+        {sidebarOpen ? "‹" : "›"}
+      </button>
 
-      <main className="mainArea">
-        <div className="mainInner">
-          <section className={`leftSection ${lineUploadMode ? "leftSectionLineMode" : ""}`}>
-          <header className="pageHeader awsHeader glassStickyHeader">
-            <div className="headerMain">
-              <div>
-                <h1>{meeting.title}</h1>
-                <div className="metaRow">
-                  <span>{meeting.date}</span>
-                  <span>{meeting.duration}</span>
-                  <span>{meeting.participants}</span>
-                </div>
-              </div>
-              <div className="headerActions" aria-label="회의 메트릭">
-                <div className="sidebarMetricList">
-                  <div className="sidebarMetricRow">
-                    <span>커버리지</span>
-                    <strong>{agendaOverview.done}/{agendas.length}</strong>
-                  </div>
-                  <div className="sidebarMetricRow">
-                    <span>대상</span>
-                    <strong>{selectedContext.transcriptCount}</strong>
-                  </div>
-                  <div className="sidebarMetricRow">
-                    <span>액션</span>
-                    <strong>{selectedContext.openActionCount}</strong>
-                  </div>
-                  <div className="sidebarMetricRow">
-                    <span>자신감</span>
-                    <strong>{agendaOverview.averageConfidence}%</strong>
+      <main className={`mainArea ${isCanvasMode ? "mainAreaCanvasMode" : ""}`}>
+        <div className={`mainInner ${isCanvasMode ? "mainInnerCanvasMode" : ""}`}>
+          <section className={`leftSection ${lineUploadMode ? "leftSectionLineMode" : ""} ${isCanvasMode ? "leftSectionCanvasMode" : ""}`}>
+          {!isCanvasMode ? (
+          <>
+            <header className="pageHeader awsHeader glassStickyHeader">
+              <div className="headerMain">
+                <div>
+                  <h1>{meeting.title}</h1>
+                  <div className="metaRow">
+                    <span>{meeting.date}</span>
+                    <span>{meeting.duration}</span>
+                    <span>{meeting.participants}</span>
                   </div>
                 </div>
+                <div className="headerActions" aria-label="회의 메트릭">
+                  <div className="sidebarMetricList">
+                    <div className="sidebarMetricRow">
+                      <span>커버리지</span>
+                      <strong>{agendaOverview.done}/{agendas.length}</strong>
+                    </div>
+                    <div className="sidebarMetricRow">
+                      <span>대상</span>
+                      <strong>{selectedContext.transcriptCount}</strong>
+                    </div>
+                    <div className="sidebarMetricRow">
+                      <span>액션</span>
+                      <strong>{selectedContext.openActionCount}</strong>
+                    </div>
+                    <div className="sidebarMetricRow">
+                      <span>자신감</span>
+                      <strong>{agendaOverview.averageConfidence}%</strong>
+                    </div>
+                  </div>
+                </div>
               </div>
-            </div>
-            <div className="contextBar">
-              <span className="chip chipInteractive">{selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}</span>
-              <span>{selectedAgenda ? `${selectedAgenda.progress}% 완료` : "0% 완료"} . {meeting.elapsed}</span>
-              <span className="mutedLabel">마지막 업데이트 {meeting.lastUpdated}</span>
-              <span className="chip chipSoft">LLM: {llmEnabled ? "ON" : "OFF"}</span>
-            </div>
-          </header>
+              <div className="contextBar">
+                <span className="chip chipInteractive">{selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}</span>
+                <span>{selectedAgenda ? `${selectedAgenda.progress}% 완료` : "0% 완료"} . {meeting.elapsed}</span>
+                <span className="mutedLabel">마지막 업데이트 {meeting.lastUpdated}</span>
+                <span className="chip chipSoft">LLM: {llmEnabled ? "ON" : "OFF"}</span>
+                {canvasReturnContext ? (
+                  <button type="button" className="chip chipInteractive" onClick={returnToCanvas}>
+                    캔버스로 돌아가기 · {canvasReturnContext}
+                  </button>
+                ) : null}
+              </div>
+            </header>
 
-          <nav className="awsTabs awsTabsSeparate" aria-label="회의 워크스페이스 탭">
-            <button className="awsTab awsTabActive" type="button">개요</button>
-            <button className="awsTab" type="button">전사문 검토</button>
-            <button className="awsTab" type="button">안건 인사이트</button>
-            <button className="awsTab" type="button">결과</button>
-          </nav>
+            <nav className="awsTabs awsTabsSeparate" aria-label="회의 워크스페이스 탭">
+              <button className="awsTab awsTabActive" type="button">개요</button>
+              <button className="awsTab" type="button">전사문 검토</button>
+              <button className="awsTab" type="button">안건 인사이트</button>
+              <button className="awsTab" type="button">결과</button>
+            </nav>
+          </>
+          ) : (
+            <header className="canvasPageHeader">
+              <div className="canvasPageHeaderLeft">
+                <span className="canvasPageBadge">Canvas</span>
+                <h1>공용 캔버스</h1>
+              </div>
+              <div className="canvasCanvasToolbar">
+                <span className="canvasToolbarMeta">{meeting.title}</span>
+                <button
+                  type="button"
+                  className={`canvasToolbarButton ${canvasComposerOpen ? "canvasToolbarButtonActive" : ""}`}
+                  onClick={() => setCanvasComposerOpen((open) => !open)}
+                >
+                  노트 추가
+                </button>
+              </div>
+            </header>
+          )}
 
-          <article className="card panelCard">
+          <article className={`card panelCard controlPanelCard ${isCanvasMode ? `canvasDrawer canvasDrawerLeft ${canvasLeftRailOpen ? "canvasDrawerOpen" : "canvasDrawerClosed"}` : ""}`}>
             <div className="panelHeader tight">
               <h3>실행 제어</h3>
-              <span className="chip chipSoft">LLM {state.llm_status?.connected ? "연결됨" : "미연결"}</span>
+              <div className="panelHeaderActionsTight">
+                <span className="chip chipSoft">LLM {state.llm_status?.connected ? "연결됨" : "미연결"}</span>
+              </div>
             </div>
             <div className="transcriptControls">
               <input
@@ -2373,97 +3088,247 @@ export default function Home() {
                 </details>
               </div>
             </details>
+            {isCanvasMode && canvasLeftRailOpen ? (
+              <div
+                className="canvasDrawerResizeHandle canvasDrawerResizeHandleLeft"
+                onPointerDown={(event) => startResize("canvas-left", canvasLeftRailWidth, event)}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="왼쪽 패널 크기 조절"
+              />
+            ) : null}
           </article>
           
-          <article className="card panelCard transcriptCard transcriptCardLeft">
-            <div className="panelHeader">
-              <h2>전사문 (전체)</h2>
-              <span className="chip chipSoft">{filteredTranscript.length}개 표시</span>
-            </div>
-            {selectedSummaryFocus ? (
-              <div className="summaryFocusBar">
-                <span className="chip chipInteractive">요약 포커스</span>
-                <p>{stripLeadingTimestamp(selectedSummaryFocus.pointText)}</p>
-                <span className="mutedLabel">
-                  범위 {selectedSummaryFocus.rangeLabel} . 원문 {selectedSummaryFocus.utterances.length}문장
-                </span>
-                <button
-                  className="ghostButton"
-                  type="button"
-                  onClick={() => setSelectedSummaryFocus(null)}
-                  disabled={analysisUiDisabled}
-                >
-                  포커스 해제
-                </button>
-              </div>
-            ) : null}
-            <div className="transcriptControls transcriptControlsCompact">
-              <input
-                aria-label="전사문 검색"
-                placeholder="전사문 검색"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-              />
-              <select aria-label="화자 필터" value={speakerFilter} onChange={(event) => setSpeakerFilter(event.target.value)}>
-                {speakerOptions.map((speaker) => (
-                  <option key={speaker} value={speaker}>{speaker}</option>
-                ))}
-              </select>
-              <label className="toggleLabel">
-                <input checked={highlightRelated} type="checkbox" onChange={(event) => setHighlightRelated(event.target.checked)} />
-                관련 발화 강조
-              </label>
-            </div>
-            <div className="transcriptMetaBar">
-              <span className="chip chipSoft">문맥 발화: {selectedContext.transcriptCount}</span>
-              <span className="chip chipSoft">연결된 의사결정: {selectedContext.decisionCount}</span>
-              <span className="chip chipSoft">연결된 액션: {selectedContext.actionCount}</span>
-            </div>
-            <div ref={transcriptListRef} className="transcriptList" onScroll={onTranscriptScroll}>
-              {filteredTranscript.length === 0 ? (
-                <p className="emptyState">
-                  {selectedSummaryFocus
-                    ? "선택한 요약/의견의 원문 발화를 찾지 못했습니다. 포커스를 해제하거나 다른 항목을 선택해 주세요."
-                    : "현재 필터와 일치하는 발화가 없습니다. 검색어나 화자 필터를 조정해 주세요."}
+          <article className={`card panelCard transcriptCard transcriptCardLeft ${isCanvasMode ? "canvasSurfaceCard" : ""}`}>
+            {!isCanvasMode ? (
+            <div className={`panelHeader ${isCanvasMode ? "panelHeaderCanvas" : ""}`}>
+              <div className="panelHeaderMeta">
+                <h2>{isCanvasMode ? "공용 캔버스" : "전사문 (전체)"}</h2>
+                <p className="mutedLabel">
+                  {isCanvasMode
+                    ? "React Flow 기반의 노드 캔버스에서 안건, 요약, 메모를 연결해 구조적으로 정리합니다."
+                    : "실시간 STT 전사를 필터링하고, 요약 근거와 연결된 원문을 추적합니다."}
                 </p>
-              ) : (
-                filteredTranscript.map((utterance) => {
-                  const isRelated = selectedAgenda ? utterance.agendaId === selectedAgenda.id : false;
-                  const shouldDim = highlightRelated && !isRelated;
-                  const shouldHighlight = highlightRelated && isRelated;
-                  return (
-                    <article
-                      key={utterance.id}
-                      className={`utterance ${shouldHighlight ? "utteranceHighlight" : ""} ${shouldDim ? "utteranceDim" : ""}`}
-                    >
-                      <div className="utteranceMeta">
-                        <span className="timestamp">{utterance.timestamp}</span>
-                        <span className="chip chipSpeaker">{utterance.speaker}</span>
-                      </div>
-                      <p>{utterance.text}</p>
-                      <div className="utteranceActions">
-                        <button type="button">+ 액션</button>
-                        <button type="button">+ 의사결정</button>
-                        <button type="button">+ 근거</button>
-                      </div>
-                    </article>
-                  );
-                })
-              )}
+              </div>
+              <div className="panelHeaderActions panelHeaderActionsTight">
+                <span className="chip chipSoft">
+                  {isCanvasMode ? `안건 ${canvasLanes.length}개 . 아이디어 ${canvasIdeas.length}개` : `${filteredTranscript.length}개 표시`}
+                </span>
+              </div>
             </div>
-            {!selectedSummaryFocus && pendingTranscriptCount > 0 ? (
-              <button
-                type="button"
-                className="transcriptJumpButton"
-                onClick={() => scrollTranscriptToBottom("smooth")}
-              >
-                새 전사 {pendingTranscriptCount}개 . 아래로
-              </button>
             ) : null}
+            {!isCanvasMode ? (
+              <>
+                {selectedSummaryFocus ? (
+                  <div className="summaryFocusBar">
+                    <span className="chip chipInteractive">요약 포커스</span>
+                    <p>{stripLeadingTimestamp(selectedSummaryFocus.pointText)}</p>
+                    <span className="mutedLabel">
+                      범위 {selectedSummaryFocus.rangeLabel} . 원문 {selectedSummaryFocus.utterances.length}문장
+                    </span>
+                    <button
+                      className="ghostButton"
+                      type="button"
+                      onClick={() => setSelectedSummaryFocus(null)}
+                      disabled={analysisUiDisabled}
+                    >
+                      포커스 해제
+                    </button>
+                  </div>
+                ) : null}
+                <div className="transcriptControls transcriptControlsCompact">
+                  <input
+                    aria-label="전사문 검색"
+                    placeholder="전사문 검색"
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                  />
+                  <select aria-label="화자 필터" value={speakerFilter} onChange={(event) => setSpeakerFilter(event.target.value)}>
+                    {speakerOptions.map((speaker) => (
+                      <option key={speaker} value={speaker}>{speaker}</option>
+                    ))}
+                  </select>
+                  <label className="toggleLabel">
+                    <input checked={highlightRelated} type="checkbox" onChange={(event) => setHighlightRelated(event.target.checked)} />
+                    관련 발화 강조
+                  </label>
+                </div>
+                <div className="transcriptMetaBar">
+                  <span className="chip chipSoft">문맥 발화: {selectedContext.transcriptCount}</span>
+                  <span className="chip chipSoft">연결된 의사결정: {selectedContext.decisionCount}</span>
+                  <span className="chip chipSoft">연결된 액션: {selectedContext.actionCount}</span>
+                </div>
+                <div ref={transcriptListRef} className="transcriptList" onScroll={onTranscriptScroll}>
+                  {filteredTranscript.length === 0 ? (
+                    <p className="emptyState">
+                      {selectedSummaryFocus
+                        ? "선택한 요약/의견의 원문 발화를 찾지 못했습니다. 포커스를 해제하거나 다른 항목을 선택해 주세요."
+                        : "현재 필터와 일치하는 발화가 없습니다. 검색어나 화자 필터를 조정해 주세요."}
+                    </p>
+                  ) : (
+                    filteredTranscript.map((utterance) => {
+                      const isRelated = selectedAgenda ? utterance.agendaId === selectedAgenda.id : false;
+                      const shouldDim = highlightRelated && !isRelated;
+                      const shouldHighlight = highlightRelated && isRelated;
+                      return (
+                        <article
+                          key={utterance.id}
+                          className={`utterance ${shouldHighlight ? "utteranceHighlight" : ""} ${shouldDim ? "utteranceDim" : ""}`}
+                        >
+                          <div className="utteranceMeta">
+                            <span className="timestamp">{utterance.timestamp}</span>
+                            <span className="chip chipSpeaker">{utterance.speaker}</span>
+                          </div>
+                          <p>{utterance.text}</p>
+                          <div className="utteranceActions">
+                            <button type="button">+ 액션</button>
+                            <button type="button">+ 의사결정</button>
+                            <button type="button">+ 근거</button>
+                          </div>
+                        </article>
+                      );
+                    })
+                  )}
+                </div>
+                {!selectedSummaryFocus && pendingTranscriptCount > 0 ? (
+                  <button
+                    type="button"
+                    className="transcriptJumpButton"
+                    onClick={() => scrollTranscriptToBottom("smooth")}
+                  >
+                    새 전사 {pendingTranscriptCount}개 . 아래로
+                  </button>
+                ) : null}
+              </>
+            ) : (
+              <div className="canvasWorkspace canvasWorkspaceImmersive">
+                <div className="canvasBoard canvasBoardImmersive">
+                  {flowNodes.length === 0 ? (
+                    <p className="emptyState">안건이 아직 없어 공용 캔버스를 구성할 수 없습니다.</p>
+                  ) : (
+                    <div className="reactFlowCanvas">
+                      <ReactFlow
+                        className="reactFlowStage"
+                        nodes={flowNodes}
+                        edges={flowEdges}
+                        onNodesChange={onFlowNodesChange}
+                        onEdgesChange={onFlowEdgesChange}
+                        onConnect={onFlowConnect}
+                        onNodeClick={onFlowNodeClick}
+                        onNodeDragStop={onFlowNodeDragStop}
+                        defaultEdgeOptions={{ reconnectable: true, type: "step" }}
+                        fitView
+                        fitViewOptions={{ padding: 0.18, duration: 480 }}
+                        minZoom={0.35}
+                        maxZoom={1.8}
+                        zoomOnDoubleClick={false}
+                        nodesConnectable
+                        elementsSelectable
+                        selectNodesOnDrag={false}
+                        selectionOnDrag
+                        panOnDrag={[1, 2]}
+                        panOnScroll
+                        zoomOnPinch
+                        zoomOnScroll
+                        snapToGrid
+                        snapGrid={[16, 16]}
+                        deleteKeyCode={["Backspace", "Delete"]}
+                        elevateEdgesOnSelect
+                        proOptions={{ hideAttribution: true }}
+                      >
+                        <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#e5e7eb" />
+                        <MiniMap
+                          zoomable
+                          pannable
+                          nodeColor={(node) => {
+                            if (node.type === "agenda") return "#1f2937";
+                            if (node.type === "summary") return "#64748b";
+                            return "#d97706";
+                          }}
+                        />
+                        <Controls />
+                        <Panel position="top-left" className="rfExamplePanel">
+                          <div className="rfExamplePanelCard">
+                            <strong>Shared Canvas</strong>
+                            <p>{selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}</p>
+                            <span>안건 {canvasLanes.length} · 메모 {canvasIdeas.length}</span>
+                          </div>
+                        </Panel>
+
+                        {canvasComposerOpen ? (
+                          <Panel position="top-right" className="rfPanelShell rfComposerPanel">
+                            <section className="canvasQuickComposer">
+                              <div className="canvasComposerHeader">
+                                <div>
+                                  <p className="canvasEyebrow">Note</p>
+                                  <h3>캔버스 메모 추가</h3>
+                                  <p className="mutedLabel">
+                                    {selectedAgenda ? `${agendaLabel(selectedAgenda)}에 바로 배치됩니다.` : "먼저 안건을 선택한 뒤 메모를 추가하세요."}
+                                    {selectedSummaryFocus ? ` 현재 요약 "${stripLeadingTimestamp(selectedSummaryFocus.pointText)}"와 연결됩니다.` : ""}
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="canvasComposerGrid">
+                                <input
+                                  aria-label="아이디어 제목"
+                                  placeholder="짧은 제목"
+                                  value={canvasIdeaTitle}
+                                  onChange={(event) => setCanvasIdeaTitle(event.target.value)}
+                                />
+                                <textarea
+                                  aria-label="아이디어 메모"
+                                  placeholder="노트 내용, 질문, 다음 실험 아이디어를 입력"
+                                  value={canvasIdeaBody}
+                                  onChange={(event) => setCanvasIdeaBody(event.target.value)}
+                                />
+                              </div>
+                              <div className="panelActions">
+                                <button
+                                  type="button"
+                                  onClick={addCanvasIdea}
+                                  disabled={analysisUiDisabled || (!safeText(canvasIdeaTitle) && !safeText(canvasIdeaBody))}
+                                >
+                                  보드에 놓기
+                                </button>
+                                <button
+                                  type="button"
+                                  className="ghostButton"
+                                  onClick={() => {
+                                    setCanvasIdeaTitle("");
+                                    setCanvasIdeaBody("");
+                                  }}
+                                  disabled={analysisUiDisabled}
+                                >
+                                  입력 지우기
+                                </button>
+                              </div>
+                            </section>
+                          </Panel>
+                        ) : null}
+                      </ReactFlow>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </article>
           </section>
 
-          <section className="rightSection">
+          <section className={`rightSection ${isCanvasMode ? `canvasDrawer canvasDrawerRight ${canvasRightRailOpen ? "canvasDrawerOpen" : "canvasDrawerClosed"}` : ""}`}>
+          {isCanvasMode ? (
+            <div className="canvasDrawerHeader">
+              <strong>인사이트</strong>
+            </div>
+          ) : null}
+          {isCanvasMode && canvasRightRailOpen ? (
+            <div
+              className="canvasDrawerResizeHandle canvasDrawerResizeHandleRight"
+              onPointerDown={(event) => startResize("canvas-right", canvasRightRailWidth, event)}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="오른쪽 패널 크기 조절"
+            />
+          ) : null}
           <section className="contentSignalGrid">
             <details className="card panelCard sidebarSection panelFold" open={false}>
               <summary className="panelHeader tight panelFoldHeader">
@@ -2740,6 +3605,28 @@ export default function Home() {
           </section>
         </div>
       </main>
+      {isCanvasMode ? (
+        <>
+          <button
+            type="button"
+            className={`edgeNudge edgeNudgeCanvas edgeNudgeCanvasLeft ${canvasLeftRailOpen ? "edgeNudgeOpen" : "edgeNudgeClosed"}`}
+            onClick={() => setCanvasLeftRailOpen((open) => !open)}
+            aria-label={canvasLeftRailOpen ? "왼쪽 패널 접기" : "왼쪽 패널 펼치기"}
+            style={{ left: `${(sidebarOpen ? sidebarWidth : 0) + (canvasLeftRailOpen ? canvasLeftRailWidth + 12 : 8)}px` }}
+          >
+            {canvasLeftRailOpen ? "‹" : "›"}
+          </button>
+          <button
+            type="button"
+            className={`edgeNudge edgeNudgeCanvas edgeNudgeCanvasRight ${canvasRightRailOpen ? "edgeNudgeOpen" : "edgeNudgeClosed"}`}
+            onClick={() => setCanvasRightRailOpen((open) => !open)}
+            aria-label={canvasRightRailOpen ? "오른쪽 패널 접기" : "오른쪽 패널 펼치기"}
+            style={{ right: `${canvasRightRailOpen ? canvasRightRailWidth + 12 : 8}px` }}
+          >
+            {canvasRightRailOpen ? "›" : "‹"}
+          </button>
+        </>
+      ) : null}
     </div>
   );
 }
