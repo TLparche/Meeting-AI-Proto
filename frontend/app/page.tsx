@@ -119,6 +119,7 @@ type CanvasNodeDetail = {
   kind: CanvasGraphNode["kind"];
   agendaId: string;
   sourceIdeaId?: string;
+  sourceManualAgendaId?: string;
   visibility?: "private" | "public";
   pointId?: string;
   title: string;
@@ -177,6 +178,7 @@ type CanvasLane = {
   agendaId: string;
   agendaLabel: string;
   agendaTitle: string;
+  edited?: boolean;
   status: AgendaStatus;
   flowType: string;
   timeLabel: string;
@@ -300,6 +302,19 @@ const evidenceSupportLabel: Record<EvidenceItem["supports"], string> = {
 
 function agendaLabel(agenda: Agenda): string {
   return `${agenda.label}: ${agenda.title}`;
+}
+
+function hasAgendaOverride(override?: { title?: string; summaryBullets?: string[] }): boolean {
+  return Boolean(safeText(override?.title) || ((override?.summaryBullets || []).map((item) => safeText(item)).filter(Boolean).length > 0));
+}
+
+function renderAgendaLabelNode(agenda: Agenda): ReactNode {
+  return (
+    <>
+      <span>{agendaLabel(agenda)}</span>
+      {agenda.edited ? <span className="chip chipSoft">수정됨</span> : null}
+    </>
+  );
 }
 
 function renderCanvasFlowLabel(data: {
@@ -1076,6 +1091,7 @@ export default function Home() {
   const [canvasIdeaBody, setCanvasIdeaBody] = useState("");
   const [canvasIdeas, setCanvasIdeas] = useState<CanvasIdea[]>([]);
   const [canvasManualAgendas, setCanvasManualAgendas] = useState<CanvasManualAgenda[]>([]);
+  const [agendaOverrides, setAgendaOverrides] = useState<Record<string, { title?: string; summaryBullets?: string[] }>>({});
   const [problemDefinitionGroups, setProblemDefinitionGroups] = useState<CanvasProblemGroup[]>([]);
   const [problemDefinitionLoading, setProblemDefinitionLoading] = useState(false);
   const [problemDefinitionMeta, setProblemDefinitionMeta] = useState("");
@@ -1083,6 +1099,9 @@ export default function Home() {
   const [solutionStageLoading, setSolutionStageLoading] = useState(false);
   const [solutionStageMeta, setSolutionStageMeta] = useState("");
   const [canvasNodeDetail, setCanvasNodeDetail] = useState<CanvasNodeDetail | null>(null);
+  const [canvasDetailEditTarget, setCanvasDetailEditTarget] = useState<{ kind: "idea" | "manual-agenda" | "agenda"; id: string } | null>(null);
+  const [canvasDetailEditTitle, setCanvasDetailEditTitle] = useState("");
+  const [canvasDetailEditBody, setCanvasDetailEditBody] = useState("");
   const [canvasNodePositions, setCanvasNodePositions] = useState<Record<string, CanvasNodePosition>>({});
 
   const [datasetFolder, setDatasetFolder] = useState("dataset/economy");
@@ -1653,10 +1672,13 @@ export default function Home() {
       return stack.map((row, idx) => {
         const st = String(row.status || "PROPOSED").toUpperCase();
         const status: AgendaStatus = st === "CLOSED" ? "Done" : st === "ACTIVE" || st === "CLOSING" ? "In progress" : "Not started";
+        const agendaId = `agenda-${idx + 1}`;
+        const override = agendaOverrides[agendaId] || {};
         return {
-          id: `agenda-${idx + 1}`,
+          id: agendaId,
           label: `안건 ${idx + 1}`,
-          title: safeText(row.title, `안건 ${idx + 1}`),
+          title: safeText(override.title, safeText(row.title, `안건 ${idx + 1}`)),
+          edited: hasAgendaOverride(override),
           status,
           confidence: status === "In progress" ? 82 : 72,
           progress: statusProgress(status),
@@ -1666,7 +1688,7 @@ export default function Home() {
           decisionSoFar: [],
           nextQuestions: [],
           keywords: [],
-          summaryBullets: [],
+          summaryBullets: (override.summaryBullets || []).map((item) => safeText(item)).filter(Boolean).slice(0, 3),
           recommendation: "",
           lastUpdated: formatNowTime(),
         };
@@ -1679,20 +1701,24 @@ export default function Home() {
       : 85;
     const rows = sortedOutcomeRows;
     const items: Agenda[] = rows.map((row, idx) => {
-      const title = safeText(row.agenda_title, `안건 ${idx + 1}`);
+      const rid = safeText(row.agenda_id, `agenda-${idx + 1}`);
+      const override = agendaOverrides[rid] || {};
+      const title = safeText(override.title, safeText(row.agenda_title, `안건 ${idx + 1}`));
       const agendaState = normalizeAgendaState(row.agenda_state);
       const status = toAgendaStatus(agendaState);
       const summaryPoints = (row.agenda_summary_items || []).map((s) => safeText(s)).filter(Boolean).slice(0, 3);
       const keyPoints = (summaryPoints.length > 0 ? summaryPoints : (row.key_utterances || [])).filter(Boolean).slice(0, 3);
-      const summaries = (summaryPoints.length > 0 ? summaryPoints : [safeText(row.summary)]).filter(Boolean).slice(0, 3);
+      const summaries = (override.summaryBullets && override.summaryBullets.length > 0
+        ? override.summaryBullets
+        : (summaryPoints.length > 0 ? summaryPoints : [safeText(row.summary)]).filter(Boolean).slice(0, 3));
       const keywords = (row.agenda_keywords || []).map((k) => safeText(k)).filter(Boolean);
       const decisionConclusions = (row.decision_results || []).map((d) => safeText(d.conclusion)).filter(Boolean);
       const actionNames = (row.action_items || []).map((a) => safeText(a.item)).filter(Boolean);
-      const rid = safeText(row.agenda_id, `agenda-${idx + 1}`);
       return {
         id: rid,
         label: `안건 ${idx + 1}`,
         title,
+        edited: hasAgendaOverride(override),
         status,
         confidence: title === activeTitle ? activeConfidence : 78,
         progress: statusProgress(status),
@@ -1713,12 +1739,13 @@ export default function Home() {
       ...agenda,
       nextUp: items[idx + 1] ? `${items[idx + 1].label}: ${items[idx + 1].title}` : "마무리",
     }));
-  }, [sortedOutcomeRows, state.agenda_stack, state.analysis?.agenda?.active?.confidence, state.analysis?.agenda?.active?.title]);
+  }, [agendaOverrides, sortedOutcomeRows, state.agenda_stack, state.analysis?.agenda?.active?.confidence, state.analysis?.agenda?.active?.title]);
 
   useEffect(() => {
     if ((state.transcript?.length || 0) === 0 && agendas.length === 0) {
       setCanvasIdeas([]);
       setCanvasManualAgendas([]);
+      setAgendaOverrides({});
       setProblemDefinitionGroups([]);
       setProblemDefinitionMeta("");
       setSolutionTopics([]);
@@ -2283,6 +2310,7 @@ export default function Home() {
         agendaId: agenda.id,
         agendaLabel: agenda.label,
         agendaTitle: agenda.title,
+        edited: agenda.edited,
         status: agenda.status,
         flowType: safeText(row?.flow_type, "discussion"),
         timeLabel: buildTimeRangeLabel(timeCandidates),
@@ -2297,6 +2325,7 @@ export default function Home() {
         agendaId: agenda.id,
         agendaLabel: `수동 안건 ${idx + 1}`,
         agendaTitle: agenda.title,
+        edited: false,
         status: "Not started" as AgendaStatus,
         flowType: "manual",
         timeLabel: agenda.createdAt,
@@ -2346,7 +2375,7 @@ export default function Home() {
         title: lane.agendaTitle,
         body: lane.keywordLabel,
         subtitle: `${lane.agendaLabel} · ${agendaStatusLabel[lane.status]}`,
-        meta: [lane.timeLabel, `${lane.transcriptCount}개 발화`, lane.flowType],
+        meta: [lane.edited ? "수정됨" : "", lane.timeLabel, `${lane.transcriptCount}개 발화`, lane.flowType].filter(Boolean),
         width: 300,
         height: 156,
         x: agendaColumnX,
@@ -2557,6 +2586,12 @@ export default function Home() {
     setCanvasIdeaBody("");
   }, []);
 
+  const clearCanvasDetailEdit = useCallback(() => {
+    setCanvasDetailEditTarget(null);
+    setCanvasDetailEditTitle("");
+    setCanvasDetailEditBody("");
+  }, []);
+
   const clearCanvasComposer = useCallback(() => {
     if (canvasPlacementPending) return;
     setCanvasComposerPlacement(null);
@@ -2574,11 +2609,12 @@ export default function Home() {
   }, [canvasPlacementPending]);
 
   const handleCanvasPaneClick = useCallback(() => {
+    clearCanvasDetailEdit();
     setCanvasNodeDetail(null);
     setCanvasRightRailOpen(false);
     swapCanvasRightPanelView("insights");
     setCanvasComposerPlacement(null);
-  }, [swapCanvasRightPanelView]);
+  }, [clearCanvasDetailEdit, swapCanvasRightPanelView]);
 
   const handleCanvasToolPlacement = useCallback(async (placement: CanvasComposerPlacement) => {
     if (!canvasComposerTool) return;
@@ -2717,30 +2753,34 @@ export default function Home() {
     const manualAgenda = manualAgendaMap.get(agendaId);
     if (!agenda && !manualAgenda) return;
     const row = outcomeByAgendaMap.get(agendaId);
-    const summaryLines = [
-      ...((row?.agenda_summary_items || []).map((item) => safeText(item)).filter(Boolean)),
-      ...((row?.summary ? [safeText(row.summary)] : []).filter(Boolean)),
-      ...(manualAgenda?.body ? [manualAgenda.body] : []),
-    ].filter(Boolean).slice(0, 3);
+    const summaryLines = agenda
+      ? agenda.summaryBullets
+      : [
+          ...((row?.agenda_summary_items || []).map((item) => safeText(item)).filter(Boolean)),
+          ...((row?.summary ? [safeText(row.summary)] : []).filter(Boolean)),
+          ...(manualAgenda?.body ? [manualAgenda.body] : []),
+        ].filter(Boolean).slice(0, 3);
     const utterances = (agendaUtterancesMap.get(agendaId) || []).slice();
     if (agenda) setSelectedAgendaId(agendaId);
     setSummaryScope("current");
     setSelectedSummaryFocus(null);
+    clearCanvasDetailEdit();
     setCanvasRightRailOpen(true);
     swapCanvasRightPanelView("detail");
     setCanvasNodeDetail({
       id: `detail-${agendaId}`,
       kind: "agenda",
       agendaId,
+      sourceManualAgendaId: manualAgenda?.id,
       title: agenda?.title || manualAgenda?.title || "안건",
       subtitle: agenda ? `${agenda.label} · ${agendaStatusLabel[agenda.status]}` : `수동 안건 · ${manualAgenda?.createdAt || ""}`,
-      badges: [safeText(row?.flow_type, manualAgenda ? "manual" : "discussion"), `${utterances.length}개 발화`],
+      badges: [agenda?.edited ? "수정됨" : "", safeText(row?.flow_type, manualAgenda ? "manual" : "discussion"), `${utterances.length}개 발화`].filter(Boolean),
       keywords: (row?.agenda_keywords || []).map((item) => safeText(item)).filter(Boolean).slice(0, 8),
       summaryLines: summaryLines.length > 0 ? summaryLines : ["요약이 아직 없습니다."],
       opinionGroups: [],
       utterances,
     });
-  }, [agendas, manualAgendaMap, outcomeByAgendaMap, agendaUtterancesMap, swapCanvasRightPanelView]);
+  }, [agendas, clearCanvasDetailEdit, manualAgendaMap, outcomeByAgendaMap, agendaUtterancesMap, swapCanvasRightPanelView]);
 
   const openCanvasIdeaDetail = useCallback((idea: CanvasIdea) => {
     const utterances =
@@ -2758,6 +2798,7 @@ export default function Home() {
     }
     setSelectedAgendaId(idea.agendaId);
     setSummaryScope("current");
+    clearCanvasDetailEdit();
     setCanvasRightRailOpen(true);
     swapCanvasRightPanelView("detail");
     setCanvasNodeDetail({
@@ -2779,7 +2820,7 @@ export default function Home() {
       utterances,
       noteBody: safeText(idea.body),
     });
-  }, [agendaUtterancesMap, resolveSummaryFocusUtterances, summaryPointMetaMap, outcomeByAgendaMap, swapCanvasRightPanelView]);
+  }, [agendaUtterancesMap, clearCanvasDetailEdit, resolveSummaryFocusUtterances, summaryPointMetaMap, outcomeByAgendaMap, swapCanvasRightPanelView]);
 
   const addCanvasItem = useCallback(async (placement?: CanvasComposerPlacement | null) => {
     if (analysisUiDisabled || canvasPlacementPending) return;
@@ -2922,6 +2963,105 @@ export default function Home() {
     });
   }, []);
 
+  const startCanvasDetailEdit = useCallback(() => {
+    if (!canvasNodeDetail) return;
+    if (canvasNodeDetail.kind === "agenda" && !canvasNodeDetail.sourceManualAgendaId) {
+      setCanvasDetailEditTarget({ kind: "agenda", id: canvasNodeDetail.agendaId });
+      setCanvasDetailEditTitle(canvasNodeDetail.title);
+      setCanvasDetailEditBody(canvasNodeDetail.summaryLines.join("\n"));
+      return;
+    }
+    if (canvasNodeDetail.kind === "idea" && canvasNodeDetail.sourceIdeaId) {
+      setCanvasDetailEditTarget({ kind: "idea", id: canvasNodeDetail.sourceIdeaId });
+      setCanvasDetailEditTitle(canvasNodeDetail.title);
+      setCanvasDetailEditBody(safeText(canvasNodeDetail.noteBody, canvasNodeDetail.summaryLines[0] || ""));
+      return;
+    }
+    if (canvasNodeDetail.kind === "agenda" && canvasNodeDetail.sourceManualAgendaId) {
+      setCanvasDetailEditTarget({ kind: "manual-agenda", id: canvasNodeDetail.sourceManualAgendaId });
+      setCanvasDetailEditTitle(canvasNodeDetail.title);
+      setCanvasDetailEditBody(canvasNodeDetail.summaryLines[0] || "");
+    }
+  }, [canvasNodeDetail]);
+
+  const saveCanvasDetailEdit = useCallback(() => {
+    if (!canvasDetailEditTarget) return;
+    const nextTitle = safeText(canvasDetailEditTitle);
+    const nextBody = safeText(canvasDetailEditBody);
+    if (!nextTitle && !nextBody) return;
+
+    if (canvasDetailEditTarget.kind === "agenda") {
+      const nextSummaryBullets = canvasDetailEditBody
+        .split(/\r?\n/)
+        .map((line) => safeText(line))
+        .filter(Boolean)
+        .slice(0, 3);
+      setAgendaOverrides((prev) => ({
+        ...prev,
+        [canvasDetailEditTarget.id]: {
+          title: nextTitle,
+          summaryBullets: nextSummaryBullets,
+        },
+      }));
+      setCanvasNodeDetail((prev) => {
+        if (!prev || prev.agendaId !== canvasDetailEditTarget.id || prev.sourceManualAgendaId) return prev;
+        return {
+          ...prev,
+          title: nextTitle || prev.title,
+          summaryLines: nextSummaryBullets.length > 0 ? nextSummaryBullets : ["요약이 아직 없습니다."],
+        };
+      });
+      clearCanvasDetailEdit();
+      return;
+    }
+
+    if (canvasDetailEditTarget.kind === "idea") {
+      setCanvasIdeas((prev) =>
+        prev.map((idea) =>
+          idea.id === canvasDetailEditTarget.id
+            ? {
+                ...idea,
+                title: nextTitle || idea.title,
+                body: nextBody,
+              }
+            : idea,
+        ),
+      );
+      setCanvasNodeDetail((prev) => {
+        if (!prev || prev.sourceIdeaId !== canvasDetailEditTarget.id) return prev;
+        return {
+          ...prev,
+          title: nextTitle || prev.title,
+          summaryLines: [nextBody || "메모 본문 없음", ...(prev.pointId && prev.summaryLines[1] ? [prev.summaryLines[1]] : prev.summaryLines.slice(1))].filter(Boolean),
+          noteBody: nextBody,
+        };
+      });
+      clearCanvasDetailEdit();
+      return;
+    }
+
+    setCanvasManualAgendas((prev) =>
+      prev.map((agenda) =>
+        agenda.id === canvasDetailEditTarget.id
+          ? {
+              ...agenda,
+              title: nextTitle || agenda.title,
+              body: nextBody,
+            }
+          : agenda,
+      ),
+    );
+    setCanvasNodeDetail((prev) => {
+      if (!prev || prev.sourceManualAgendaId !== canvasDetailEditTarget.id) return prev;
+      return {
+        ...prev,
+        title: nextTitle || prev.title,
+        summaryLines: [nextBody || "요약이 아직 없습니다."],
+      };
+    });
+    clearCanvasDetailEdit();
+  }, [canvasDetailEditBody, canvasDetailEditTarget, canvasDetailEditTitle, clearCanvasDetailEdit]);
+
   const focusTargetCard = (agendaId: string, targetId: string) => {
     if (analysisUiDisabled) return;
     const cleanTarget = safeText(targetId);
@@ -2969,6 +3109,7 @@ export default function Home() {
     if (!isCanvasMode) {
       setCanvasComposerTool(null);
       setCanvasComposerPlacement(null);
+      clearCanvasDetailEdit();
       setCanvasNodeDetail(null);
       setCanvasRightPanelView("insights");
       setCanvasRightPanelAnim("idle");
@@ -2976,7 +3117,7 @@ export default function Home() {
     return () => {
       clearCanvasRightPanelTimer();
     };
-  }, [clearCanvasRightPanelTimer, isCanvasMode]);
+  }, [clearCanvasDetailEdit, clearCanvasRightPanelTimer, isCanvasMode]);
 
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
@@ -3138,7 +3279,13 @@ export default function Home() {
     try {
       const res = await exportAgendaSnapshot();
       const filename = safeText(res.filename, `agenda_snapshot_${Date.now()}.json`);
-      const blob = new Blob([JSON.stringify(res.snapshot || {}, null, 2)], { type: "application/json;charset=utf-8" });
+      const snapshot = {
+        ...(res.snapshot || {}),
+        frontend_overrides: {
+          agenda_overrides: agendaOverrides,
+        },
+      };
+      const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -3149,7 +3296,7 @@ export default function Home() {
       URL.revokeObjectURL(url);
       setError("");
       setDebugEvents((rows) => [
-        `${formatNowTime()} | 안건 스냅샷 내보내기 완료: ${filename} (agenda=${res.agenda_count}, turns=${res.transcript_count})`,
+        `${formatNowTime()} | 안건 스냅샷 내보내기 완료: ${filename} (agenda=${res.agenda_count}, turns=${res.transcript_count}, overrides=${Object.keys(agendaOverrides).length})`,
         ...rows,
       ].slice(0, 80));
     } catch (err) {
@@ -3163,14 +3310,23 @@ export default function Home() {
     if (!agendaSnapshotFile) return;
     beginTask("안건 스냅샷 불러오는 중");
     try {
+      let parsedSnapshot: Record<string, unknown> = {};
+      try {
+        parsedSnapshot = JSON.parse(await agendaSnapshotFile.text()) as Record<string, unknown>;
+      } catch {
+        parsedSnapshot = {};
+      }
       const res = await importAgendaSnapshot({ file: agendaSnapshotFile, reset_state: true });
       commitMeetingState(res.state);
+      const frontendOverrides = (parsedSnapshot.frontend_overrides as Record<string, unknown> | undefined) || {};
+      const importedAgendaOverrides = (frontendOverrides.agenda_overrides as Record<string, { title?: string; summaryBullets?: string[] }> | undefined) || {};
+      setAgendaOverrides(importedAgendaOverrides);
       setMeetingGoalDraft(res.state.meeting_goal || "");
       setMeetingGoalDirty(false);
-      setDatasetImportInfo(`snapshot imported=${res.import_debug.agenda_count} agendas / ${res.import_debug.transcript_count} turns`);
+      setDatasetImportInfo(`snapshot imported=${res.import_debug.agenda_count} agendas / ${res.import_debug.transcript_count} turns / overrides=${Object.keys(importedAgendaOverrides).length}`);
       setError("");
       setDebugEvents((rows) => [
-        `${formatNowTime()} | 안건 스냅샷 불러오기 완료: ${res.import_debug.filename} (agenda=${res.import_debug.agenda_count}, turns=${res.import_debug.transcript_count})`,
+        `${formatNowTime()} | 안건 스냅샷 불러오기 완료: ${res.import_debug.filename} (agenda=${res.import_debug.agenda_count}, turns=${res.import_debug.transcript_count}, overrides=${Object.keys(importedAgendaOverrides).length})`,
         ...rows,
       ].slice(0, 80));
     } catch (err) {
@@ -3188,6 +3344,15 @@ export default function Home() {
         </div>
       );
     }
+
+    const editableIdea = canvasNodeDetail.kind === "idea" && Boolean(canvasNodeDetail.sourceIdeaId);
+    const editableAgenda = canvasNodeDetail.kind === "agenda" && !canvasNodeDetail.sourceManualAgendaId;
+    const editableManualAgenda = canvasNodeDetail.kind === "agenda" && Boolean(canvasNodeDetail.sourceManualAgendaId);
+    const isCanvasDetailEditable = editableIdea || editableAgenda || editableManualAgenda;
+    const isCanvasDetailEditing =
+      (editableAgenda && canvasDetailEditTarget?.kind === "agenda" && canvasDetailEditTarget.id === canvasNodeDetail.agendaId) ||
+      (editableIdea && canvasDetailEditTarget?.kind === "idea" && canvasDetailEditTarget.id === canvasNodeDetail.sourceIdeaId) ||
+      (editableManualAgenda && canvasDetailEditTarget?.kind === "manual-agenda" && canvasDetailEditTarget.id === canvasNodeDetail.sourceManualAgendaId);
 
     return (
       <div className={`canvasDrawerViewport canvasDrawerViewport${canvasRightPanelAnim === "out" ? "SwapOut" : canvasRightPanelAnim === "in" ? "SwapIn" : ""}`}>
@@ -3207,6 +3372,22 @@ export default function Home() {
                 >
                   {canvasNodeDetail.visibility === "public" ? "비공개로 전환" : "공개로 전환"}
                 </button>
+              ) : null}
+              {isCanvasDetailEditable ? (
+                isCanvasDetailEditing ? (
+                  <>
+                    <button type="button" className="ghostButton" onClick={clearCanvasDetailEdit}>
+                      취소
+                    </button>
+                    <button type="button" className="ghostButton" onClick={saveCanvasDetailEdit}>
+                      저장
+                    </button>
+                  </>
+                ) : (
+                  <button type="button" className="ghostButton" onClick={startCanvasDetailEdit}>
+                    수정
+                  </button>
+                )
               ) : null}
               <button
                 type="button"
@@ -3228,6 +3409,25 @@ export default function Home() {
             </div>
           </div>
           <div className="canvasNodeDetailBody">
+            {isCanvasDetailEditing ? (
+              <section className="canvasNodeDetailSection canvasNodeDetailEditSection">
+                <h4>내용 수정</h4>
+                <div className="canvasNodeDetailEditForm">
+                  <input
+                    aria-label="캔버스 항목 제목 수정"
+                    value={canvasDetailEditTitle}
+                    onChange={(event) => setCanvasDetailEditTitle(event.target.value)}
+                    placeholder="제목"
+                  />
+                  <textarea
+                    aria-label="캔버스 항목 본문 수정"
+                    value={canvasDetailEditBody}
+                    onChange={(event) => setCanvasDetailEditBody(event.target.value)}
+                    placeholder={editableAgenda || editableManualAgenda ? "요약본을 줄바꿈으로 구분해 입력" : "내용"}
+                  />
+                </div>
+              </section>
+            ) : null}
             <div className="canvasNodeDetailMeta">
               {canvasNodeDetail.badges.map((badge) => (
                 <span key={`${canvasNodeDetail.id}-${badge}`} className="chip chipSoft">{badge}</span>
@@ -3322,7 +3522,7 @@ export default function Home() {
           {bottomAgendas.map((agenda) => (
             <details key={agenda.id} open>
               <summary>
-                <span>{agendaLabel(agenda)}</span>
+                <span className="agendaHeadingWithBadge">{renderAgendaLabelNode(agenda)}</span>
                 <span className={agendaStatusClass[agenda.status]}>{agendaStatusLabel[agenda.status]}</span>
               </summary>
               {agenda.summaryBullets.length === 0 ? (
@@ -3400,7 +3600,7 @@ export default function Home() {
             if (scopedDecisions.length === 0) return null;
             return (
               <section key={agenda.id} className="decisionGroup">
-                <h4>{agendaLabel(agenda)}</h4>
+                <h4 className="agendaHeadingWithBadge">{renderAgendaLabelNode(agenda)}</h4>
                 {scopedDecisions.map((decision) => (
                   <article
                     key={decision.id}
@@ -3644,6 +3844,7 @@ export default function Home() {
               </div>
               <div className="contextBar">
                 <span className="chip chipInteractive">{selectedAgenda ? agendaLabel(selectedAgenda) : "선택된 안건 없음"}</span>
+                {selectedAgenda?.edited ? <span className="chip chipSoft">수정됨</span> : null}
                 <span>{selectedAgenda ? `${selectedAgenda.progress}% 완료` : "0% 완료"} . {meeting.elapsed}</span>
                 <span className="mutedLabel">마지막 업데이트 {meeting.lastUpdated}</span>
                 <span className="chip chipSoft">LLM: {llmEnabled ? "ON" : "OFF"}</span>
@@ -4417,7 +4618,7 @@ export default function Home() {
               {selectedAgenda ? (
                 <section className="currentAgenda">
                   <p className="mutedLabel">현재 안건</p>
-                  <h3>{agendaLabel(selectedAgenda)}</h3>
+                  <h3 className="agendaHeadingWithBadge">{renderAgendaLabelNode(selectedAgenda)}</h3>
                   <div className="progressTrack"><span style={{ width: `${selectedAgenda.progress}%` }} /></div>
                   <div className="inlineMeta">
                     <span>{selectedAgenda.progress}% 완료</span>
@@ -4444,7 +4645,7 @@ export default function Home() {
                     disabled={analysisUiDisabled}
                   >
                     <div>
-                      <p className="agendaTitle">{agendaLabel(agenda)}</p>
+                      <p className="agendaTitle agendaHeadingWithBadge">{renderAgendaLabelNode(agenda)}</p>
                       <p className="mutedLabel">신뢰도 {agenda.confidence}%</p>
                     </div>
                     <span className={agendaStatusClass[agenda.status]}>{agendaStatusLabel[agenda.status]}</span>
@@ -4484,7 +4685,7 @@ export default function Home() {
                 <div className="summarySections">
                   {summaryAgendas.map((agenda) => (
                     <section key={agenda.id} className="summaryBlock">
-                      <h3>{agendaLabel(agenda)}</h3>
+                      <h3 className="agendaHeadingWithBadge">{renderAgendaLabelNode(agenda)}</h3>
                       {agenda.keywords && agenda.keywords.length > 0 ? (
                         <div className="chipRow">
                           {agenda.keywords.slice(0, 8).map((kw) => (

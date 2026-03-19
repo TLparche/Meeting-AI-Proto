@@ -4,6 +4,7 @@ export interface Agenda {
   id: string;
   label: string;
   title: string;
+  edited?: boolean;
   status: AgendaStatus;
   confidence: number;
   progress: number;

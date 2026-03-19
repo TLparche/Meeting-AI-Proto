@@ -2143,6 +2143,42 @@ h4 {
   font-size: 0.82rem;
 }
 
+.canvasNodeDetailEditSection {
+  padding: 12px;
+  border: 1px solid #dbe3f0;
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+.canvasNodeDetailEditForm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.canvasNodeDetailEditForm input,
+.canvasNodeDetailEditForm textarea {
+  width: 100%;
+  border: 1px solid #d7deea;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #0f172a;
+  padding: 10px 12px;
+  font: inherit;
+}
+
+.canvasNodeDetailEditForm textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
+.agendaHeadingWithBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .canvasNodeDetailSectionHeader {
   display: flex;
   align-items: center;
