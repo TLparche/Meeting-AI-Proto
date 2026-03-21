@@ -368,6 +368,10 @@ function buildCanvasFlowNodes(
       sourcePosition: Position.Right,
       targetPosition: Position.Left,
       className: `rfNode rfNode${node.kind === "agenda" ? "Agenda" : node.kind === "summary" ? "Summary" : "Idea"} ${selectedAgendaId === node.agendaId ? "rfNodeEmphasized" : ""}`,
+      style: {
+        width: node.width,
+        minHeight: node.height,
+      },
       data: {
         label: renderCanvasFlowLabel({
           kind: node.kind,
@@ -1072,7 +1076,8 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(280);
   const [canvasLeftRailOpen, setCanvasLeftRailOpen] = useState(true);
-  const [canvasRightRailOpen, setCanvasRightRailOpen] = useState(true);
+  const [canvasRightRailOpen] = useState(true);
+  const [canvasLeftPanelTab, setCanvasLeftPanelTab] = useState<"control" | "insights">("control");
   const [canvasLeftRailWidth, setCanvasLeftRailWidth] = useState(332);
   const [canvasRightRailWidth, setCanvasRightRailWidth] = useState(360);
   const [canvasSurfaceTop, setCanvasSurfaceTop] = useState(144);
@@ -1103,6 +1108,7 @@ export default function Home() {
   const [canvasDetailEditTitle, setCanvasDetailEditTitle] = useState("");
   const [canvasDetailEditBody, setCanvasDetailEditBody] = useState("");
   const [canvasNodePositions, setCanvasNodePositions] = useState<Record<string, CanvasNodePosition>>({});
+  const [canvasPinnedNodeIds, setCanvasPinnedNodeIds] = useState<string[]>([]);
 
   const [datasetFolder, setDatasetFolder] = useState("dataset/economy");
   const [datasetFiles, setDatasetFiles] = useState<File[]>([]);
@@ -1755,6 +1761,7 @@ export default function Home() {
       setCanvasComposerTool(null);
       setCanvasComposerPlacement(null);
       setCanvasNodePositions({});
+      setCanvasPinnedNodeIds([]);
     }
   }, [state.transcript?.length, agendas.length]);
 
@@ -2345,28 +2352,60 @@ export default function Home() {
     }
 
     const nodeMap = new Map<string, CanvasGraphNode>();
-    const agendaColumnX = 96;
-    const ideaColumnX = 520;
-    const laneGapY = 144;
-    const ideaGapY = 152;
-    const laneMinHeight = 240;
-    let currentLaneY = 96;
+    const agendaNodeWidth = 216;
+    const agendaNodeHeight = 208;
+    const ideaNodeWidth = 188;
+    const ideaNodeHeight = 188;
+    const ideaGapX = 42;
+    const ideaGapY = 42;
+    const clusterGapX = 120;
+    const clusterGapY = 120;
+    const clusterStartX = 96;
+    const clusterStartY = 96;
+    const clusterCols = canvasLanes.length >= 5 ? 3 : canvasLanes.length >= 2 ? 2 : 1;
+    const clusterDims = canvasLanes.map((lane) => {
+      const ideaCount = lane.ideaNodes.length;
+      const ideaCols = ideaCount >= 5 ? 3 : ideaCount >= 2 ? 2 : Math.max(1, ideaCount);
+      const ideaRows = ideaCount > 0 ? Math.ceil(ideaCount / ideaCols) : 0;
+      const ideaBlockWidth = ideaCount > 0 ? ideaCols * (ideaNodeWidth + ideaGapX) - ideaGapX : 0;
+      const ideaBlockHeight = ideaCount > 0 ? ideaRows * (ideaNodeHeight + ideaGapY) - ideaGapY : 0;
+      return {
+        ideaCols,
+        ideaRows,
+        width: agendaNodeWidth + (ideaCount > 0 ? 64 + ideaBlockWidth : 0),
+        height: Math.max(agendaNodeHeight, ideaBlockHeight || agendaNodeHeight),
+      };
+    });
+
+    const clusterOrigins: Array<{ x: number; y: number }> = [];
+    let rowY = clusterStartY;
+    for (let start = 0; start < canvasLanes.length; start += clusterCols) {
+      const rowItems = clusterDims.slice(start, start + clusterCols);
+      let rowX = clusterStartX;
+      const rowHeight = Math.max(...rowItems.map((item) => item.height));
+      rowItems.forEach((item, offset) => {
+        clusterOrigins[start + offset] = { x: rowX, y: rowY };
+        rowX += item.width + clusterGapX;
+      });
+      rowY += rowHeight + clusterGapY;
+    }
+
     let maxX = 1500;
     let maxY = 860;
 
-    canvasLanes.forEach((lane) => {
+    canvasLanes.forEach((lane, laneIdx) => {
+      const origin = clusterOrigins[laneIdx] || { x: clusterStartX, y: clusterStartY };
+      const dims = clusterDims[laneIdx];
       const agendaNodeId = `canvas-agenda-${lane.agendaId}`;
-      const ideaSlots = lane.ideaNodes.map((idea, ideaIdx) => ({
-        idea,
-        x: ideaColumnX,
-        y: currentLaneY + ideaIdx * ideaGapY,
-      }));
-
-      const laneBottom = Math.max(
-        currentLaneY + laneMinHeight,
-        ...ideaSlots.map((slot) => slot.y + 148),
-      );
-      const laneHeight = laneBottom - currentLaneY;
+      const ideaSlots = lane.ideaNodes.map((idea, ideaIdx) => {
+        const col = ideaIdx % dims.ideaCols;
+        const row = Math.floor(ideaIdx / dims.ideaCols);
+        return {
+          idea,
+          x: origin.x + agendaNodeWidth + 64 + col * (ideaNodeWidth + ideaGapX),
+          y: origin.y + row * (ideaNodeHeight + ideaGapY),
+        };
+      });
 
       const agendaNode: CanvasGraphNode = {
         id: agendaNodeId,
@@ -2376,10 +2415,10 @@ export default function Home() {
         body: lane.keywordLabel,
         subtitle: `${lane.agendaLabel} · ${agendaStatusLabel[lane.status]}`,
         meta: [lane.edited ? "수정됨" : "", lane.timeLabel, `${lane.transcriptCount}개 발화`, lane.flowType].filter(Boolean),
-        width: 300,
-        height: 156,
-        x: agendaColumnX,
-        y: currentLaneY + Math.max(0, (laneHeight - 156) / 2),
+        width: agendaNodeWidth,
+        height: agendaNodeHeight,
+        x: origin.x,
+        y: origin.y + Math.max(0, (dims.height - agendaNodeHeight) / 2),
       };
       nodeMap.set(agendaNodeId, agendaNode);
 
@@ -2395,8 +2434,8 @@ export default function Home() {
           meta: [idea.visibility === "public" ? "공개" : "비공개", idea.linkedPointId ? "요약 연결" : "안건 연결"],
           linkedPointText: idea.linkedPointText,
           pointId: idea.linkedPointId,
-          width: 248,
-          height: 148,
+          width: ideaNodeWidth,
+          height: ideaNodeHeight,
           x,
           y,
         };
@@ -2409,13 +2448,12 @@ export default function Home() {
         });
       });
 
-      currentLaneY = laneBottom + laneGapY;
-      maxX = Math.max(maxX, ideaColumnX + 248 + 180);
-      maxY = Math.max(maxY, laneBottom + laneGapY);
+      maxX = Math.max(maxX, origin.x + dims.width + 180);
+      maxY = Math.max(maxY, origin.y + dims.height + clusterGapY);
     });
 
     nodeMap.forEach((node, id) => {
-      const override = canvasNodePositions[id];
+      const override = canvasPinnedNodeIds.includes(id) ? canvasNodePositions[id] : undefined;
       const nextNode = override ? { ...node, x: override.x, y: override.y } : node;
       nodes.push(nextNode);
       maxX = Math.max(maxX, nextNode.x + nextNode.width + 160);
@@ -2428,7 +2466,7 @@ export default function Home() {
       width: Math.max(1800, maxX),
       height: Math.max(960, maxY),
     };
-  }, [canvasLanes, canvasNodePositions]);
+  }, [canvasLanes, canvasNodePositions, canvasPinnedNodeIds]);
 
   const flowNodeSeed = useMemo(
     () => buildCanvasFlowNodes(canvasGraph.nodes, selectedAgenda?.id),
@@ -2442,6 +2480,7 @@ export default function Home() {
       ...prev,
       [node.id]: { x: node.position.x, y: node.position.y },
     }));
+    setCanvasPinnedNodeIds((prev) => (prev.includes(node.id) ? prev : [...prev, node.id]));
   }, []);
 
   const filteredTranscript = useMemo(() => {
@@ -2611,7 +2650,8 @@ export default function Home() {
   const handleCanvasPaneClick = useCallback(() => {
     clearCanvasDetailEdit();
     setCanvasNodeDetail(null);
-    setCanvasRightRailOpen(false);
+    setCanvasLeftRailOpen(false);
+    setCanvasLeftPanelTab("insights");
     swapCanvasRightPanelView("insights");
     setCanvasComposerPlacement(null);
   }, [clearCanvasDetailEdit, swapCanvasRightPanelView]);
@@ -2765,7 +2805,8 @@ export default function Home() {
     setSummaryScope("current");
     setSelectedSummaryFocus(null);
     clearCanvasDetailEdit();
-    setCanvasRightRailOpen(true);
+    setCanvasLeftRailOpen(true);
+    setCanvasLeftPanelTab("insights");
     swapCanvasRightPanelView("detail");
     setCanvasNodeDetail({
       id: `detail-${agendaId}`,
@@ -2799,7 +2840,8 @@ export default function Home() {
     setSelectedAgendaId(idea.agendaId);
     setSummaryScope("current");
     clearCanvasDetailEdit();
-    setCanvasRightRailOpen(true);
+    setCanvasLeftRailOpen(true);
+    setCanvasLeftPanelTab("insights");
     swapCanvasRightPanelView("detail");
     setCanvasNodeDetail({
       id: `detail-${idea.id}`,
@@ -2859,13 +2901,6 @@ export default function Home() {
             createdAt: formatNowTime(),
           },
         ]);
-        setCanvasNodePositions((prev) => ({
-          ...prev,
-          [`canvas-agenda-${nextId}`]: {
-            x: placement?.flowX ?? 96,
-            y: placement?.flowY ?? 96 + canvasLanes.length * 236,
-          },
-        }));
         clearCanvasComposer();
         return;
       }
@@ -2877,11 +2912,7 @@ export default function Home() {
       const tone = toneCycle[canvasIdeas.length % toneCycle.length];
       const linkedPointId = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointId : undefined;
       const linkedPointText = selectedSummaryFocus?.agendaId === agendaId ? selectedSummaryFocus.pointText : undefined;
-      const agendaIndex = Math.max(0, canvasLanes.findIndex((lane) => lane.agendaId === agendaId));
-      const agendaIdeaCount = canvasIdeas.filter((idea) => idea.agendaId === agendaId).length;
       const nextId = `canvas-idea-${Date.now()}`;
-      const baseX = 640 + (agendaIdeaCount % 2) * 28;
-      const baseY = 164 + agendaIndex * 384 + agendaIdeaCount * 152;
       setCanvasIdeas((prev) => [
         {
           id: nextId,
@@ -2897,13 +2928,6 @@ export default function Home() {
         },
         ...prev,
       ]);
-      setCanvasNodePositions((prev) => ({
-        ...prev,
-        [nextId]: {
-          x: placement?.flowX ?? baseX,
-          y: placement?.flowY ?? baseY,
-        },
-      }));
       clearCanvasComposer();
     } catch (err) {
       setError((err as Error).message);
@@ -2918,7 +2942,6 @@ export default function Home() {
     canvasIdeaBody,
     canvasIdeaTitle,
     canvasIdeas,
-    canvasLanes,
     commitMeetingState,
     selectedAgenda?.id,
     clearCanvasComposer,
@@ -3508,6 +3531,288 @@ export default function Home() {
     );
   };
 
+  const renderCanvasInsightsPanel = () => (
+    <>
+      {canvasRightPanelView === "detail" ? renderCanvasDetailDrawer() : (
+        <div className={`canvasDrawerViewport ${canvasRightPanelAnim === "out" ? "canvasDrawerViewportSwapOut" : canvasRightPanelAnim === "in" ? "canvasDrawerViewportSwapIn" : ""}`}>
+          <section className="contentSignalGrid">
+            <details className="card panelCard sidebarSection panelFold" open={false}>
+              <summary className="panelHeader tight panelFoldHeader">
+                <h3>실시간 참여자</h3>
+                <span className="chip chipSoft">{participantRoster.length}명 참여 중</span>
+              </summary>
+              <div className="panelFoldBody">
+                <div className="participantList">
+                  {participantRoster.map((member) => (
+                    <div key={member.name} className="participantItem">
+                      <div className="participantAvatar">{member.name.slice(0, 2)}</div>
+                      <div>
+                        <p className="participantName">{member.name}</p>
+                        <p className="participantRole">{member.role}</p>
+                      </div>
+                      <span className={participantStatusClass(member.status)}>{participantStatusLabel[member.status]}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </details>
+
+            <details className="card panelCard sidebarSection panelFold" open={false}>
+              <summary className="panelHeader tight panelFoldHeader">
+                <h3>STT 스트림</h3>
+                <span className="chip chipSoft">{sttStatusText}</span>
+              </summary>
+              <div className="panelFoldBody">
+                <div className="panelActions">
+                  <select value={sttSource} disabled>
+                    <option value="system">시스템 오디오</option>
+                  </select>
+                  <input value={sttSpeaker} onChange={(event) => setSttSpeaker(event.target.value)} placeholder="speaker label" />
+                  <button type="button" onClick={() => void startStt()} disabled={sttRunning}>Start STT</button>
+                  <button type="button" onClick={stopStt} disabled={!sttRunning}>Stop STT</button>
+                </div>
+                <p className="mutedLabel">{sttStatusDetail}</p>
+                {lastDebug ? (
+                  <p className="mutedLabel">마지막 청크 #{lastDebug.chunk_id} / {lastDebug.status} / {formatBytes(lastDebug.bytes)}</p>
+                ) : null}
+                <div className="signalTimeline">
+                  {(sttLogs.length ? sttLogs.slice(-4).reverse() : ["로그 없음"]).map((line, idx) => (
+                    <div key={`stt-log-${idx}`}>
+                      <p>{line}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </details>
+
+            <details className="card panelCard sidebarSection panelFold" open={false}>
+              <summary className="panelHeader tight panelFoldHeader">
+                <h3>LLM 디버그 탭</h3>
+                <span className="chip chipSoft">{llmIoLogs.length} logs</span>
+              </summary>
+              <div className="panelFoldBody">
+                <div className="transcriptMetaBar">
+                  <span className="chip chipSoft">req {llmReqCount}</span>
+                  <span className="chip chipSoft">res {llmResCount}</span>
+                  <span className="chip chipSoft">err {llmErrCount}</span>
+                </div>
+                {llmIoLogs.length === 0 ? (
+                  <p className="emptyState compact">아직 LLM 요청/응답 로그가 없습니다.</p>
+                ) : (
+                  <div className="llmIoList">
+                    {[...llmIoLogs].slice(-50).reverse().map((log) => {
+                      const seq = Number(log?.seq || 0);
+                      const at = safeText(log?.at, "-");
+                      const direction = safeText(log?.direction, "-").toLowerCase();
+                      const stage = safeText(log?.stage, "-");
+                      const payload = safeText(log?.payload, "");
+                      const dirLabel = direction === "request" ? "REQ" : direction === "response" ? "RES" : direction === "error" ? "ERR" : direction;
+                      return (
+                        <details key={`llm-io-${seq}-${at}-${stage}`} className="llmIoItem">
+                          <summary>
+                            <span className="chip chipSoft">{dirLabel}</span>
+                            <span>#{seq}</span>
+                            <span>{at}</span>
+                            <span>{stage}</span>
+                          </summary>
+                          <pre className="emptyState compact llmIoPayload">{payload || "(empty)"}</pre>
+                        </details>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </details>
+          </section>
+
+          <section className="topGrid">
+            <details className="card panelCard panelFold" open>
+              <summary className="panelHeader panelFoldHeader"><h2>안건</h2></summary>
+              <div className="panelFoldBody">
+                {selectedAgenda ? (
+                  <section className="currentAgenda">
+                    <p className="mutedLabel">현재 안건</p>
+                    <h3 className="agendaHeadingWithBadge">{renderAgendaLabelNode(selectedAgenda)}</h3>
+                    <div className="progressTrack"><span style={{ width: `${selectedAgenda.progress}%` }} /></div>
+                    <div className="inlineMeta">
+                      <span>{selectedAgenda.progress}% 완료</span>
+                      <span>다음: {selectedAgenda.nextUp}</span>
+                    </div>
+                  </section>
+                ) : (
+                  <p className="emptyState compact">진행 중인 안건이 없어요.</p>
+                )}
+
+                <div className="agendaHealthGrid">
+                  <article><p className="mutedLabel">완료</p><strong>{agendaOverview.done}</strong></article>
+                  <article><p className="mutedLabel">진행 중</p><strong>{agendaOverview.inProgress}</strong></article>
+                  <article><p className="mutedLabel">시작 전</p><strong>{agendaOverview.notStarted}</strong></article>
+                </div>
+
+                <div className="agendaList">
+                  {agendas.map((agenda) => (
+                    <button
+                      key={agenda.id}
+                      className={`agendaItem ${agenda.id === selectedAgendaId ? "agendaItemSelected" : ""}`}
+                      type="button"
+                      onClick={() => onSelectAgenda(agenda.id)}
+                      disabled={analysisUiDisabled}
+                    >
+                      <div>
+                        <p className="agendaTitle agendaHeadingWithBadge">{renderAgendaLabelNode(agenda)}</p>
+                        <p className="mutedLabel">신뢰도 {agenda.confidence}%</p>
+                      </div>
+                      <span className={agendaStatusClass[agenda.status]}>{agendaStatusLabel[agenda.status]}</span>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="panelActions">
+                  <button type="button" onClick={() => void apply(() => tickAnalysis(), "안건 추출 재실행 중", true)} disabled={loading || analysisUiDisabled}>추출 다시 실행</button>
+                  <button type="button" onClick={() => setQuery("")}>전사문으로 이동</button>
+                </div>
+              </div>
+            </details>
+
+            <details className="card panelCard summaryCard panelFold" open={false}>
+              <summary className="panelHeader panelFoldHeader">
+                <h2>안건 요약</h2>
+                <span className="chip chipSoft">{summaryAgendas.length}개</span>
+              </summary>
+              <div className="panelFoldBody">
+                <div className="panelHeader tight">
+                  <div className="segmented">
+                    <button className={summaryScope === "current" ? "active" : ""} type="button" onClick={() => setSummaryScope("current")} disabled={analysisUiDisabled}>현재 안건</button>
+                    <button className={summaryScope === "all" ? "active" : ""} type="button" onClick={() => setSummaryScope("all")} disabled={analysisUiDisabled}>전체</button>
+                  </div>
+                </div>
+
+                <div className="summarySignals">
+                  <article><p className="mutedLabel">신뢰도</p><strong>{selectedAgenda?.confidence ?? 0}%</strong></article>
+                  <article><p className="mutedLabel">의사결정</p><strong>{selectedContext.decisionCount}</strong></article>
+                  <article><p className="mutedLabel">근거</p><strong>{selectedContext.evidenceCount}</strong></article>
+                </div>
+
+                {summaryAgendas.length === 0 ? (
+                  <p className="emptyState">안건이 정리되면 요약이 보여요.</p>
+                ) : (
+                  <div className="summarySections">
+                    {summaryAgendas.map((agenda) => (
+                      <section key={agenda.id} className="summaryBlock">
+                        <h3 className="agendaHeadingWithBadge">{renderAgendaLabelNode(agenda)}</h3>
+                        {agenda.keywords && agenda.keywords.length > 0 ? (
+                          <div className="chipRow">
+                            {agenda.keywords.slice(0, 8).map((kw) => (
+                              <span key={`${agenda.id}-kw-${kw}`} className="chip chipSoft">#{kw}</span>
+                            ))}
+                          </div>
+                        ) : null}
+                        <div className="summaryGrid">
+                          <div>
+                            <p className="mutedLabel">핵심 포인트</p>
+                            {agenda.keyPoints.length === 0 ? <p className="emptyState compact">아직 핵심 포인트가 없습니다.</p> : <ul className="bulletList">{agenda.keyPoints.map((point, pointIdx) => {
+                              const targetId = agenda.summaryPointIds?.[pointIdx] || `summary-${agenda.id}-${pointIdx}`;
+                              const domId = `evi-target-${targetId}`;
+                              const meta = summaryPointMetaMap.get(`${agenda.id}|${targetId}`);
+                              const rangeLabel = meta?.rangeLabel || buildTimeRangeLabel([point]);
+                              const clickable = Boolean(meta || extractTimestampToken(point));
+                              return (
+                                <li key={`${point}-${pointIdx}`}>
+                                  <button
+                                    id={domId}
+                                    className={`ghostButton ${focusedTargetDomId === domId ? "focusFlash" : ""}`}
+                                    type="button"
+                                    onClick={() => jumpBySummary(agenda.id, point, targetId)}
+                                    disabled={analysisUiDisabled || !clickable}
+                                  >
+                                    <span>{stripLeadingTimestamp(point)}</span>
+                                    {rangeLabel !== "-" ? <span className="summaryPointRange">{rangeLabel}</span> : null}
+                                  </button>
+                                  {meta && meta.opinionGroups.length > 0 ? (
+                                    <div className="summaryOpinionBlock">
+                                      <p className="mutedLabel">의견 요약</p>
+                                      <ul className="summaryOpinionList">
+                                        {meta.opinionGroups.map((group) => (
+                                          <li key={group.id}>
+                                            <button
+                                              className="opinionSummaryButton"
+                                              type="button"
+                                              onClick={() => focusByOpinionGroup(agenda.id, targetId, group.id)}
+                                              disabled={analysisUiDisabled}
+                                            >
+                                              <span className={`chip chipSoft opinionTypeChip opinionType-${group.type}`}>{group.typeLabel}</span>
+                                              <span>{group.summary}</span>
+                                              {group.detail ? <span className="opinionDetail">{group.detail}</span> : null}
+                                              {group.rangeLabel !== "-" ? <span className="summaryPointRange">{group.rangeLabel}</span> : null}
+                                            </button>
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    </div>
+                                  ) : null}
+                                </li>
+                              );
+                            })}</ul>}
+                          </div>
+                          <div>
+                            <p className="mutedLabel">리스크</p>
+                            {agenda.risks.length === 0 ? <p className="emptyState compact">기록된 리스크가 없습니다.</p> : <ul className="bulletList">{agenda.risks.map((risk) => <li key={risk}>{risk}</li>)}</ul>}
+                          </div>
+                          <div>
+                            <p className="mutedLabel">현재까지의 의사결정</p>
+                            {agenda.decisionSoFar.length === 0 ? <p className="emptyState compact">아직 의사결정이 없습니다.</p> : <ul className="bulletList">{agenda.decisionSoFar.map((decisionPoint) => <li key={decisionPoint}>{decisionPoint}</li>)}</ul>}
+                          </div>
+                          <div>
+                            <p className="mutedLabel">다음 질문</p>
+                            {agenda.nextQuestions.length === 0 ? <p className="emptyState compact">열린 질문이 없습니다.</p> : <ul className="bulletList">{agenda.nextQuestions.map((question) => <li key={question}>{question}</li>)}</ul>}
+                          </div>
+                        </div>
+                        <div className="inlineMeta">
+                          <span>신뢰도 {agenda.confidence}%</span>
+                          <span>업데이트 {agenda.lastUpdated}</span>
+                        </div>
+                      </section>
+                    ))}
+                  </div>
+                )}
+
+                <section className="summaryEvidence">
+                  <div className="panelHeader tight">
+                    <h3>관련 근거</h3>
+                    <span className="chip chipSoft">{summaryEvidence.length}개 링크</span>
+                  </div>
+                  {summaryEvidence.length === 0 ? (
+                    <p className="emptyState compact">이 안건의 근거 스니펫이 아직 없어요.</p>
+                  ) : (
+                    <div className="miniEvidenceList">
+                      {summaryEvidence.slice(0, 5).map((item) => (
+                        <button key={item.id} className="miniEvidence" type="button" onClick={() => jumpToTranscript(item.agendaId, item.timestamp)} disabled={analysisUiDisabled}>
+                          <span className="timestamp">{item.timestamp}</span>
+                          <span className="chip chipSpeaker">{item.speaker}</span>
+                          <p>{item.quote}</p>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              </div>
+            </details>
+          </section>
+
+          <div className="bottomFilter">
+            <span className="chip chipInteractive">필터 기준: {selectedAgenda ? agendaLabel(selectedAgenda) : "없음"}</span>
+            <span className="mutedLabel">하단 섹션은 선택된 안건과 동기화돼요.</span>
+          </div>
+
+          <section className="bottomDesktop">
+            <div className="stackColumn">{renderSummaryCard()}{renderDecisionCard()}</div>
+            <div className="stackColumn">{renderActionCard()}{renderEvidenceCard()}</div>
+          </section>
+        </div>
+      )}
+    </>
+  );
+
   const renderSummaryCard = () => (
     <details className="card panelCard panelFold" open={false}>
       <summary className="panelHeader panelFoldHeader">
@@ -3912,11 +4217,31 @@ export default function Home() {
 
           <article className={`card panelCard controlPanelCard ${isCanvasMode ? `canvasDrawer canvasDrawerLeft ${canvasLeftRailOpen ? "canvasDrawerOpen" : "canvasDrawerClosed"}` : ""}`}>
             <div className="panelHeader tight">
-              <h3>실행 제어</h3>
+              <h3>{isCanvasMode ? (canvasLeftPanelTab === "control" ? "실행 제어" : canvasRightPanelView === "detail" && canvasNodeDetail ? "디테일" : "인사이트") : "실행 제어"}</h3>
               <div className="panelHeaderActionsTight">
                 <span className="chip chipSoft">LLM {state.llm_status?.connected ? "연결됨" : "미연결"}</span>
               </div>
             </div>
+            {isCanvasMode ? (
+              <div className="canvasLeftTabs" role="tablist" aria-label="캔버스 왼쪽 패널 탭">
+                <button
+                  type="button"
+                  className={`canvasLeftTab ${canvasLeftPanelTab === "control" ? "canvasLeftTabActive" : ""}`}
+                  onClick={() => setCanvasLeftPanelTab("control")}
+                >
+                  실행
+                </button>
+                <button
+                  type="button"
+                  className={`canvasLeftTab ${canvasLeftPanelTab === "insights" ? "canvasLeftTabActive" : ""}`}
+                  onClick={() => setCanvasLeftPanelTab("insights")}
+                >
+                  {canvasRightPanelView === "detail" && canvasNodeDetail ? "디테일" : "인사이트"}
+                </button>
+              </div>
+            ) : null}
+            {(!isCanvasMode || canvasLeftPanelTab === "control") ? (
+            <>
             <div className="transcriptControls">
               <input
                 aria-label="회의 목표"
@@ -4119,6 +4444,10 @@ export default function Home() {
                 </details>
               </div>
             </details>
+            </>
+            ) : (
+              renderCanvasInsightsPanel()
+            )}
             {isCanvasMode && canvasLeftRailOpen ? (
               <div
                 className="canvasDrawerResizeHandle canvasDrawerResizeHandleLeft"
@@ -4492,7 +4821,8 @@ export default function Home() {
           </article>
           </section>
 
-          <section className={`rightSection ${isCanvasMode ? `canvasDrawer canvasDrawerRight ${canvasRightRailOpen ? "canvasDrawerOpen" : "canvasDrawerClosed"}` : ""}`}>
+          {!isCanvasMode ? (
+          <section className="rightSection">
           {isCanvasMode ? (
             <div className="canvasDrawerHeader">
               <strong>{canvasRightPanelView === "detail" && canvasNodeDetail ? "디테일" : "인사이트"}</strong>
@@ -4797,6 +5127,7 @@ export default function Home() {
           </div>
           )}
           </section>
+          ) : null}
         </div>
       </main>
       {isCanvasMode ? (
@@ -4809,15 +5140,6 @@ export default function Home() {
             style={{ left: `${(sidebarOpen ? sidebarWidth : 0) + (canvasLeftRailOpen ? canvasLeftRailWidth + 12 : 8)}px` }}
           >
             {canvasLeftRailOpen ? "‹" : "›"}
-          </button>
-          <button
-            type="button"
-            className={`edgeNudge edgeNudgeCanvas edgeNudgeCanvasRight ${canvasRightRailOpen ? "edgeNudgeOpen" : "edgeNudgeClosed"}`}
-            onClick={() => setCanvasRightRailOpen((open) => !open)}
-            aria-label={canvasRightRailOpen ? "오른쪽 패널 접기" : "오른쪽 패널 펼치기"}
-            style={{ right: `${canvasRightRailOpen ? canvasRightRailWidth + 12 : 8}px` }}
-          >
-            {canvasRightRailOpen ? "›" : "‹"}
           </button>
         </>
       ) : null}
