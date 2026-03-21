@@ -160,6 +160,14 @@ type CanvasIdea = {
   colorTone: "blue" | "mint" | "amber" | "rose";
 };
 
+type PersonalStickyNote = {
+  id: string;
+  title: string;
+  body: string;
+  colorTone: "blue" | "mint" | "amber" | "rose";
+  updatedAt: string;
+};
+
 type CanvasManualAgenda = {
   id: string;
   title: string;
@@ -423,6 +431,14 @@ type CanvasFlowSurfaceProps = {
   onNodeDragStop: (_: unknown, node: Node<CanvasFlowNodeData>) => void;
 };
 
+type PersonalStickyNotesPanelProps = {
+  initialNotes: PersonalStickyNote[];
+  stage: CanvasStage;
+  notesRef: React.MutableRefObject<PersonalStickyNote[]>;
+  onCommit: (notes: PersonalStickyNote[]) => void;
+  onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+};
+
 const CanvasFlowSurface = memo(function CanvasFlowSurface({
   nodeSeed,
   edgeSeed,
@@ -620,6 +636,163 @@ const CanvasFlowSurface = memo(function CanvasFlowSurface({
         </div>
       ) : null}
     </div>
+  );
+});
+
+const PersonalStickyNotesPanel = memo(function PersonalStickyNotesPanel({
+  initialNotes,
+  stage,
+  notesRef,
+  onCommit,
+  onResizeStart,
+}: PersonalStickyNotesPanelProps) {
+  const [notes, setNotes] = useState<PersonalStickyNote[]>(initialNotes);
+  const [dragId, setDragId] = useState("");
+  const previousStageRef = useRef(stage);
+
+  useEffect(() => {
+    notesRef.current = notes;
+  }, [notes, notesRef]);
+
+  useEffect(() => {
+    if (previousStageRef.current !== stage) {
+      previousStageRef.current = stage;
+      onCommit(notesRef.current);
+    }
+  }, [stage, onCommit, notesRef]);
+
+  useEffect(() => {
+    return () => {
+      onCommit(notesRef.current);
+    };
+  }, [onCommit, notesRef]);
+
+  const addNote = useCallback(() => {
+    const tones: PersonalStickyNote["colorTone"][] = ["amber", "mint", "blue", "rose"];
+    setNotes((prev) => [
+      {
+        id: `sticky-${Date.now()}`,
+        title: "",
+        body: "",
+        colorTone: tones[prev.length % tones.length],
+        updatedAt: formatNowTime(),
+      },
+      ...prev,
+    ]);
+  }, []);
+
+  const updateNote = useCallback((noteId: string, patch: Partial<Pick<PersonalStickyNote, "title" | "body">>) => {
+    setNotes((prev) =>
+      prev.map((note) =>
+        note.id === noteId
+          ? {
+              ...note,
+              ...patch,
+              updatedAt: formatNowTime(),
+            }
+          : note,
+      ),
+    );
+  }, []);
+
+  const removeNote = useCallback((noteId: string) => {
+    setNotes((prev) => prev.filter((note) => note.id !== noteId));
+  }, []);
+
+  const moveNote = useCallback((sourceId: string, targetId: string) => {
+    if (!sourceId || !targetId || sourceId === targetId) return;
+    setNotes((prev) => {
+      const from = prev.findIndex((note) => note.id === sourceId);
+      const to = prev.findIndex((note) => note.id === targetId);
+      if (from < 0 || to < 0 || from === to) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+  }, []);
+
+  return (
+    <aside className="canvasStickyNotesPanel" aria-label="개인 메모장">
+      <div
+        className="canvasStickyResizeHandle"
+        onPointerDown={onResizeStart}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="개인 메모장 너비 조절"
+      />
+      <div className="canvasStickyNotesHeader">
+        <div>
+          <p className="canvasEyebrow">Personal</p>
+          <h3>개인 메모장</h3>
+        </div>
+        <button type="button" className="ghostButton" onClick={addNote}>
+          + 메모
+        </button>
+      </div>
+      <div className="canvasStickyNotesList">
+        {notes.length === 0 ? (
+          <div className="canvasStickyEmpty">
+            <p>캔버스 옆에서 바로 개인 메모를 남길 수 있습니다.</p>
+          </div>
+        ) : (
+          notes.map((note, idx) => (
+            <article
+              key={note.id}
+              className={`stickyNoteCard stickyNoteCard${note.colorTone[0].toUpperCase()}${note.colorTone.slice(1)} ${dragId === note.id ? "stickyNoteCardDragging" : ""}`}
+              onDragOver={(event) => {
+                event.preventDefault();
+                if (dragId && dragId !== note.id) {
+                  event.dataTransfer.dropEffect = "move";
+                }
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                const sourceId = event.dataTransfer.getData("text/plain") || dragId;
+                moveNote(sourceId, note.id);
+                setDragId("");
+              }}
+            >
+              <div className="stickyNoteMeta">
+                <div className="stickyNoteMetaLeft">
+                  <button
+                    type="button"
+                    className="stickyNoteDragHandle"
+                    draggable
+                    aria-label="메모 순서 이동"
+                    onDragStart={(event) => {
+                      event.dataTransfer.effectAllowed = "move";
+                      event.dataTransfer.setData("text/plain", note.id);
+                      setDragId(note.id);
+                    }}
+                    onDragEnd={() => setDragId("")}
+                  >
+                    ⋮⋮
+                  </button>
+                  <span>메모 {notes.length - idx}</span>
+                </div>
+                <button type="button" className="stickyNoteDelete" onClick={() => removeNote(note.id)}>
+                  삭제
+                </button>
+              </div>
+              <input
+                aria-label="개인 메모 제목"
+                value={note.title}
+                onChange={(event) => updateNote(note.id, { title: event.target.value })}
+                placeholder="제목"
+              />
+              <textarea
+                aria-label="개인 메모 내용"
+                value={note.body}
+                onChange={(event) => updateNote(note.id, { body: event.target.value })}
+                placeholder="개인 메모를 입력하세요"
+              />
+              <span className="stickyNoteTimestamp">{note.updatedAt}</span>
+            </article>
+          ))
+        )}
+      </div>
+    </aside>
   );
 });
 
@@ -1096,6 +1269,7 @@ export default function Home() {
   const [canvasIdeaBody, setCanvasIdeaBody] = useState("");
   const [canvasIdeas, setCanvasIdeas] = useState<CanvasIdea[]>([]);
   const [canvasManualAgendas, setCanvasManualAgendas] = useState<CanvasManualAgenda[]>([]);
+  const [personalStickyNotes, setPersonalStickyNotes] = useState<PersonalStickyNote[]>([]);
   const [agendaOverrides, setAgendaOverrides] = useState<Record<string, { title?: string; summaryBullets?: string[] }>>({});
   const [problemDefinitionGroups, setProblemDefinitionGroups] = useState<CanvasProblemGroup[]>([]);
   const [problemDefinitionLoading, setProblemDefinitionLoading] = useState(false);
@@ -1163,6 +1337,7 @@ export default function Home() {
     decisionCount: number;
     actionCount: number;
   } | null>(null);
+  const personalStickyNotesRef = useRef<PersonalStickyNote[]>([]);
 
   const appendSttLog = useCallback((message: string) => {
     const ts = new Date().toLocaleTimeString();
@@ -1751,6 +1926,8 @@ export default function Home() {
     if ((state.transcript?.length || 0) === 0 && agendas.length === 0) {
       setCanvasIdeas([]);
       setCanvasManualAgendas([]);
+      setPersonalStickyNotes([]);
+      personalStickyNotesRef.current = [];
       setAgendaOverrides({});
       setProblemDefinitionGroups([]);
       setProblemDefinitionMeta("");
@@ -2242,6 +2419,11 @@ export default function Home() {
     };
   }, [state.meeting_goal, participantRoster.length, transcript]);
 
+  const personalStickyNotesSeedKey = useMemo(
+    () => JSON.stringify(personalStickyNotes.map((note) => [note.id, note.title, note.body, note.colorTone, note.updatedAt])),
+    [personalStickyNotes],
+  );
+
   const speakerOptions = useMemo(() => ["전체", ...new Set(transcript.map((utterance) => utterance.speaker))], [transcript]);
 
   const agendaOverview = useMemo(() => {
@@ -2623,6 +2805,11 @@ export default function Home() {
   const clearCanvasIdeaInputs = useCallback(() => {
     setCanvasIdeaTitle("");
     setCanvasIdeaBody("");
+  }, []);
+
+  const commitPersonalStickyNotes = useCallback((nextNotes: PersonalStickyNote[]) => {
+    personalStickyNotesRef.current = nextNotes;
+    setPersonalStickyNotes(nextNotes);
   }, []);
 
   const clearCanvasDetailEdit = useCallback(() => {
@@ -3143,6 +3330,15 @@ export default function Home() {
   }, [clearCanvasDetailEdit, clearCanvasRightPanelTimer, isCanvasMode]);
 
   useEffect(() => {
+    if (canvasComposerTool === "note") {
+      setCanvasComposerTool(null);
+      setCanvasComposerPlacement(null);
+      setCanvasIdeaTitle("");
+      setCanvasIdeaBody("");
+    }
+  }, [canvasComposerTool]);
+
+  useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
       const drag = resizeRef.current;
       if (!drag) return;
@@ -3306,6 +3502,7 @@ export default function Home() {
         ...(res.snapshot || {}),
         frontend_overrides: {
           agenda_overrides: agendaOverrides,
+          personal_sticky_notes: personalStickyNotesRef.current,
         },
       };
       const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json;charset=utf-8" });
@@ -3319,7 +3516,7 @@ export default function Home() {
       URL.revokeObjectURL(url);
       setError("");
       setDebugEvents((rows) => [
-        `${formatNowTime()} | 안건 스냅샷 내보내기 완료: ${filename} (agenda=${res.agenda_count}, turns=${res.transcript_count}, overrides=${Object.keys(agendaOverrides).length})`,
+        `${formatNowTime()} | 안건 스냅샷 내보내기 완료: ${filename} (agenda=${res.agenda_count}, turns=${res.transcript_count}, overrides=${Object.keys(agendaOverrides).length}, sticky=${personalStickyNotesRef.current.length})`,
         ...rows,
       ].slice(0, 80));
     } catch (err) {
@@ -3343,13 +3540,18 @@ export default function Home() {
       commitMeetingState(res.state);
       const frontendOverrides = (parsedSnapshot.frontend_overrides as Record<string, unknown> | undefined) || {};
       const importedAgendaOverrides = (frontendOverrides.agenda_overrides as Record<string, { title?: string; summaryBullets?: string[] }> | undefined) || {};
+      const importedStickyNotes = Array.isArray(frontendOverrides.personal_sticky_notes)
+        ? (frontendOverrides.personal_sticky_notes as PersonalStickyNote[])
+        : [];
       setAgendaOverrides(importedAgendaOverrides);
+      setPersonalStickyNotes(importedStickyNotes);
+      personalStickyNotesRef.current = importedStickyNotes;
       setMeetingGoalDraft(res.state.meeting_goal || "");
       setMeetingGoalDirty(false);
-      setDatasetImportInfo(`snapshot imported=${res.import_debug.agenda_count} agendas / ${res.import_debug.transcript_count} turns / overrides=${Object.keys(importedAgendaOverrides).length}`);
+      setDatasetImportInfo(`snapshot imported=${res.import_debug.agenda_count} agendas / ${res.import_debug.transcript_count} turns / overrides=${Object.keys(importedAgendaOverrides).length} / sticky=${importedStickyNotes.length}`);
       setError("");
       setDebugEvents((rows) => [
-        `${formatNowTime()} | 안건 스냅샷 불러오기 완료: ${res.import_debug.filename} (agenda=${res.import_debug.agenda_count}, turns=${res.import_debug.transcript_count}, overrides=${Object.keys(importedAgendaOverrides).length})`,
+        `${formatNowTime()} | 안건 스냅샷 불러오기 완료: ${res.import_debug.filename} (agenda=${res.import_debug.agenda_count}, turns=${res.import_debug.transcript_count}, overrides=${Object.keys(importedAgendaOverrides).length}, sticky=${importedStickyNotes.length})`,
         ...rows,
       ].slice(0, 80));
     } catch (err) {
@@ -4056,6 +4258,7 @@ export default function Home() {
     ["--workspace-sidebar-width" as string]: `${sidebarOpen ? sidebarWidth : 0}px`,
     ["--canvas-left-drawer-width" as string]: `${canvasLeftRailWidth}px`,
     ["--canvas-right-drawer-width" as string]: `${canvasRightRailWidth}px`,
+    ["--canvas-sticky-width" as string]: `${canvasRightRailWidth}px`,
     ["--canvas-surface-top" as string]: `${canvasSurfaceTop}px`,
     ["--canvas-surface-bottom" as string]: "12px",
     ["--canvas-surface-height" as string]: `calc(100vh - ${canvasSurfaceTop}px - 12px)`,
@@ -4653,7 +4856,6 @@ export default function Home() {
                       ) : null}
                       <div className="canvasBottomDock" aria-label="캔버스 도구 모음">
                         {([
-                          ["note", "메모 입력"],
                           ["comment", "코멘트 입력"],
                           ["topic", "주제 추가"],
                           ["agenda", "Agenda 추가"],
@@ -4665,7 +4867,7 @@ export default function Home() {
                             onClick={() => selectCanvasTool(tool)}
                             disabled={canvasPlacementPending}
                           >
-                            <span className="canvasDockToolIcon">{tool === "note" ? "N" : tool === "comment" ? "C" : tool === "topic" ? "T" : "A"}</span>
+                            <span className="canvasDockToolIcon">{tool === "comment" ? "C" : tool === "topic" ? "T" : "A"}</span>
                             <span>{label}</span>
                           </button>
                         ))}
@@ -4815,6 +5017,14 @@ export default function Home() {
                       </div>
                     )
                   )}
+                  <PersonalStickyNotesPanel
+                    key={personalStickyNotesSeedKey}
+                    initialNotes={personalStickyNotes}
+                    stage={canvasStage}
+                    notesRef={personalStickyNotesRef}
+                    onCommit={commitPersonalStickyNotes}
+                    onResizeStart={(event) => startResize("canvas-right", canvasRightRailWidth, event)}
+                  />
                 </div>
               </div>
             )}
